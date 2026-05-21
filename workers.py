@@ -7,7 +7,7 @@ import logging
 import chess
 from PySide6.QtCore import QThread, Signal
 from ai_engines import MinimaxEngine, MCTSEngine, HeuristicEvaluator
-from constants import HAS_CV2, find_stockfish
+from constants import HAS_CV2, find_stockfish, MAX_FRAMES_IN_MEMORY
 
 if HAS_CV2:
     import cv2
@@ -38,9 +38,6 @@ class _SyncUCI:
         self.proc.stdin.flush()
 
     def _read(self, tok):
-        """Read lines until *tok* appears.
-        Note: Runs inside a QThread, so blocking readline() is safe and
-        doesn't freeze the UI. Avoids using `select` which breaks on Windows pipes."""
         lines = []
         while True:
             l = self.proc.stdout.readline()
@@ -61,7 +58,7 @@ class _SyncUCI:
         bm = None
         sc = 0
         wt = b.turn == chess.WHITE
-        
+
         lines = self._read("bestmove")
         for l in lines:
             if l.startswith("info") and " score " in l:
@@ -194,16 +191,20 @@ class BatchEvalWorker(QThread):
 
 
 class ExportWorker(QThread):
+    """Export frames to video. Supports in-memory numpy arrays or
+    disk-cached JPEG frames read in chunks for low-memory systems."""
     progress = Signal(int, str)
     export_finished = Signal(str)
 
-    def __init__(self, fr, fps, out, w, h):
+    def __init__(self, fr, fps, out, w, h, frame_dir=None, chunk_size=200):
         super().__init__()
-        self.fr = fr
+        self.fr = fr             # list of numpy arrays (may be empty if frame_dir set)
         self.fps = fps
         self.out = out
         self.w = w
         self.h = h
+        self.frame_dir = frame_dir   # directory of frame_XXXXX.jpg files
+        self.chunk_size = chunk_size
         self._c = False
 
     def cancel(self):
@@ -213,13 +214,23 @@ class ExportWorker(QThread):
         if not HAS_CV2:
             self.export_finished.emit("ERROR: opencv-python missing")
             return
-        if not self.fr:
+
+        # Determine total frame count
+        if self.frame_dir and os.path.isdir(self.frame_dir):
+            total = len([f for f in os.listdir(self.frame_dir)
+                         if f.startswith("frame_") and f.endswith(".jpg")])
+        elif self.fr:
+            total = len(self.fr)
+        else:
             self.export_finished.emit("ERROR: No frames")
             return
 
-        cs = [("avc1", ".mp4"), ("X264", ".mp4")]
-        if sys.platform != "win32":
-            cs.append(("mp4v", ".mp4"))
+        if total == 0:
+            self.export_finished.emit("ERROR: No frames to export")
+            return
+
+        # Try codecs
+        cs = [("avc1", ".mp4"), ("X264", ".mp4"), ("mp4v", ".mp4")]
         cs.append(("XVID", ".avi"))
 
         wr = None
@@ -240,28 +251,76 @@ class ExportWorker(QThread):
             self.export_finished.emit("ERROR: Codec not found")
             return
 
-        tot = len(self.fr)
-        for i, f in enumerate(self.fr):
+        # ── Disk-cache mode: read frames in chunks ────────────────
+        if self.frame_dir and os.path.isdir(self.frame_dir):
+            self._export_from_disk(wr, up, uc, total)
+        else:
+            # ── In-memory mode ─────────────────────────────────────
+            self._export_from_memory(wr, up, uc, total)
+
+    def _export_from_disk(self, wr, up, uc, total):
+        """Read JPEG frames from disk in chunks — constant memory."""
+        chunk = self.chunk_size
+        written = 0
+        for start in range(0, total, chunk):
             if self._c:
                 wr.release()
                 if os.path.exists(up):
                     os.remove(up)
                 self.export_finished.emit("Cancelled")
                 return
-            if f.shape[:2] != (self.h, self.w):
-                f = cv2.resize(f, (self.w, self.h))
-            if f.ndim == 3 and f.shape[2] == 4:
-                bgr = f[:, :, :3]
-                a = f[:, :, 3:]
-                bg = np.full_like(bgr, 32)
-                al = a.astype(np.float32) / 255.0
-                f = (bgr.astype(np.float32) * al +
-                     bg.astype(np.float32) * (1 - al)).astype(np.uint8)
-            wr.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
-            self.progress.emit(int((i + 1) / tot * 100),
-                               f"Frame {i + 1}/{tot}")
+            end = min(start + chunk, total)
+            for i in range(start, end):
+                fname = os.path.join(self.frame_dir, f"frame_{i:05d}.jpg")
+                if not os.path.isfile(fname):
+                    continue
+                f = cv2.imread(fname, cv2.IMREAD_COLOR)
+                if f is None:
+                    continue
+                if f.shape[:2] != (self.h, self.w):
+                    f = cv2.resize(f, (self.w, self.h))
+                wr.write(f)  # Already BGR from imread
+                written += 1
+            self.progress.emit(
+                int(written / total * 100),
+                f"Frame {written}/{total} (disk cache)")
         wr.release()
         self.export_finished.emit(
             f"Done!\nCodec:{uc}\nSaved:{up}\n"
-            f"{self.w}x{self.h} @ {self.fps}fps\nFrames:{tot}"
-        )
+            f"{self.w}x{self.h} @ {self.fps}fps\nFrames:{written}")
+
+    def _export_from_memory(self, wr, up, uc, total):
+        """Write in-memory numpy frames to video in chunks."""
+        chunk = self.chunk_size
+        written = 0
+        for start in range(0, total, chunk):
+            if self._c:
+                wr.release()
+                if os.path.exists(up):
+                    os.remove(up)
+                self.export_finished.emit("Cancelled")
+                return
+            end = min(start + chunk, total)
+            for i in range(start, end):
+                f = self.fr[i]
+                if f.shape[:2] != (self.h, self.w):
+                    f = cv2.resize(f, (self.w, self.h))
+                if f.ndim == 3 and f.shape[2] == 4:
+                    bgr = f[:, :, :3]
+                    a = f[:, :, 3:]
+                    bg = np.full_like(bgr, 32)
+                    al = a.astype(np.float32) / 255.0
+                    f = (bgr.astype(np.float32) * al +
+                         bg.astype(np.float32) * (1 - al)).astype(np.uint8)
+                wr.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+                written += 1
+            # Free processed chunk from memory if possible
+            for i in range(start, end):
+                self.fr[i] = None
+            self.progress.emit(
+                int(written / total * 100),
+                f"Frame {written}/{total}")
+        wr.release()
+        self.export_finished.emit(
+            f"Done!\nCodec:{uc}\nSaved:{up}\n"
+            f"{self.w}x{self.h} @ {self.fps}fps\nFrames:{written}")
