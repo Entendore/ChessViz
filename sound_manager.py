@@ -7,6 +7,8 @@ import tempfile
 import shutil
 import logging
 from PySide6.QtCore import QObject, QUrl
+import gc
+import time
 
 try:
     from PySide6.QtMultimedia import QSoundEffect
@@ -347,8 +349,46 @@ class SoundManager(QObject):
         self.enabled = e
 
     def cleanup(self):
+        # Stop and release all QSoundEffect objects — on Windows they
+        # hold open file handles inside self._temp_dir.
+        for stype, eff in list(self._sounds.items()):
+            try:
+                if eff.isPlaying():
+                    eff.stop()
+                eff.setSource(QUrl())
+                eff.deleteLater()        # Schedule C++ object deletion
+            except RuntimeError:
+                pass
+        self._sounds.clear()
+
+        # Force Python GC and Qt event processing to release C++ objects
+        gc.collect()
+        try:
+            from PySide6.QtWidgets import QApplication
+            if QApplication.instance():
+                for _ in range(3):
+                    QApplication.processEvents()
+        except RuntimeError:
+            pass
+        gc.collect()
+
+        # Remove temp directory with retries (Windows needs time to
+        # release file handles after C++ objects are deleted)
         if self._temp_dir and os.path.isdir(self._temp_dir):
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            for attempt in range(8):
+                try:
+                    shutil.rmtree(self._temp_dir)
+                    break
+                except OSError:
+                    gc.collect()
+                    time.sleep(0.15 * (attempt + 1))
+                    try:
+                        from PySide6.QtWidgets import QApplication
+                        if QApplication.instance():
+                            QApplication.processEvents()
+                    except RuntimeError:
+                        pass
+        self._temp_dir = None
 
 
 # ── Design-aware synthesizers for non-theme-param sounds ───────────

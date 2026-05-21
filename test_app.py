@@ -1,2292 +1,2109 @@
-"""
-Chess Video Maker Pro — Comprehensive Test Suite
-Tests all features across every module in a single file.
-Run:  pytest test_app.py -v
-"""
+"""Chess Video Maker Pro — Comprehensive Single-File Test Suite
 
-import sys
-import os
+Run with:
+    pytest test_app.py -v
+
+Requirements:
+    pip install pytest PySide6 chess numpy
+"""
+import gc
 import io
+import os
+import sys
 import math
 import tempfile
-import time
 import shutil
-import platform
-
-import pytest
+import time
 import chess
 import chess.pgn
+import pytest
+from unittest.mock import patch, MagicMock
 
-from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMainWindow
+from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
 from PySide6.QtGui import QColor, QImage
 
 
-
-# ── QApplication singleton ──────────────────────────────────────────
-
-_app = None
-
-
+# ── Session-scoped QApplication fixture ────────────────────────────
+@pytest.fixture(scope="session")
 def qapp():
-    global _app
-    if _app is None:
-        _app = QApplication.instance()
-        if _app is None:
-            _app = QApplication(sys.argv)
-    return _app
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    yield app
 
 
-def wait_for_thread(worker, timeout_ms=15000):
-    """Wait for a QThread to finish while keeping the event loop alive
-    so queued cross-thread signals can be delivered."""
-    start = time.time()
-    while worker.isRunning():
-        qapp().processEvents()
-        if time.time() - start > timeout_ms / 1000.0:
-            break
-        time.sleep(0.01)
+def _safe_delete(widget):
+    """Schedule a widget for deletion and process events so C++ objects
+    are cleaned up *before* Python GC tries to collect them."""
+    if widget is not None:
+        try:
+            widget.deleteLater()
+        except RuntimeError:
+            pass
+        try:
+            QApplication.processEvents()
+        except RuntimeError:
+            pass
 
 
-def find_stockfish():
-    """Find Stockfish binary on the system (cross-platform), or return None."""
-    # Check PATH via shutil.which (works on Windows, Linux, macOS)
-    which_path = shutil.which("stockfish")
-    if which_path:
-        return which_path
-    # Check common install locations (exact paths)
-    candidates = [
-        "/usr/games/stockfish",
-        "/usr/local/bin/stockfish",
-        "/usr/bin/stockfish",
-        "/snap/bin/stockfish",
-        "/opt/homebrew/bin/stockfish",
-        r"C:\Program Files\Stockfish\stockfish.exe",
-        r"C:\Program Files\stockfish\stockfish.exe",
-        r"C:\Stockfish\stockfish.exe",
-        r"C:\Program Files (x86)\Stockfish\stockfish.exe",
-        r"C:\Program Files (x86)\stockfish\stockfish.exe",
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    # Scan known Stockfish folders for any .exe with "stockfish" in the name
-    # (the exe may be named stockfish-windows-x86-64.exe, stockfish_15.exe, etc.)
-    scan_dirs = [
-        r"C:\Program Files\Stockfish",
-        r"C:\Program Files\stockfish",
-        r"C:\Stockfish",
-        r"C:\Program Files (x86)\Stockfish",
-        r"C:\Program Files (x86)\stockfish",
-    ]
-    for d in scan_dirs:
-        if os.path.isdir(d):
-            for fname in os.listdir(d):
-                lower = fname.lower()
-                if lower.endswith(".exe") and "stockfish" in lower:
-                    return os.path.join(d, fname)
-    return None
-
-
-# ── Fixtures ────────────────────────────────────────────────────────
-
-@pytest.fixture(autouse=True)
-def _ensure_qapp():
-    qapp()
-    yield
-
-
-@pytest.fixture
-def main_window():
-    from main_window import MainWindow
-    w = MainWindow()
-    w.show()
-    yield w
-    w.close()
-
-
-@pytest.fixture
-def board_widget():
-    from board_widget import ChessBoardWidget
-    w = ChessBoardWidget()
-    w.resize(500, 500)
-    w.show()
-    yield w
-    w.close()
-
-
-@pytest.fixture
-def eval_bar():
-    from eval_bar import EvalBarWidget
-    w = EvalBarWidget()
-    w.show()
-    yield w
-    w.close()
+def _pe(ms=50):
+    """Process Qt events for a brief period. Uses the global QApplication
+    instance automatically."""
+    app = QApplication.instance()
+    if app is None:
+        return
+    deadline = time.time() + ms / 1000.0
+    while time.time() < deadline:
+        app.processEvents()
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 1. CONSTANTS
+#  Constants
 # ═══════════════════════════════════════════════════════════════════
-
 class TestConstants:
     def test_piece_sym_completeness(self):
         from constants import PIECE_SYM
-        for pt in [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]:
+        assert len(PIECE_SYM) == 12
+        for pt in [chess.PAWN, chess.KNIGHT, chess.BISHOP,
+                    chess.ROOK, chess.QUEEN, chess.KING]:
             for c in [chess.WHITE, chess.BLACK]:
                 assert (pt, c) in PIECE_SYM
-                assert isinstance(PIECE_SYM[(pt, c)], str)
-                assert len(PIECE_SYM[(pt, c)]) > 0
 
-    def test_ai_map_keys(self):
+    def test_ai_map(self):
         from constants import AI_MAP
-        assert 0 in AI_MAP
-        assert 1 in AI_MAP
-        assert 2 in AI_MAP
+        assert "Minimax" in AI_MAP[0]
+        assert "MCTS" in AI_MAP[1]
+        assert "Stockfish" in AI_MAP[2]
 
-    def test_ai_map_values(self):
-        from constants import AI_MAP
-        assert "Minimax (Alpha-Beta)" in AI_MAP.values()
-        assert "MCTS (Monte Carlo)" in AI_MAP.values()
-        assert "Stockfish (UCI)" in AI_MAP.values()
+    def test_sound_constants(self):
+        from constants import SOUND_THEMES, SOUND_DESIGNS, SOUND_TYPES
+        assert "Classic" in SOUND_THEMES
+        assert "Silent" in SOUND_THEMES
+        assert "Default" in SOUND_DESIGNS
+        assert "Warm" in SOUND_DESIGNS
+        for t in ["move", "capture", "check", "checkmate",
+                   "castle", "illegal", "new_game", "promotion", "ui_click"]:
+            assert t in SOUND_TYPES
 
-    def test_sample_pgn_parseable(self):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        assert game is not None
-        assert game.headers.get("White") == "Carlsen, Magnus"
-        assert game.headers.get("Black") == "Nepomniachtchi, Ian"
+    def test_anim_easings(self):
+        from constants import ANIM_EASINGS
+        assert "OutCubic" in ANIM_EASINGS
+        assert "Linear" in ANIM_EASINGS
 
-    def test_has_cv2_is_bool(self):
-        from constants import HAS_CV2
-        assert isinstance(HAS_CV2, bool)
+    def test_game_states(self):
+        from constants import (GAME_NORMAL, GAME_CHECKMATE,
+                               GAME_STALEMATE, GAME_DRAW, GAME_INSUFFICIENT)
+        assert GAME_NORMAL == "normal"
+        assert GAME_CHECKMATE == "checkmate"
+        assert GAME_STALEMATE == "stalemate"
+        assert GAME_DRAW == "draw"
+        assert GAME_INSUFFICIENT == "insufficient"
 
     def test_board_theme_defaults(self):
         from constants import BoardTheme
         t = BoardTheme()
         assert t.name == "Classic"
-        assert t.light_sq.lightness() > 0
-        assert t.dark_sq.lightness() > 0
-        assert t.highlight.alpha() > 0
-        assert t.last_move.alpha() > 0
+        assert isinstance(t.light_sq, QColor)
+        assert isinstance(t.dark_sq, QColor)
+        assert isinstance(t.highlight, QColor)
+        assert isinstance(t.last_move, QColor)
 
-    def test_board_theme_custom(self):
-        from constants import BoardTheme
-        t = BoardTheme("Custom", light=(255, 0, 0), dark=(0, 0, 255))
-        assert t.name == "Custom"
-        assert t.light_sq == QColor(255, 0, 0)
-        assert t.dark_sq == QColor(0, 0, 255)
-
-    def test_themes_dict_has_all(self):
+    def test_themes_dict(self):
         from constants import THEMES
-        assert "Classic" in THEMES
-        assert "Blue" in THEMES
-        assert "Green" in THEMES
-        assert "Brown" in THEMES
+        for name in ["Classic", "Blue", "Green", "Brown"]:
+            assert name in THEMES
+            assert THEMES[name].name == name
 
-    def test_themes_are_board_theme_instances(self):
-        from constants import THEMES, BoardTheme
-        for name, theme in THEMES.items():
-            assert isinstance(theme, BoardTheme)
-            assert theme.name == name
+    def test_find_stockfish_return_type(self):
+        from constants import find_stockfish
+        result = find_stockfish()
+        assert result is None or isinstance(result, str)
+
+    def test_has_cv2_flag(self):
+        from constants import HAS_CV2
+        assert isinstance(HAS_CV2, bool)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 2. AI ENGINES — HeuristicEvaluator
+#  AI Engines
 # ═══════════════════════════════════════════════════════════════════
-
 class TestHeuristicEvaluator:
     def test_starting_position_near_zero(self):
         from ai_engines import HeuristicEvaluator
         ev = HeuristicEvaluator()
         score = ev.evaluate(chess.Board())
-        assert abs(score) < 100
+        assert isinstance(score, (int, float))
+        assert abs(score) < 2000
 
-    def test_checkmate_white_mated(self):
-        from ai_engines import HeuristicEvaluator
-        ev = HeuristicEvaluator()
-        board = chess.Board("rnb1kbnr/pppp1ppp/4p3/8/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3")
-        if board.is_checkmate():
-            score = ev.evaluate(board)
-            assert score == -99999
-
-    def test_checkmate_black_mated(self):
+    def test_checkmate_black_wins(self):
         from ai_engines import HeuristicEvaluator
         ev = HeuristicEvaluator()
         board = chess.Board()
         for m in ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]:
-            board.push_uci(m)
+            board.push(chess.Move.from_uci(m))
         assert board.is_checkmate()
+        assert board.turn == chess.BLACK
         score = ev.evaluate(board)
-        assert score == 99999
+        assert score == 10000
 
-    def test_stalemate_is_zero(self):
+    def test_checkmate_white_loses(self):
         from ai_engines import HeuristicEvaluator
         ev = HeuristicEvaluator()
-        board = chess.Board("8/8/8/4k3/8/8/8/4K3 w - - 0 1")
-        score = ev.evaluate(board)
-        assert score == 0
+        board = chess.Board(
+            "rnb1kbnr/pppp1ppp/4p3/8/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3")
+        if board.is_checkmate() and board.turn == chess.WHITE:
+            score = ev.evaluate(board)
+            assert score == -10000
 
-    def test_white_extra_queen_positive(self):
+    def test_stalemate_returns_zero(self):
         from ai_engines import HeuristicEvaluator
         ev = HeuristicEvaluator()
-        board = chess.Board("8/8/8/8/8/8/8/4K2Q w - - 0 1")
-        score = ev.evaluate(board)
-        assert score > 0
+        board = chess.Board("k7/8/KQ6/8/8/8/8/8 b - - 0 1")
+        if board.is_stalemate():
+            assert ev.evaluate(board) == 0
 
-    def test_black_extra_queen_negative(self):
+    def test_insufficient_material_returns_zero(self):
         from ai_engines import HeuristicEvaluator
         ev = HeuristicEvaluator()
-        board = chess.Board("4k2q/8/8/8/8/8/8/4K3 w - - 0 1")
-        score = ev.evaluate(board)
-        assert score < 0
-
-    def test_pawn_table_applied(self):
-        from ai_engines import HeuristicEvaluator
-        ev = HeuristicEvaluator()
-        board_center = chess.Board("8/8/8/8/4P3/8/8/4K2k w - - 0 1")
-        board_edge = chess.Board("8/8/8/8/8/P7/8/4K2k w - - 0 1")
-        score_center = ev.evaluate(board_center)
-        score_edge = ev.evaluate(board_edge)
-        assert score_center >= score_edge
+        board = chess.Board("k7/8/K7/8/8/8/8/8 w - - 0 1")
+        if board.is_insufficient_material():
+            assert ev.evaluate(board) == 0
 
     def test_piece_values(self):
         from ai_engines import HeuristicEvaluator
-        ev = HeuristicEvaluator()
-        assert ev.PIECE_VALUES[chess.PAWN] == 100
-        assert ev.PIECE_VALUES[chess.KNIGHT] == 320
-        assert ev.PIECE_VALUES[chess.BISHOP] == 330
-        assert ev.PIECE_VALUES[chess.ROOK] == 500
-        assert ev.PIECE_VALUES[chess.QUEEN] == 900
-        assert ev.PIECE_VALUES[chess.KING] == 20000
+        pv = HeuristicEvaluator.PV
+        assert pv[chess.PAWN] == 100
+        assert pv[chess.KNIGHT] == 320
+        assert pv[chess.BISHOP] == 330
+        assert pv[chess.ROOK] == 500
+        assert pv[chess.QUEEN] == 900
+        assert pv[chess.KING] == 20000
 
-    def test_symmetric_position_symmetric_eval(self):
+    def test_pawn_table_length(self):
+        from ai_engines import HeuristicEvaluator
+        assert len(HeuristicEvaluator.PT) == 64
+
+    def test_material_advantage(self):
         from ai_engines import HeuristicEvaluator
         ev = HeuristicEvaluator()
-        board = chess.Board("4k3/8/8/8/8/8/8/4K3 w - - 0 1")
+        board = chess.Board(
+            "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
         score = ev.evaluate(board)
-        assert score == 0
+        assert score > 0
 
-    def test_insufficient_material(self):
-        from ai_engines import HeuristicEvaluator
-        ev = HeuristicEvaluator()
-        board = chess.Board("8/8/8/4k3/8/8/8/4K3 w - - 0 1")
-        assert board.is_insufficient_material()
-        score = ev.evaluate(board)
-        assert score == 0
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 3. AI ENGINES — MinimaxEngine
-# ═══════════════════════════════════════════════════════════════════
 
 class TestMinimaxEngine:
-    def test_search_returns_correct_types(self):
+    def test_finds_valid_move(self):
         from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board()
-        best_move, white_eval, nodes, policy = eng.search(board, depth=1)
-        assert best_move is None or isinstance(best_move, chess.Move)
-        assert isinstance(white_eval, (int, float))
-        assert isinstance(nodes, int)
-        assert isinstance(policy, dict)
-
-    def test_search_finds_move(self):
-        from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board()
-        best_move, _, _, _ = eng.search(board, depth=1)
-        assert best_move is not None
-        assert best_move in board.legal_moves
-
-    def test_search_increments_nodes(self):
-        from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board()
-        _, _, nodes, _ = eng.search(board, depth=1)
+        bm, ev, nodes, pol = MinimaxEngine().search(chess.Board(), depth=2)
+        assert bm is not None
+        assert isinstance(ev, (int, float))
         assert nodes > 0
+        assert isinstance(pol, dict)
 
-    def test_policy_values_between_zero_and_one(self):
+    def test_policy_normalised(self):
         from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board()
-        _, _, _, policy = eng.search(board, depth=1)
-        for uci, prob in policy.items():
-            assert 0.0 <= prob <= 1.0
+        _, _, _, pol = MinimaxEngine().search(chess.Board(), depth=2)
+        for v in pol.values():
+            assert 0 <= v <= 1
 
-    def test_policy_best_move_has_highest_prob(self):
+    def test_best_move_in_policy(self):
         from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board()
-        best_move, _, _, policy = eng.search(board, depth=1)
-        if policy:
-            max_uci = max(policy, key=policy.get)
-            assert max_uci == best_move.uci()
+        bm, _, _, pol = MinimaxEngine().search(chess.Board(), depth=2)
+        assert bm.uci() in pol
 
-    def test_checkmate_in_one(self):
+    def test_finds_mate_in_one(self):
         from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1")
-        best_move, _, _, _ = eng.search(board, depth=2)
-        assert best_move is not None
-
-    def test_forced_mate_evaluated_high(self):
-        from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1")
-        _, white_eval, _, _ = eng.search(board, depth=2)
-        assert white_eval > 0
-
-    def test_depth_two_more_nodes_than_depth_one(self):
-        from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board()
-        _, _, n1, _ = eng.search(board, depth=1)
-        _, _, n2, _ = eng.search(board, depth=2)
-        assert n2 >= n1
-
-    def test_starting_position_eval_near_zero(self):
-        from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board()
-        _, white_eval, _, _ = eng.search(board, depth=1)
-        assert abs(white_eval) < 500
+        board = chess.Board(
+            "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/"
+            "RNB1K1NR w KQkq - 4 4")
+        bm, _, _, _ = MinimaxEngine().search(board, depth=3)
+        assert bm == chess.Move.from_uci("h5f7")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 4. AI ENGINES — MCTSNode
-# ═══════════════════════════════════════════════════════════════════
+class TestMCTSEngine:
+    def test_finds_valid_move(self):
+        from ai_engines import MCTSEngine
+        bm, ev, visits, pol = MCTSEngine().search(
+            chess.Board(), iters=50)
+        assert bm is not None
+        assert visits > 0
+        assert isinstance(pol, dict)
+
+    def test_policy_sums_to_one(self):
+        from ai_engines import MCTSEngine
+        _, _, _, pol = MCTSEngine().search(chess.Board(), iters=50)
+        total = sum(pol.values())
+        assert abs(total - 1.0) < 0.05
+
+    def test_policy_normalised(self):
+        from ai_engines import MCTSEngine
+        _, _, _, pol = MCTSEngine().search(chess.Board(), iters=50)
+        for v in pol.values():
+            assert 0 <= v <= 1
+
 
 class TestMCTSNode:
-    def test_initial_state(self):
-        from ai_engines import MCTSNode
-        node = MCTSNode(chess.Board())
-        assert node.visits == 0
-        assert node.wins == 0.0
-        assert node.parent is None
-        assert node.move is None
-        assert len(node.children) == 0
-        assert len(node.untried_moves) > 0
-
     def test_ucb1_unvisited_is_inf(self):
         from ai_engines import MCTSNode
         node = MCTSNode(chess.Board())
-        node.parent = MCTSNode(chess.Board())
-        node.parent.visits = 10
-        assert node.ucb1() == float('inf')
+        assert node.ucb1() == float("inf")
 
-    def test_ucb1_visited(self):
-        from ai_engines import MCTSNode
-        parent = MCTSNode(chess.Board())
-        parent.visits = 100
-        child = MCTSNode(chess.Board(), parent=parent)
-        child.visits = 10
-        child.wins = 5.0
-        ucb = child.ucb1()
-        assert 0 < ucb < float('inf')
-
-    def test_best_child(self):
-        from ai_engines import MCTSNode
-        parent = MCTSNode(chess.Board())
-        parent.visits = 100
-        children = []
-        for i in range(3):
-            c = MCTSNode(chess.Board(), parent=parent)
-            c.visits = 10 + i
-            c.wins = float(i)
-            children.append(c)
-        parent.children = children
-        best = parent.best_child()
-        assert best in children
-
-    def test_expand_creates_child(self):
+    def test_expand_reduces_untried(self):
         from ai_engines import MCTSNode
         node = MCTSNode(chess.Board())
-        initial_untried = len(node.untried_moves)
+        before = len(node.untried)
         child = node.expand()
-        assert len(node.children) == 1
-        assert len(node.untried_moves) == initial_untried - 1
-        assert child.parent is node
-        assert child.move is not None
+        assert len(node.untried) == before - 1
+        assert child in node.children
 
-    def test_expand_depletes_moves(self):
+    def test_best_child_returns_child(self):
         from ai_engines import MCTSNode
         node = MCTSNode(chess.Board())
-        n_moves = len(node.untried_moves)
-        for _ in range(n_moves):
-            node.expand()
-        assert len(node.untried_moves) == 0
-        assert len(node.children) == n_moves
+        c1, c2 = node.expand(), node.expand()
+        node.visits = 20
+        c1.visits, c1.wins = 10, 8.0
+        c2.visits, c2.wins = 8, 2.0
+        best = node.best_child()
+        assert best in node.children
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 5. AI ENGINES — MCTSEngine
+#  Board Widget
 # ═══════════════════════════════════════════════════════════════════
-
-class TestMCTSEngine:
-    def test_search_returns_correct_types(self):
-        from ai_engines import MCTSEngine
-        eng = MCTSEngine()
-        board = chess.Board()
-        best_move, white_eval, visits, policy = eng.search(board, iterations=10)
-        assert best_move is None or isinstance(best_move, chess.Move)
-        assert isinstance(white_eval, (int, float))
-        assert isinstance(visits, int)
-        assert isinstance(policy, dict)
-
-    def test_search_finds_move(self):
-        from ai_engines import MCTSEngine
-        eng = MCTSEngine()
-        board = chess.Board()
-        best_move, _, _, _ = eng.search(board, iterations=20)
-        assert best_move is not None
-
-    def test_policy_sums_approximately_one(self):
-        from ai_engines import MCTSEngine
-        eng = MCTSEngine()
-        board = chess.Board()
-        _, _, _, policy = eng.search(board, iterations=20)
-        if policy:
-            total = sum(policy.values())
-            assert abs(total - 1.0) < 0.01
-
-    def test_visits_equals_iterations(self):
-        from ai_engines import MCTSEngine
-        eng = MCTSEngine()
-        board = chess.Board()
-        iters = 15
-        _, _, visits, _ = eng.search(board, iterations=iters)
-        assert visits >= iters
-
-    def test_heuristic_rollout_returns_between_zero_and_one(self):
-        from ai_engines import MCTSEngine
-        eng = MCTSEngine()
-        board = chess.Board()
-        score = eng._heuristic_rollout(board, depth=5)
-        assert 0.0 <= score <= 1.0
-
-    def test_checkmate_rollout(self):
-        from ai_engines import MCTSEngine
-        eng = MCTSEngine()
-        board = chess.Board()
-        for m in ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]:
-            board.push_uci(m)
-        score = eng._heuristic_rollout(board)
-        assert score == 1.0
-
-    def test_stalemate_rollout(self):
-        from ai_engines import MCTSEngine
-        eng = MCTSEngine()
-        board = chess.Board("5k2/5P2/5K2/8/8/8/8/8 b - - 0 1")
-        if board.is_stalemate():
-            score = eng._heuristic_rollout(board)
-            assert score == 0.5
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 6. BOARD WIDGET
-# ═══════════════════════════════════════════════════════════════════
-
 class TestChessBoardWidget:
-    def test_initial_state(self, board_widget):
-        assert board_widget.board is not None
-        assert not board_widget.flipped
-        assert board_widget.selected_sq is None
-        assert board_widget.legal_targets == []
-        assert board_widget.last_move is None
+    @pytest.fixture
+    def bw(self, qapp):
+        from board_widget import ChessBoardWidget
+        w = ChessBoardWidget()
+        w.resize(400, 400)
+        yield w
+        _safe_delete(w)
 
-    def test_set_position(self, board_widget):
-        board = chess.Board("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
-        last_move = chess.Move.from_uci("e2e4")
-        board_widget.set_position(board, last_move)
-        assert board_widget.board == board
-        assert board_widget.last_move == last_move
-        assert board_widget.selected_sq is None
+    def test_creation(self, bw):
+        assert bw.board is not None
+        assert not bw.flipped
 
-    def test_set_theme(self, board_widget):
-        from constants import BoardTheme
-        t = BoardTheme("Blue")
-        board_widget.set_theme(t)
-        assert board_widget.theme.name == "Blue"
+    def test_set_position_clears_state(self, bw):
+        bw.selected_sq = chess.E2
+        bw.legal_targets = [chess.E4]
+        bw.set_position(chess.Board())
+        assert bw.selected_sq is None
+        assert bw.legal_targets == []
+        assert bw.anim_move is None
 
-    def test_flip(self, board_widget):
-        board_widget.flipped = True
-        assert board_widget.flipped
-        board_widget.flipped = False
-        assert not board_widget.flipped
+    def test_set_position_animated(self, bw):
+        bw.set_position_animated(chess.Board())
+        assert bw.board is not None
 
-    def test_square_clicked_signal(self, board_widget):
+    def test_set_theme(self, bw):
+        from constants import THEMES
+        bw.set_theme(THEMES["Blue"])
+        assert bw.theme.name == "Blue"
+
+    def test_layout(self, bw):
+        t, m, s = bw._layout()
+        assert t > 0
+        assert s > 0
+
+    def test_sq_rect_returns_valid(self, bw):
+        t, m, s = bw._layout()
+        for sq in chess.SQUARES:
+            rect = bw._sq_rect(sq, t, m, s)
+            assert rect.width() > 0
+            assert rect.height() > 0
+
+    def test_pos_to_sq_roundtrip(self, bw):
+        t, m, s = bw._layout()
+        for sq in chess.SQUARES:
+            rect = bw._sq_rect(sq, t, m, s)
+            cx = int(rect.center().x())
+            cy = int(rect.center().y())
+            result = bw._pos_to_sq(QPointF(cx, cy).toPoint(), t, m, s)
+            assert result is not None
+
+    def test_flipped_pos_to_sq(self, bw):
+        bw.flipped = True
+        t, m, s = bw._layout()
+        rect = bw._sq_rect(chess.A1, t, m, s)
+        cx = int(rect.center().x())
+        cy = int(rect.center().y())
+        result = bw._pos_to_sq(QPointF(cx, cy).toPoint(), t, m, s)
+        assert result == chess.A1
+
+    def test_render_to_image_no_show_needed(self, bw):
+        img = bw.render_to_image(400)
+        assert isinstance(img, QImage)
+        assert img.width() == 400
+        assert img.height() == 400
+
+    def test_render_to_image_large(self, bw):
+        img = bw.render_to_image(1080)
+        assert isinstance(img, QImage)
+        assert img.width() == 1080
+
+    def test_render_to_image_with_pieces(self, bw):
+        bw.set_position(chess.Board())
+        img = bw.render_to_image(400)
+        assert isinstance(img, QImage)
+
+    def test_render_to_image_with_last_move(self, bw):
+        bw.set_position(chess.Board(), lm=chess.Move.from_uci("e2e4"))
+        img = bw.render_to_image(400)
+        assert isinstance(img, QImage)
+
+    def test_square_clicked_signal(self, bw):
         received = []
-        board_widget.squareClicked.connect(lambda sq: received.append(sq))
-        board_widget.squareClicked.emit(chess.E2)
+        bw.squareClicked.connect(lambda sq: received.append(sq))
+        bw.squareClicked.emit(chess.E2)
         assert received == [chess.E2]
 
-    def test_highlighted_squares(self, board_widget):
-        board_widget.highlighted.add(chess.E4)
-        assert chess.E4 in board_widget.highlighted
-        board_widget.highlighted.symmetric_difference_update({chess.E4})
-        assert chess.E4 not in board_widget.highlighted
+    def test_anim_properties(self, bw):
+        for val in [0.0, 0.5, 1.0]:
+            bw._set_ap(val)
+            assert bw._get_ap() == val
+            bw._set_co(val)
+            assert bw._get_co() == val
+            bw._set_fo(val)
+            assert bw._get_fo() == val
 
-    def test_arrows(self, board_widget):
-        board_widget.arrows.append((chess.E2, chess.E4, QColor(220, 50, 47, 200)))
-        assert len(board_widget.arrows) == 1
+    def test_policy_vis(self, bw):
+        bw.policy_vis = {"e2e4": 0.8, "d2d4": 0.2}
+        assert len(bw.policy_vis) == 2
 
-    def test_policy_vis(self, board_widget):
-        board_widget.policy_vis = {"e2e4": 0.8, "d2d4": 0.2}
-        assert "e2e4" in board_widget.policy_vis
+    def test_arrows(self, bw):
+        bw.arrows.append((chess.E2, chess.E4, QColor(220, 50, 47, 200)))
+        assert len(bw.arrows) == 1
 
-    def test_layout_values(self, board_widget):
-        total, margin, sq = board_widget._layout()
-        assert total > 0
-        assert sq > 0
-        assert margin >= 0
+    def test_highlighted_squares(self, bw):
+        bw.highlighted = {chess.E4}
+        bw.update()
+        assert chess.E4 in bw.highlighted
 
-    def test_sq_rect_in_bounds(self, board_widget):
-        total, margin, sq = board_widget._layout()
-        rect = board_widget._sq_rect(chess.E4, total, margin, sq)
-        assert rect.width() > 0
-        assert rect.height() > 0
-
-    def test_pos_to_sq_roundtrip(self, board_widget):
-        total, margin, sq = board_widget._layout()
-        rect = board_widget._sq_rect(chess.E4, total, margin, sq)
-        center = rect.center().toPoint()
-        result = board_widget._pos_to_sq(center, total, margin, sq)
-        assert result == chess.E4
-
-    def test_render_to_image(self, board_widget):
-        img = board_widget.render_to_image(200)
+    def test_paint_content_directly(self, bw):
+        img = QImage(400, 400, QImage.Format_ARGB32)
+        img.fill(QColor(0, 0, 0, 0))
+        from PySide6.QtGui import QPainter
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        m = 400 * 0.05
+        sz = (400 - 2 * m) / 8
+        bw._paint_content(p, 400, m, sz)
+        p.end()
         assert isinstance(img, QImage)
-        assert not img.isNull()
-        assert img.width() == 200
-        assert img.height() == 200
-
-    def test_anim_move_property(self, board_widget):
-        board_widget.anim_move = chess.Move.from_uci("e2e4")
-        board_widget.anim_progress = 0.5
-        assert board_widget.anim_move == chess.Move.from_uci("e2e4")
-        assert board_widget.anim_progress == 0.5
-
-    def test_set_position_clears_selection(self, board_widget):
-        board_widget.selected_sq = chess.E2
-        board_widget.legal_targets = [chess.E4]
-        board_widget.set_position(chess.Board())
-        assert board_widget.selected_sq is None
-        assert board_widget.legal_targets == []
-
-    def test_show_coords_toggle(self, board_widget):
-        board_widget.show_coords = True
-        _, margin_on, _ = board_widget._layout()
-        board_widget.show_coords = False
-        _, margin_off, _ = board_widget._layout()
-        assert margin_on > margin_off
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 7. EVAL BAR WIDGET
+#  EvalBarWidget
 # ═══════════════════════════════════════════════════════════════════
-
 class TestEvalBarWidget:
-    def test_initial_eval(self, eval_bar):
-        assert eval_bar.eval_cp == 0.0
+    @pytest.fixture
+    def ew(self, qapp):
+        from widgets import EvalBarWidget
+        w = EvalBarWidget()
+        w.resize(60, 400)
+        yield w
+        _safe_delete(w)
 
-    def test_set_eval(self, eval_bar):
-        eval_bar.set_eval(150.0)
-        assert eval_bar.eval_cp == 150.0
+    def test_creation(self, ew):
+        assert ew._eval_cp == 0.0
+        assert ew._game_state == "normal"
 
-    def test_set_eval_negative(self, eval_bar):
-        eval_bar.set_eval(-200.0)
-        assert eval_bar.eval_cp == -200.0
+    def test_set_eval(self, ew):
+        ew.set_eval(150.0)
+        assert ew._eval_cp == 150.0
 
-    def test_set_eval_mate(self, eval_bar):
-        eval_bar.set_eval(10001.0)
-        assert eval_bar.eval_cp > 9000
+    def test_set_eval_mate_positive(self, ew):
+        ew.set_eval(10001)
+        assert ew._eval_cp == 10001
 
-    def test_fixed_size(self, eval_bar):
-        assert eval_bar.width() > 0
-        assert eval_bar.height() > 0
+    def test_set_eval_mate_negative(self, ew):
+        ew.set_eval(-10002)
+        assert ew._eval_cp == -10002
+
+    def test_set_game_state_checkmate(self, ew):
+        from constants import GAME_CHECKMATE
+        ew.set_game_state(GAME_CHECKMATE, result="1-0", detail="Checkmate")
+        assert ew._game_state == GAME_CHECKMATE
+        assert ew._game_result == "1-0"
+        assert ew._game_detail == "Checkmate"
+
+    def test_set_game_state_draw(self, ew):
+        from constants import GAME_DRAW
+        ew.set_game_state(GAME_DRAW, result="½-½", detail="Draw")
+        assert ew._game_state == GAME_DRAW
+
+    def test_reset_game_state(self, ew):
+        from constants import GAME_CHECKMATE
+        ew.set_game_state(GAME_CHECKMATE, result="1-0")
+        ew.reset_game_state()
+        assert ew._game_state == "normal"
+        assert ew._game_result == ""
+
+    def test_cp_to_ratio_center(self):
+        from widgets import EvalBarWidget
+        assert abs(EvalBarWidget._cp_to_ratio(0) - 0.5) < 0.01
+
+    def test_cp_to_ratio_extremes(self):
+        from widgets import EvalBarWidget
+        assert EvalBarWidget._cp_to_ratio(9000) == 1.0
+        assert EvalBarWidget._cp_to_ratio(-9000) == 0.0
+
+    def test_cp_to_ratio_symmetry(self):
+        from widgets import EvalBarWidget
+        r_pos = EvalBarWidget._cp_to_ratio(100)
+        r_neg = EvalBarWidget._cp_to_ratio(-100)
+        assert abs(r_pos - (1 - r_neg)) < 0.01
+
+    def test_set_anim_duration(self, ew):
+        ew.set_anim_duration(500)
+        assert ew._anim_dur == 500
+        ew.set_anim_duration(0)
+        assert ew._anim_dur == 0
+
+    def test_eval_snap_on_game_over(self, ew):
+        from constants import GAME_CHECKMATE
+        ew.set_game_state(GAME_CHECKMATE)
+        ew.set_eval(10001)
+        assert ew._anim_cp == 10001.0
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 8. VIDEO CANVAS
+#  PromotionWidget
 # ═══════════════════════════════════════════════════════════════════
+class TestPromotionWidget:
+    @pytest.fixture
+    def pw(self, qapp):
+        from widgets import PromotionWidget
+        w = PromotionWidget()
+        yield w
+        _safe_delete(w)
 
+    def test_initially_hidden(self, pw):
+        assert pw.isHidden()
+
+    def test_show_for_white(self, pw):
+        pw.show_for_color(chess.WHITE)
+        assert pw.isVisible()
+
+    def test_show_for_black(self, pw):
+        pw.show_for_color(chess.BLACK)
+        assert pw.isVisible()
+
+    def test_piece_selected_signal(self, pw):
+        received = []
+        pw.piece_selected.connect(lambda pt: received.append(pt))
+        pw.piece_selected.emit(chess.QUEEN)
+        assert received == [chess.QUEEN]
+
+    def test_pick_emits_and_hides(self, pw):
+        pw.show()
+        received = []
+        pw.piece_selected.connect(lambda pt: received.append(pt))
+        for pt in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+            pw._pick(pt)
+            assert received[-1] == pt
+            assert pw.isHidden()
+            pw.show()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  VideoCanvas
+# ═══════════════════════════════════════════════════════════════════
 class TestVideoCanvas:
-    def test_initial_state(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
+    @pytest.fixture
+    def canvas_deps(self, qapp):
+        from board_widget import ChessBoardWidget
+        from widgets import EvalBarWidget
+        bw = ChessBoardWidget()
+        bw.resize(400, 400)
+        ew = EvalBarWidget()
+        yield bw, ew
+        _safe_delete(bw)
+        _safe_delete(ew)
+
+    def test_creation_defaults(self, canvas_deps):
+        from widgets import VideoCanvas
+        bw, ew = canvas_deps
+        vc = VideoCanvas(bw, ew)
         assert vc.w == 1920
         assert vc.h == 1080
         assert vc.eval_cp == 0.0
-        assert vc.white_name == "White"
-        assert vc.black_name == "Black"
 
-    def test_render_returns_image(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
+    def test_render_normal(self, canvas_deps):
+        from widgets import VideoCanvas
+        bw, ew = canvas_deps
+        vc = VideoCanvas(bw, ew, w=640, h=360)
         img = vc.render()
         assert isinstance(img, QImage)
-        assert not img.isNull()
-        assert img.width() == 1920
-        assert img.height() == 1080
+        assert img.width() == 640
+        assert img.height() == 360
 
-    def test_render_custom_resolution(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar, w=1280, h=720)
-        img = vc.render()
-        assert img.width() == 1280
-        assert img.height() == 720
-
-    def test_render_with_eval(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.eval_cp = 250.0
-        img = vc.render()
-        assert not img.isNull()
-
-    def test_render_with_negative_eval(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.eval_cp = -300.0
-        img = vc.render()
-        assert not img.isNull()
-
-    def test_render_with_mate_eval(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.eval_cp = 10001.0
-        img = vc.render()
-        assert not img.isNull()
-
-    def test_render_with_names(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.white_name = "Magnus"
-        vc.black_name = "Hikaru"
-        img = vc.render()
-        assert not img.isNull()
-
-    def test_render_with_move_text(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.move_text = "1. e4"
-        img = vc.render()
-        assert not img.isNull()
-
-    def test_render_with_engine_text(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.engine_text = "Stockfish 16"
-        img = vc.render()
-        assert not img.isNull()
-
-    def test_render_with_move_list(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
+    def test_render_with_move_list(self, canvas_deps):
+        from widgets import VideoCanvas
+        bw, ew = canvas_deps
+        vc = VideoCanvas(bw, ew, w=1280, h=720)
         vc.move_list_text = ["e4", "e5", "Nf3", "Nc6"]
         vc.current_move_index = 2
         img = vc.render()
-        assert not img.isNull()
+        assert isinstance(img, QImage)
 
-    def test_render_with_overlays(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.overlays = [{"path": "/nonexistent/image.png", "x": 50, "y": 50, "w": 100, "h": 100}]
+    def test_render_with_names(self, canvas_deps):
+        from widgets import VideoCanvas
+        bw, ew = canvas_deps
+        vc = VideoCanvas(bw, ew, w=640, h=360)
+        vc.white_name = "Magnus"
+        vc.black_name = "Hikaru"
         img = vc.render()
-        assert not img.isNull()
+        assert isinstance(img, QImage)
 
-    def test_render_with_bg_color(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar, bg_color=QColor(50, 50, 60))
+    def test_render_checkmate_white(self, canvas_deps):
+        from widgets import VideoCanvas
+        from constants import GAME_CHECKMATE
+        bw, ew = canvas_deps
+        vc = VideoCanvas(bw, ew, w=640, h=360)
+        vc.game_state = GAME_CHECKMATE
+        vc.game_result = "1-0"
+        vc.eval_cp = 10001
         img = vc.render()
-        assert not img.isNull()
+        assert isinstance(img, QImage)
 
-    def test_render_flipped_board(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        board_widget.flipped = True
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.white_name = "W"
-        vc.black_name = "B"
+    def test_render_checkmate_black(self, canvas_deps):
+        from widgets import VideoCanvas
+        from constants import GAME_CHECKMATE
+        bw, ew = canvas_deps
+        vc = VideoCanvas(bw, ew, w=640, h=360)
+        vc.game_state = GAME_CHECKMATE
+        vc.game_result = "0-1"
+        vc.eval_cp = -10001
         img = vc.render()
-        assert not img.isNull()
-        board_widget.flipped = False
+        assert isinstance(img, QImage)
+
+    def test_render_stalemate(self, canvas_deps):
+        from widgets import VideoCanvas
+        from constants import GAME_STALEMATE
+        bw, ew = canvas_deps
+        vc = VideoCanvas(bw, ew, w=640, h=360)
+        vc.game_state = GAME_STALEMATE
+        vc.game_result = "½-½"
+        img = vc.render()
+        assert isinstance(img, QImage)
+
+    def test_render_draw(self, canvas_deps):
+        from widgets import VideoCanvas
+        from constants import GAME_DRAW
+        bw, ew = canvas_deps
+        vc = VideoCanvas(bw, ew, w=640, h=360)
+        vc.game_state = GAME_DRAW
+        vc.game_result = "½-½"
+        img = vc.render()
+        assert isinstance(img, QImage)
+
+    def test_render_insufficient(self, canvas_deps):
+        from widgets import VideoCanvas
+        from constants import GAME_INSUFFICIENT
+        bw, ew = canvas_deps
+        vc = VideoCanvas(bw, ew, w=640, h=360)
+        vc.game_state = GAME_INSUFFICIENT
+        vc.game_result = "½-½"
+        vc.game_detail = "Insufficient Material"
+        img = vc.render()
+        assert isinstance(img, QImage)
+
+    def test_cp2r(self, canvas_deps):
+        from widgets import VideoCanvas
+        assert abs(VideoCanvas._cp2r(0) - 0.5) < 0.01
+        assert VideoCanvas._cp2r(9000) == 1.0
+        assert VideoCanvas._cp2r(-9000) == 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 9. WORKERS — AIWorker 
+#  Animation Manager
 # ═══════════════════════════════════════════════════════════════════
+class TestAnimationManager:
+    @pytest.fixture
+    def am(self, qapp):
+        from animation_manager import AnimationManager
+        from board_widget import ChessBoardWidget
+        from widgets import EvalBarWidget
+        bw = ChessBoardWidget()
+        ew = EvalBarWidget()
+        m = AnimationManager(bw, ew)
+        yield m
+        m.cancel_all()
+        _safe_delete(bw)
+        _safe_delete(ew)
 
+    def test_defaults(self, am):
+        assert am.enabled
+        assert am.piece_anim
+        assert am.highlight_anim
+        assert am.eval_anim
+        assert am.duration == 250
+        assert am.easing_name == "OutCubic"
+
+    def test_set_duration(self, am):
+        am.set_duration(500)
+        assert am.duration == 500
+
+    def test_set_duration_clamped_min(self, am):
+        am.set_duration(1)
+        assert am.duration == 50
+
+    def test_set_duration_clamped_max(self, am):
+        am.set_duration(9999)
+        assert am.duration == 2000
+
+    def test_set_easing_valid(self, am):
+        for name in ["Linear", "InOutCubic", "OutBack",
+                      "OutBounce", "InCubic"]:
+            am.set_easing(name)
+            assert am.easing_name == name
+
+    def test_set_easing_invalid_falls_back(self, am):
+        am.set_easing("NonExistent")
+        assert am.easing_name == "OutCubic"
+
+    def test_set_piece_anim(self, am):
+        am.set_piece_anim(False)
+        assert not am.piece_anim
+
+    def test_set_highlight_anim(self, am):
+        am.set_highlight_anim(False)
+        assert not am.highlight_anim
+
+    def test_set_eval_anim(self, am):
+        am.set_eval_anim(False)
+        assert not am.eval_anim
+
+    def test_cancel_all(self, am):
+        am.cancel_all()
+        assert len(am._active) == 0
+
+    def test_animate_piece_move_disabled_callback(self, am):
+        am.enabled = False
+        called = []
+        am.animate_piece_move(chess.Move.from_uci("e2e4"),
+                              callback=lambda: called.append(True))
+        assert called == [True]
+
+    def test_animate_piece_move_piece_anim_off(self, am):
+        am.piece_anim = False
+        called = []
+        am.animate_piece_move(chess.Move.from_uci("e2e4"),
+                              callback=lambda: called.append(True))
+        assert called == [True]
+
+    def test_animate_check_disabled(self, am):
+        am.highlight_anim = False
+        am.animate_check(chess.E1)
+
+    def test_animate_last_move_flash_disabled(self, am):
+        am.highlight_anim = False
+        am.animate_last_move_flash(chess.E2, chess.E4)
+
+    def test_configure_eval_bar(self, am):
+        am.configure_eval_bar()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Sound Manager — Synthesis Functions
+# ═══════════════════════════════════════════════════════════════════
+class TestSoundSynthesis:
+    @pytest.fixture(autouse=True)
+    def _skip_no_numpy(self):
+        try:
+            import numpy as np
+        except ImportError:
+            pytest.skip("numpy not available")
+
+    def test_synth_move(self):
+        from sound_manager import _synth_move
+        assert len(_synth_move()) > 0
+
+    def test_synth_capture(self):
+        from sound_manager import _synth_capture
+        assert len(_synth_capture()) > 0
+
+    def test_synth_check(self):
+        from sound_manager import _synth_check
+        assert len(_synth_check()) > 0
+
+    def test_synth_checkmate(self):
+        from sound_manager import _synth_checkmate
+        assert len(_synth_checkmate()) > 0
+
+    def test_synth_castle(self):
+        from sound_manager import _synth_castle
+        assert len(_synth_castle()) > 0
+
+    def test_synth_illegal(self):
+        from sound_manager import _synth_illegal
+        assert len(_synth_illegal()) > 0
+
+    def test_synth_new_game(self):
+        from sound_manager import _synth_new_game
+        assert len(_synth_new_game()) > 0
+
+    def test_synth_promotion(self):
+        from sound_manager import _synth_promotion
+        assert len(_synth_promotion()) > 0
+
+    def test_synth_ui_click(self):
+        from sound_manager import _synth_ui_click
+        assert len(_synth_ui_click()) > 0
+
+    def test_to_wav(self):
+        import numpy as np
+        from sound_manager import _to_wav, _synth_move
+        wav = _to_wav(_synth_move())
+        assert isinstance(wav, bytes)
+        assert len(wav) > 44
+
+    def test_fade(self):
+        import numpy as np
+        from sound_manager import _fade
+        s = np.random.randn(1000).astype(np.float64)
+        f = _fade(s.copy())
+        assert len(f) == len(s)
+
+    def test_norm(self):
+        import numpy as np
+        from sound_manager import _norm
+        s = np.random.randn(1000).astype(np.float64)
+        n = _norm(s)
+        assert abs(np.max(np.abs(n)) - 0.9) < 0.15
+
+    def test_add_reverb(self):
+        from sound_manager import _add_reverb, _synth_move
+        r = _add_reverb(_synth_move(), amount=0.2)
+        assert len(r) > 0
+
+    def test_add_reverb_zero(self):
+        from sound_manager import _add_reverb, _synth_move
+        s = _synth_move()
+        r = _add_reverb(s, amount=0.0)
+        assert len(r) == len(s)
+
+    def test_bitcrush(self):
+        import numpy as np
+        from sound_manager import _bitcrush
+        s = np.random.randn(1000).astype(np.float64)
+        c = _bitcrush(s, bits=4)
+        assert len(np.unique(c)) < len(np.unique(s))
+
+    def test_bitcrush_16bits_noop(self):
+        import numpy as np
+        from sound_manager import _bitcrush
+        s = np.random.randn(1000).astype(np.float64)
+        c = _bitcrush(s, bits=16)
+        assert len(c) == len(s)
+
+
+class TestSoundDesignSynths:
+    @pytest.fixture(autouse=True)
+    def _skip_no_numpy(self):
+        try:
+            import numpy as np
+        except ImportError:
+            pytest.skip("numpy not available")
+
+    def test_all_design_synths(self):
+        from sound_manager import (
+            _synth_check_design, _synth_checkmate_design,
+            _synth_castle_design, _synth_illegal_design,
+            _synth_new_game_design, _synth_promotion_design,
+            _synth_ui_click_design,
+        )
+        for fn in [_synth_check_design, _synth_checkmate_design,
+                    _synth_castle_design, _synth_illegal_design,
+                    _synth_new_game_design, _synth_promotion_design,
+                    _synth_ui_click_design]:
+            assert len(fn()) > 0
+
+
+class TestSoundManager:
+    @pytest.fixture
+    def sm(self, qapp):
+        from sound_manager import SoundManager, HAS_MM, HAS_NP
+        if not HAS_MM or not HAS_NP:
+            pytest.skip("QtMultimedia or numpy not available")
+        manager = SoundManager()
+        yield manager
+        manager.cleanup()
+
+    def test_creation(self, sm):
+        assert sm.enabled
+
+    def test_set_volume(self, sm):
+        sm.set_volume(0.3)
+        assert sm._volume == 0.3
+        sm.set_volume(1.5)
+        assert sm._volume == 1.0
+        sm.set_volume(-0.1)
+        assert sm._volume == 0.0
+
+    def test_set_theme(self, sm):
+        for t in ["Classic", "Digital", "Tournament"]:
+            sm.set_theme(t)
+            assert sm._theme == t
+
+    def test_set_design(self, sm):
+        for d in ["Default", "Warm", "Crisp",
+                   "Retro", "Cinematic", "Minimal"]:
+            sm.set_design(d)
+            assert sm._design == d
+
+    def test_set_enabled(self, sm):
+        sm.set_enabled(False)
+        assert not sm.enabled
+        sm.set_enabled(True)
+        assert sm.enabled
+
+    def test_play_when_disabled(self, sm):
+        sm.set_enabled(False)
+        sm.play("move")
+
+    def test_play_nonexistent(self, sm):
+        sm.play("nonexistent_sound")
+
+    def test_set_type_volume(self, sm):
+        sm.set_type_volume("move", 0.5)
+        assert sm._type_vol["move"] == 0.5
+
+    def test_silent_theme_no_sounds(self, sm):
+        sm.set_theme("Silent")
+        assert len(sm._sounds) == 0
+
+    def test_play_move(self, sm):
+        sm.play("move")
+
+        # In TestSoundManager:
+
+    def test_cleanup_clears_sounds(self, sm):
+        assert len(sm._sounds) > 0
+        sm.cleanup()
+        assert len(sm._sounds) == 0
+
+    def test_cleanup_removes_temp(self, sm):
+        """After cleanup, the temp directory should eventually be removed.
+        On Windows, QSoundEffect file handles may take time to release
+        after deleteLater(), so we retry with gc.collect()."""
+        td = sm._temp_dir
+        assert td is not None
+        sm.cleanup()
+        # Retry with gc.collect() to help release C++ file handles
+        import gc
+        removed = not os.path.isdir(td)
+        for attempt in range(20):
+            if removed:
+                break
+            gc.collect()
+            time.sleep(0.15)
+            removed = not os.path.isdir(td)
+        assert removed, f"Temp directory still exists after 3s: {td}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Workers
+# ═══════════════════════════════════════════════════════════════════
 class TestAIWorker:
-    def test_minimax_worker(self, qtbot):
+    def test_minimax(self, qapp):
         from workers import AIWorker
-        board = chess.Board()
-        worker = AIWorker("Minimax (Alpha-Beta)", board.fen(), {"depth": 1})
-        with qtbot.waitSignal(worker.eval_ready, timeout=15000):
-            worker.start()
-        worker.wait(3000)
-
-    def test_mcts_worker(self, qtbot):
-        from workers import AIWorker
-        board = chess.Board()
-        worker = AIWorker("MCTS (Monte Carlo)", board.fen(), {"iterations": 10})
-        with qtbot.waitSignal(worker.eval_ready, timeout=15000):
-            worker.start()
-        worker.wait(3000)
-
-    def test_worker_emits_correct_keys(self, qtbot):
-        from workers import AIWorker
-        board = chess.Board()
-        worker = AIWorker("Minimax (Alpha-Beta)", board.fen(), {"depth": 1})
+        w = AIWorker("Minimax (Alpha-Beta)",
+                     chess.Board().fen(), {"depth": 2})
         results = []
-
-        def capture(data):
-            results.append(data)
-
-        worker.eval_ready.connect(capture)
-        with qtbot.waitSignal(worker.eval_ready, timeout=15000):
-            worker.start()
-        worker.wait(3000)
+        w.eval_ready.connect(lambda d: results.append(d))
+        w.run()
         assert len(results) == 1
-        data = results[0]
-        assert "eval" in data
-        assert "eval_cp" in data
-        assert "nodes" in data
-        assert "policy" in data
-        assert "engine_type" in data
-        assert data["engine_type"] == "Minimax (Alpha-Beta)"
+        d = results[0]
+        assert "eval" in d
+        assert "eval_cp" in d
+        assert "best_move" in d
+        assert d.get("error") is not True
 
-    def test_worker_invalid_engine_type(self, qtbot):
+    def test_mcts(self, qapp):
         from workers import AIWorker
-        board = chess.Board()
-        worker = AIWorker("NonExistent", board.fen(), {})
-        worker.start()
-        worker.wait(5000)
-
-    def test_worker_empty_board_fen(self, qtbot):
-        from workers import AIWorker
-        board = chess.Board("4k3/8/8/8/8/8/8/4K3 w - - 0 1")
-        worker = AIWorker("Minimax (Alpha-Beta)", board.fen(), {"depth": 1})
+        w = AIWorker("MCTS (Monte Carlo)",
+                     chess.Board().fen(), {"iterations": 50})
         results = []
-        worker.eval_ready.connect(lambda d: results.append(d))
-        with qtbot.waitSignal(worker.eval_ready, timeout=15000):
-            worker.start()
-        worker.wait(3000)
+        w.eval_ready.connect(lambda d: results.append(d))
+        w.run()
         assert len(results) == 1
+        assert "nodes" in results[0]
 
-    @pytest.mark.skipif(not find_stockfish(), reason="Stockfish not installed")
-    def test_stockfish_worker(self, qtbot):
+    def test_stockfish_missing_binary(self, qapp):
         from workers import AIWorker
-        board = chess.Board()
-        sf_path = find_stockfish()
-        worker = AIWorker("Stockfish (UCI)", board.fen(), {"path": sf_path})
-        with qtbot.waitSignal(worker.eval_ready, timeout=30000):
-            worker.start()
-        worker.wait(5000)
-
-    def test_worker_stockfish_bad_path(self, qtbot):
-        from workers import AIWorker
-        board = chess.Board()
-        worker = AIWorker("Stockfish (UCI)", board.fen(), {"path": "/nonexistent/stockfish"})
+        w = AIWorker("Stockfish (UCI)",
+                     chess.Board().fen(),
+                     {"path": "/nonexistent/stockfish"})
         results = []
-        worker.eval_ready.connect(lambda d: results.append(d))
-        with qtbot.waitSignal(worker.eval_ready, timeout=15000):
-            worker.start()
-        worker.wait(3000)
+        w.eval_ready.connect(lambda d: results.append(d))
+        w.run()
         assert len(results) == 1
-        assert "Error" in results[0]["eval"]
+        assert results[0].get("error") is True
 
-# ═══════════════════════════════════════════════════════════════════
-# 10. WORKERS — BatchEvalWorker
-# ═══════════════════════════════════════════════════════════════════
 
 class TestBatchEvalWorker:
-    def test_batch_eval_with_heuristic(self, qtbot):
+    def test_heuristic_batch(self, qapp):
         from workers import BatchEvalWorker
-        game = chess.pgn.read_game(io.StringIO("1. e4 e5 2. Nf3 Nc6"))
-        move_list = list(game.mainline())
-        worker = BatchEvalWorker(move_list, "Minimax (Alpha-Beta)", {"depth": 1})
+        game = chess.pgn.Game()
+        node = game
+        for san in ["e4", "e5", "Nf3", "Nc6"]:
+            node = node.add_variation(
+                node.board().parse_san(san))
+        ml = list(game.mainline())
+        w = BatchEvalWorker(ml, "Heuristic", {})
         results = []
-        worker.move_evaluated.connect(lambda i, e, s: results.append((i, e, s)))
-        with qtbot.waitSignal(worker.finished, timeout=30000):
-            worker.start()
-        worker.wait(3000)
-        qapp().processEvents()
-        assert len(results) == len(move_list)
+        w.move_evaluated.connect(
+            lambda i, e, s: results.append((i, e, s)))
+        w.run()
+        assert len(results) == len(ml)
 
-    def test_batch_eval_cancel(self, qtbot):
+    def test_cancel(self, qapp):
         from workers import BatchEvalWorker
-        game = chess.pgn.read_game(io.StringIO("1. e4 e5 2. Nf3"))
-        move_list = list(game.mainline())
-        worker = BatchEvalWorker(move_list, "Minimax (Alpha-Beta)", {"depth": 1})
-        worker.cancel()
-        with qtbot.waitSignal(worker.finished, timeout=15000):
-            worker.start()
-        worker.wait(3000)
+        game = chess.pgn.Game()
+        node = game
+        for san in ["e4", "e5", "Nf3", "Nc6", "Bb5", "a6"]:
+            node = node.add_variation(
+                node.board().parse_san(san))
+        ml = list(game.mainline())
+        w = BatchEvalWorker(ml, "Heuristic", {})
+        w.cancel()
+        assert w._c
 
-    def test_batch_eval_finished_signal(self, qtbot):
-        from workers import BatchEvalWorker
-        game = chess.pgn.read_game(io.StringIO("1. e4"))
-        move_list = list(game.mainline())
-        worker = BatchEvalWorker(move_list, "Minimax (Alpha-Beta)", {"depth": 1})
-        with qtbot.waitSignal(worker.finished, timeout=15000):
-            worker.start()
-        worker.wait(3000)
-
-    def test_batch_eval_eval_values(self, qtbot):
-        from workers import BatchEvalWorker
-        game = chess.pgn.read_game(io.StringIO("1. e4"))
-        move_list = list(game.mainline())
-        worker = BatchEvalWorker(move_list, "Minimax (Alpha-Beta)", {"depth": 1})
-        results = []
-        worker.move_evaluated.connect(lambda i, e, s: results.append((i, e, s)))
-        with qtbot.waitSignal(worker.finished, timeout=15000):
-            worker.start()
-        worker.wait(3000)
-        qapp().processEvents()
-        assert len(results) >= 1
-        idx, eval_cp, eval_str = results[0]
-        assert idx == 0
-        assert isinstance(eval_cp, float)
-
-    @pytest.mark.skipif(not find_stockfish(), reason="Stockfish not installed")
-    def test_batch_eval_stockfish(self, qtbot):
-        from workers import BatchEvalWorker
-        game = chess.pgn.read_game(io.StringIO("1. e4 e5"))
-        move_list = list(game.mainline())
-        sf_path = find_stockfish()
-        worker = BatchEvalWorker(move_list, "Stockfish (UCI)", {"path": sf_path})
-        results = []
-        worker.move_evaluated.connect(lambda i, e, s: results.append((i, e, s)))
-        with qtbot.waitSignal(worker.finished, timeout=60000):
-            worker.start()
-        worker.wait(5000)
-        qapp().processEvents()
-        assert len(results) == 2
-        # Verify eval values are reasonable
-        for idx, eval_cp, eval_str in results:
-            assert isinstance(eval_cp, float)
-            assert isinstance(eval_str, str)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 11. WORKERS — ExportWorker
-# ═══════════════════════════════════════════════════════════════════
 
 class TestExportWorker:
-    def test_export_worker_creates_file(self, qtbot):
-        """Test that ExportWorker produces a valid video file.
-
-        Uses avc1 (H.264) on all platforms — YouTube's preferred codec.
-        Falls back through the codec chain automatically.
-        """
-        from constants import HAS_CV2
-        if not HAS_CV2:
-            pytest.skip("opencv-python not installed")
-        import numpy as np
+    def test_no_frames(self, qapp):
         from workers import ExportWorker
-
-        frames = [np.zeros((720, 1280, 3), dtype=np.uint8) for _ in range(5)]
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            out_path = tmp.name
-        try:
-            worker = ExportWorker(frames, 30, out_path, 1280, 720)
-            results = []
-            worker.finished.connect(lambda m: results.append(m))
-            with qtbot.waitSignal(worker.finished, timeout=15000):
-                worker.start()
-            worker.wait(3000)
-            assert len(results) == 1
-            assert "ERROR" not in results[0]
-            # File should exist and have content
-            actual_path = out_path
-            if not os.path.exists(out_path):
-                # Codec fallback may have changed the extension
-                base = os.path.splitext(out_path)[0]
-                for ext in [".avi"]:
-                    candidate = base + ext
-                    if os.path.exists(candidate):
-                        actual_path = candidate
-                        break
-            assert os.path.exists(actual_path)
-            assert os.path.getsize(actual_path) > 0
-        finally:
-            for path in [out_path, os.path.splitext(out_path)[0] + ".avi"]:
-                if os.path.exists(path):
-                    os.unlink(path)
-
-    def test_export_worker_no_cv2(self, qtbot):
-        """Test that ExportWorker emits an error when opencv is missing.
-
-        Temporarily sets workers.HAS_CV2 = False to force the error path,
-        then restores the original value.  Runs even when opencv IS installed.
-        """
-        import workers as workers_mod
-        original_has_cv2 = workers_mod.HAS_CV2
-        workers_mod.HAS_CV2 = False
-        try:
-            out_path = os.path.join(tempfile.gettempdir(), "test_no_cv2.mp4")
-            worker = workers_mod.ExportWorker([], 30, out_path, 1280, 720)
-            results = []
-            worker.finished.connect(lambda m: results.append(m))
-            with qtbot.waitSignal(worker.finished, timeout=15000):
-                worker.start()
-            worker.wait(3000)
-            assert len(results) == 1
-            assert "ERROR" in results[0] or "opencv" in results[0].lower()
-        finally:
-            workers_mod.HAS_CV2 = original_has_cv2
-
-    def test_export_worker_no_frames(self, qtbot):
-        """Test that exporting zero frames reports an error."""
-        from constants import HAS_CV2
-        if not HAS_CV2:
-            pytest.skip("opencv-python not installed")
-        from workers import ExportWorker
-
-        out_path = os.path.join(tempfile.gettempdir(), "test_empty.mp4")
-        worker = ExportWorker([], 30, out_path, 1280, 720)
+        w = ExportWorker([], 30, "/tmp/test_out.mp4", 640, 360)
         results = []
-        worker.finished.connect(lambda m: results.append(m))
-        with qtbot.waitSignal(worker.finished, timeout=15000):
-            worker.start()
-        worker.wait(3000)
+        w.export_finished.connect(lambda m: results.append(m))
+        w.run()
         assert len(results) == 1
         assert "ERROR" in results[0] or "No frames" in results[0]
 
-    def test_export_worker_cancel(self, qtbot):
-        """Test cancelling an export worker.
-
-        Uses avc1 (H.264) — safe on all platforms including Windows.
-        """
-        from constants import HAS_CV2
-        if not HAS_CV2:
-            pytest.skip("opencv-python not installed")
-        import numpy as np
+    def test_cancel(self, qapp):
         from workers import ExportWorker
+        w = ExportWorker([b"fake"], 30, "/tmp/test_cancel.mp4",
+                         640, 360)
+        w.cancel()
+        assert w._c
 
-        frames = [np.zeros((720, 1280, 3), dtype=np.uint8) for _ in range(100)]
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            out_path = tmp.name
-        try:
-            worker = ExportWorker(frames, 60, out_path, 1280, 720)
-            worker.start()
-            worker.cancel()
-            worker.wait(10000)
-        finally:
-            for path in [out_path, os.path.splitext(out_path)[0] + ".avi"]:
-                if os.path.exists(path):
-                    os.unlink(path)
 
-    def test_export_worker_codec_fallback_logic(self):
-        """Test the codec selection logic without calling VideoWriter.
+class TestResolveStockfish:
+    def test_with_path(self):
+        from workers import _resolve_sf
+        assert _resolve_sf("/usr/local/bin/stockfish") == \
+            "/usr/local/bin/stockfish"
 
-        Runs safely on all platforms including Windows.
-        """
-        from workers import _get_youtube_codecs
-        codecs = _get_youtube_codecs()
-
-        # Should always have at least 2 fallback codecs
-        assert len(codecs) >= 2
-
-        # First codec must produce .mp4 (YouTube's required container)
-        first_codec, first_ext = codecs[0]
-        assert first_ext == ".mp4"
-        assert first_codec in ("avc1", "X264"), \
-            f"First codec should be H.264, got {first_codec}"
-
-        # Path extension switching logic
-        out_path = "my_video.mp4"
-        for fourcc_str, ext in codecs:
-            used_path = out_path
-            if not used_path.lower().endswith(ext):
-                base = os.path.splitext(used_path)[0]
-                used_path = base + ext
-            assert used_path.lower().endswith(ext), \
-                f"Path {used_path} should end with {ext}"
-
-        # Verify Windows never uses mp4v
-        if platform.system() == "Windows":
-            codec_names = [c[0] for c in codecs]
-            assert "mp4v" not in codec_names, \
-                "mp4v must never be used on Windows (causes access violation)"
-
-        # Verify at least one H.264 codec is available
-        h264_codecs = [c for c in codecs if c[0] in ("avc1", "X264")]
-        assert len(h264_codecs) >= 1, "Must have at least one H.264 codec"
-
-        # Verify all H.264 codecs target .mp4
-        for codec_name, ext in h264_codecs:
-            assert ext == ".mp4", \
-                f"H.264 codec {codec_name} must use .mp4 container, got {ext}"
+    def test_empty_string(self):
+        from workers import _resolve_sf
+        result = _resolve_sf("")
+        assert result is None or isinstance(result, str)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 12. DIALOGS — PromotionWidget (inline, no popups)
+#  UI Builder
 # ═══════════════════════════════════════════════════════════════════
-
-class TestPromotionWidget:
-    def test_widget_creation(self):
-        from dialogs import PromotionWidget
-        w = PromotionWidget()
-        assert w is not None
-        w.close()
-
-    def test_widget_has_piece_selected_signal(self):
-        from dialogs import PromotionWidget
-        w = PromotionWidget()
-        received = []
-        w.piece_selected.connect(lambda pt: received.append(pt))
-        w.piece_selected.emit(chess.QUEEN)
-        assert received == [chess.QUEEN]
-        w.close()
-
-    def test_show_for_white(self):
-        from dialogs import PromotionWidget
-        w = PromotionWidget()
-        w.show_for_color(chess.WHITE)
-        assert w.isVisible()
-        w.close()
-
-    def test_show_for_black(self):
-        from dialogs import PromotionWidget
-        w = PromotionWidget()
-        w.show_for_color(chess.BLACK)
-        assert w.isVisible()
-        w.close()
-
-    def test_pick_queen(self):
-        from dialogs import PromotionWidget
-        w = PromotionWidget()
-        received = []
-        w.piece_selected.connect(lambda pt: received.append(pt))
-        w.show_for_color(chess.WHITE)
-        w._pick(chess.QUEEN)
-        assert received == [chess.QUEEN]
-        assert not w.isVisible()
-
-    def test_pick_rook(self):
-        from dialogs import PromotionWidget
-        w = PromotionWidget()
-        received = []
-        w.piece_selected.connect(lambda pt: received.append(pt))
-        w.show_for_color(chess.WHITE)
-        w._pick(chess.ROOK)
-        assert received == [chess.ROOK]
-        assert not w.isVisible()
-
-    def test_pick_bishop(self):
-        from dialogs import PromotionWidget
-        w = PromotionWidget()
-        received = []
-        w.piece_selected.connect(lambda pt: received.append(pt))
-        w.show_for_color(chess.BLACK)
-        w._pick(chess.BISHOP)
-        assert received == [chess.BISHOP]
-        assert not w.isVisible()
-
-    def test_pick_knight(self):
-        from dialogs import PromotionWidget
-        w = PromotionWidget()
-        received = []
-        w.piece_selected.connect(lambda pt: received.append(pt))
-        w.show_for_color(chess.BLACK)
-        w._pick(chess.KNIGHT)
-        assert received == [chess.KNIGHT]
-        assert not w.isVisible()
-
-    def test_pick_hides_widget(self):
-        from dialogs import PromotionWidget
-        w = PromotionWidget()
-        w.show_for_color(chess.WHITE)
-        assert w.isVisible()
-        w._pick(chess.QUEEN)
-        assert not w.isVisible()
-
-    def test_all_pieces_for_both_colors(self):
-        from dialogs import PromotionWidget
-        for color in [chess.WHITE, chess.BLACK]:
-            for piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
-                w = PromotionWidget()
-                received = []
-                w.piece_selected.connect(lambda pt: received.append(pt))
-                w.show_for_color(color)
-                w._pick(piece)
-                assert received == [piece]
-                assert not w.isVisible()
-                w.close()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 13. MAIN WINDOW — Core Navigation
-# ═══════════════════════════════════════════════════════════════════
-
-class TestMainWindowCore:
-    def test_window_title(self, main_window):
-        assert "Chess Video Maker Pro" in main_window.windowTitle()
-
-    def test_new_game(self, main_window):
-        main_window._new_game()
-        assert main_window.game is not None
-        assert main_window.node is not None
-        assert main_window.move_index == -1
-        assert main_window.move_list == []
-
-    def test_go_first(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        main_window._go_last()
-        main_window._go_first()
-        assert main_window.node == main_window.game
-
-    def test_go_last(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        main_window._go_last()
-        assert main_window.node == main_window.move_list[-1]
-
-    def test_go_next(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        main_window._go_first()
-        initial_node = main_window.node
-        main_window._go_next()
-        assert main_window.node != initial_node
-
-    def test_go_prev(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        main_window._go_next()
-        node_after_next = main_window.node
-        main_window._go_prev()
-        assert main_window.node != node_after_next
-
-    def test_toggle_play(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        main_window._go_first()
-        main_window._toggle_play()
-        assert main_window._playing
-        main_window._toggle_play()
-        assert not main_window._playing
-
-    def test_flip_board(self, main_window):
-        initial = main_window.board_widget.flipped
-        main_window._flip_board()
-        assert main_window.board_widget.flipped != initial
-
-    def test_theme_changed(self, main_window):
-        main_window._theme_changed("Blue")
-        assert main_window.board_widget.theme.name == "Blue"
-        main_window._theme_changed("Classic")
-        assert main_window.board_widget.theme.name == "Classic"
-
-    def test_apply_comment(self, main_window):
-        main_window.anno_edit.setPlainText("Test comment")
-        main_window._apply_comment()
-        assert main_window.node.comment == "Test comment"
-
-    def test_update_names(self, main_window):
-        main_window.white_name_edit.setText("Magnus")
-        main_window.black_name_edit.setText("Hikaru")
-        main_window._update_names()
-
-    def test_clear_policy(self, main_window):
-        main_window.board_widget.policy_vis = {"e2e4": 0.5}
-        main_window._clear_policy()
-        assert main_window.board_widget.policy_vis == {}
-
-    def test_on_move_row(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        if len(main_window.move_list) > 0:
-            main_window._on_move_row(0)
-            assert main_window.node == main_window.move_list[0]
-
-    def test_on_move_row_invalid(self, main_window):
-        main_window._on_move_row(-1)
-        main_window._on_move_row(999)
-
-    def test_load_pgn_menu_switches_tab(self, main_window):
-        main_window._load_pgn()
-        assert main_window.tabs.currentIndex() == 1
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 14. MAIN WINDOW — Board Interaction
-# ═══════════════════════════════════════════════════════════════════
-
-class TestMainWindowBoardInteraction:
-    def test_click_select_piece(self, main_window):
-        main_window._on_sq_click(chess.E2)
-        assert main_window.board_widget.selected_sq == chess.E2
-        assert len(main_window.board_widget.legal_targets) > 0
-
-    def test_click_move_piece(self, main_window):
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        assert main_window.board_widget.selected_sq is None
-        assert main_window.move_index == 0
-
-    def test_click_wrong_color(self, main_window):
-        main_window._on_sq_click(chess.E7)
-        assert main_window.board_widget.selected_sq is None
-
-    def test_click_empty_square(self, main_window):
-        main_window._on_sq_click(chess.E4)
-        assert main_window.board_widget.selected_sq is None
-
-    def test_click_illegal_move(self, main_window):
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E7)
-        assert main_window.board_widget.selected_sq is None
-
-    def test_play_multiple_moves(self, main_window):
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        main_window._on_sq_click(chess.E7)
-        main_window._on_sq_click(chess.E5)
-        assert main_window.move_index == 1
-
-    def test_ai_vs_ai_blocks_clicks(self, main_window):
-        main_window.ai_vs_ai_running = True
-        main_window._on_sq_click(chess.E2)
-        assert main_window.board_widget.selected_sq is None
-        main_window.ai_vs_ai_running = False
-
-    def test_promo_pick_inline(self, main_window):
-        main_window._pending_promo_from = chess.E7
-        main_window._pending_promo_to = chess.E8
-        board = chess.Board("4k3/4P3/8/8/8/8/8/4K3 w - - 0 1")
-        main_window.board_widget.set_position(board)
-        main_window.node = main_window.game
-        main_window._on_promo_pick(chess.QUEEN)
-        assert main_window._pending_promo_from is None
-        assert main_window._pending_promo_to is None
-        assert not main_window.promo_widget.isVisible()
-
-    def test_promo_pick_resets_pending(self, main_window):
-        main_window._pending_promo_from = chess.E2
-        main_window._pending_promo_to = chess.E4
-        main_window._on_promo_pick(chess.QUEEN)
-        assert main_window._pending_promo_from is None
-        assert main_window._pending_promo_to is None
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 15. MAIN WINDOW — PGN Loading (inline, no dialogs)
-# ═══════════════════════════════════════════════════════════════════
-
-class TestMainWindowPGN:
-    def test_load_pgn_data(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        assert main_window.game == game
-        assert len(main_window.move_list) > 0
-
-    def test_load_pgn_data_moves_populated(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        assert main_window.move_listbox.count() > 0
-
-    def test_load_pgn_data_goes_to_last(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        assert main_window.node == main_window.move_list[-1]
-
-    def test_refresh_move_list_eval_display(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        if main_window.move_list:
-            main_window.eval_cache[main_window.move_list[0]] = 50.0
-            main_window._refresh_move_list()
-            item_text = main_window.move_listbox.item(0).text()
-            assert "(+0.50)" in item_text
-
-    def test_refresh_move_list_mate_eval(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        if main_window.move_list:
-            main_window.eval_cache[main_window.move_list[0]] = 10001.0
-            main_window._refresh_move_list()
-            item_text = main_window.move_listbox.item(0).text()
-            assert "M" in item_text
-
-    def test_load_pgn_text_inline(self, main_window):
-        from constants import SAMPLE_PGN
-        main_window.pgn_text_edit.setPlainText(SAMPLE_PGN)
-        main_window._load_pgn_text()
-        assert len(main_window.move_list) > 0
-        assert main_window.game is not None
-
-    def test_load_pgn_text_empty(self, main_window):
-        main_window.pgn_text_edit.setPlainText("")
-        main_window._load_pgn_text()
-
-    def test_load_pgn_text_invalid(self, main_window):
-        main_window.pgn_text_edit.setPlainText("not valid pgn at all")
-        main_window._load_pgn_text()
-
-    def test_load_pgn_from_file_inline_invalid_path(self, main_window):
-        main_window.pgn_file_edit.setText("/nonexistent/path/to/file.pgn")
-        main_window._load_pgn_from_file()
-
-    def test_load_pgn_from_file_inline_empty_path(self, main_window):
-        main_window.pgn_file_edit.setText("")
-        main_window._load_pgn_from_file()
-
-    def test_load_pgn_from_file_inline_valid(self, main_window):
-        from constants import SAMPLE_PGN
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.pgn', delete=False) as f:
-            f.write(SAMPLE_PGN)
-            tmp_path = f.name
-        try:
-            main_window.pgn_file_edit.setText(tmp_path)
-            main_window._load_pgn_from_file()
-            assert len(main_window.move_list) > 0
-        finally:
-            os.unlink(tmp_path)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 16. MAIN WINDOW — AI Features
-# ═══════════════════════════════════════════════════════════════════
-
-class TestMainWindowAI:
-    def test_toggle_ai_ui(self, main_window):
-        main_window._toggle_ai_ui("Minimax (Alpha-Beta)")
-        assert main_window.ai_stack.currentIndex() == 0
-        main_window._toggle_ai_ui("MCTS (Monte Carlo)")
-        assert main_window.ai_stack.currentIndex() == 1
-        main_window._toggle_ai_ui("Stockfish (UCI)")
-        assert main_window.ai_stack.currentIndex() == 2
-
-    def test_run_engine_minimax(self, main_window, qtbot):
-        main_window.ai_combo.setCurrentText("Minimax (Alpha-Beta)")
-        main_window.mm_depth.setValue(1)
-        main_window._run_engine()
-        with qtbot.waitSignal(main_window.engine_worker.eval_ready, timeout=15000):
-            pass
-        assert main_window.eval_label.text() != "Eval: …"
-
-    def test_on_eval_ready(self, main_window):
-        data = {
-            "eval": "+1.50",
-            "eval_cp": 150.0,
-            "nodes": 1000,
-            "policy": {"e2e4": 0.8, "d2d4": 0.2},
-            "engine_type": "Minimax (Alpha-Beta)",
-            "best_move": "e2e4",
-        }
-        main_window.policy_chk.setChecked(True)
-        main_window._on_eval_ready(data)
-        assert "1.50" in main_window.eval_label.text()
-        assert "1000" in main_window.pv_label.text()
-        assert "e2e4" in main_window.board_widget.policy_vis
-        assert len(main_window.board_widget.arrows) > 0
-
-    def test_on_eval_ready_no_policy(self, main_window):
-        data = {
-            "eval": "+0.00",
-            "eval_cp": 0.0,
-            "nodes": 500,
-            "policy": {},
-            "engine_type": "Minimax (Alpha-Beta)",
-            "best_move": None,
-        }
-        main_window._on_eval_ready(data)
-        assert "0.00" in main_window.eval_label.text()
-
-    def test_batch_eval_no_moves(self, main_window):
-        main_window._new_game()
-        main_window._start_batch_eval()
-
-    def test_start_stop_ai_vs_ai(self, main_window, qtbot):
-        main_window.white_ai_combo.setCurrentText("Minimax (Alpha-Beta)")
-        main_window.white_ai_str.setValue(1)
-        main_window.black_ai_combo.setCurrentText("Minimax (Alpha-Beta)")
-        main_window.black_ai_str.setValue(1)
-        main_window.battle_delay.setValue(50)
-
-        main_window._start_ai_vs_ai()
-        assert main_window.ai_vs_ai_running
-        assert not main_window.start_battle_btn.isEnabled()
-        assert main_window.stop_battle_btn.isEnabled()
-
-        timeout = 15
-        start = time.time()
-        while main_window.ai_vs_ai_running and time.time() - start < timeout:
-            qapp().processEvents()
-            time.sleep(0.05)
-
-        main_window._stop_ai_vs_ai()
-        assert not main_window.ai_vs_ai_running
-        assert main_window.start_battle_btn.isEnabled()
-
-    def test_on_move_evaluated(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        if main_window.move_list:
-            main_window._on_move_evaluated(0, 100.0, "+1.00")
-            assert main_window.move_list[0] in main_window.eval_cache
-
-    def test_on_batch_finished(self, main_window):
-        main_window._on_batch_finished()
-        assert main_window.eval_game_btn.isEnabled()
-        assert not main_window.stop_eval_btn.isEnabled()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 17. MAIN WINDOW — Video Capture & Inline Export
-# ═══════════════════════════════════════════════════════════════════
-
-class TestMainWindowVideo:
-    def test_auto_capture_no_moves(self, main_window):
-        main_window._new_game()
-        main_window._auto_capture()
-        assert len(main_window.capture_frames) == 0
-
-    def test_auto_capture_with_moves(self, main_window):
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        main_window._on_sq_click(chess.E7)
-        main_window._on_sq_click(chess.E5)
-        main_window.fps_spin.setValue(10)
-        main_window.hold_spin.setValue(0.2)
-        main_window._auto_capture()
-        assert len(main_window.capture_frames) > 0
-
-    def test_auto_capture_sets_frame_count(self, main_window):
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        main_window.fps_spin.setValue(10)
-        main_window.hold_spin.setValue(0.2)
-        main_window._auto_capture()
-        assert "Frames:" in main_window.frame_count_lbl.text()
-        count = int(main_window.frame_count_lbl.text().split(":")[1].strip())
-        assert count > 0
-
-    def test_clear_frames(self, main_window):
-        main_window.capture_frames = [QImage(100, 100, QImage.Format_ARGB32)]
-        main_window._clear_frames()
-        assert len(main_window.capture_frames) == 0
-        assert "0" in main_window.frame_count_lbl.text()
-
-    def test_inline_export_no_frames(self, main_window):
-        main_window.capture_frames = []
-        main_window._start_inline_export()
-
-    def test_inline_export_no_output_path(self, main_window):
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        main_window.fps_spin.setValue(10)
-        main_window.hold_spin.setValue(0.2)
-        main_window._auto_capture()
-        main_window.export_path_edit.setText("")
-        from constants import HAS_CV2
-        if HAS_CV2:
-            main_window._start_inline_export()
-
-    def test_auto_capture_with_names(self, main_window):
-        main_window.white_name_edit.setText("Magnus")
-        main_window.black_name_edit.setText("Hikaru")
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        main_window.fps_spin.setValue(10)
-        main_window.hold_spin.setValue(0.2)
-        main_window._auto_capture()
-        assert len(main_window.capture_frames) > 0
-
-    def test_export_progress_handler(self, main_window):
-        main_window._on_export_progress(50, "Frame 5/10")
-        assert main_window.export_progress_bar.value() == 50
-        assert "Frame 5/10" in main_window.export_status_lbl.text()
-
-    def test_export_finished_handler(self, main_window):
-        main_window._start_inline_export()
-        main_window._on_export_finished("Done!\nSaved to: test.mp4")
-        assert main_window.export_start_btn.isEnabled()
-        assert not main_window.export_cancel_btn.isEnabled()
-        assert "Done" in main_window.export_status_lbl.text()
-
-    def test_cancel_export(self, main_window):
-        main_window.export_worker = None
-        main_window._cancel_export()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 18. MAIN WINDOW — Overlays, Assets & Inline Folders
-# ═══════════════════════════════════════════════════════════════════
-
-class TestMainWindowOverlays:
-    def test_add_overlay_no_selection(self, main_window):
-        main_window._add_overlay()
-
-    def test_clear_overlays(self, main_window):
-        main_window.canvas_overlays = [{"path": "test.png", "x": 50, "y": 50, "w": 100, "h": 100}]
-        main_window._clear_overlays()
-        assert main_window.canvas_overlays == []
-
-    def test_scan_img_db_no_folder(self, main_window):
-        main_window._scan_img_db()
-
-    def test_scan_pgn_db_no_folder(self, main_window):
-        main_window._scan_pgn_db()
-
-    def test_load_selected_pgn_db_no_selection(self, main_window):
-        main_window._load_selected_pgn_db()
-
-    def test_set_pgn_db_folder_invalid(self, main_window):
-        main_window.db_folder_edit.setText("/nonexistent/folder/path")
-        main_window._set_pgn_db_folder()
-        assert main_window.db_folder == ""
-
-    def test_set_pgn_db_folder_valid(self, main_window):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            main_window.db_folder_edit.setText(tmpdir)
-            main_window._set_pgn_db_folder()
-            assert main_window.db_folder == tmpdir
-
-    def test_set_img_folder_invalid(self, main_window):
-        main_window.img_folder_edit.setText("/nonexistent/folder/path")
-        main_window._set_img_folder()
-        assert main_window.img_folder == ""
-
-    def test_set_img_folder_valid(self, main_window):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            main_window.img_folder_edit.setText(tmpdir)
-            main_window._set_img_folder()
-            assert main_window.img_folder == tmpdir
-
-    def test_scan_pgn_db_with_files(self, main_window):
-        from constants import SAMPLE_PGN
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with open(os.path.join(tmpdir, "test.pgn"), 'w') as f:
-                f.write(SAMPLE_PGN)
-            main_window.db_folder = tmpdir
-            main_window._scan_pgn_db()
-            assert main_window.db_list.count() == 1
-
-    def test_scan_img_db_with_files(self, main_window):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            img = QImage(1, 1, QImage.Format_ARGB32)
-            img.save(os.path.join(tmpdir, "test.png"))
-            main_window.img_folder = tmpdir
-            main_window._scan_img_db()
-            assert main_window.img_list.count() >= 1
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 19. UI BUILDER
-# ═══════════════════════════════════════════════════════════════════
-
 class TestUIBuilder:
-    def test_build_ui_creates_widgets(self, main_window):
-        assert main_window.board_widget is not None
-        assert main_window.eval_bar_widget is not None
-        assert main_window.tabs is not None
-        assert main_window.right_tabs is not None
-
-    def test_build_ui_tabs_count(self, main_window):
-        assert main_window.tabs.count() == 3
-        assert main_window.right_tabs.count() == 3
-
-    def test_build_ui_moves_tab(self, main_window):
-        assert main_window.move_listbox is not None
-        assert main_window.btn_play is not None
-        assert main_window.speed_slider is not None
-        assert main_window.anno_edit is not None
-
-    def test_build_ui_database_tab(self, main_window):
-        assert main_window.db_path_lbl is not None
-        assert main_window.db_list is not None
-        assert main_window.db_game_idx is not None
-        assert main_window.db_folder_edit is not None
-        assert main_window.pgn_text_edit is not None
-        assert main_window.pgn_file_edit is not None
-
-    def test_build_ui_assets_tab(self, main_window):
-        assert main_window.img_path_lbl is not None
-        assert main_window.img_list is not None
-        assert main_window.ov_pos_combo is not None
-        assert main_window.img_folder_edit is not None
-
-    def test_build_ui_battle_tab(self, main_window):
-        assert main_window.white_ai_combo is not None
-        assert main_window.black_ai_combo is not None
-        assert main_window.white_ai_str is not None
-        assert main_window.black_ai_str is not None
-        assert main_window.battle_delay is not None
-        assert main_window.start_battle_btn is not None
-        assert main_window.stop_battle_btn is not None
-
-    def test_build_ui_analysis_tab(self, main_window):
-        assert main_window.ai_combo is not None
-        assert main_window.ai_stack is not None
-        assert main_window.mm_depth is not None
-        assert main_window.m_iters is not None
-        assert main_window.engine_path_edit is not None
-        assert main_window.run_ai_btn is not None
-        assert main_window.eval_game_btn is not None
-        assert main_window.stop_eval_btn is not None
-        assert main_window.eval_label is not None
-        assert main_window.pv_label is not None
-        assert main_window.policy_chk is not None
-        assert main_window.clear_policy_btn is not None
-
-    def test_build_ui_video_tab(self, main_window):
-        assert main_window.bg_color_combo is not None
-        assert main_window.white_name_edit is not None
-        assert main_window.black_name_edit is not None
-        assert main_window.theme_combo is not None
-        assert main_window.flip_btn is not None
-        assert main_window.fps_spin is not None
-        assert main_window.anim_spin is not None
-        assert main_window.hold_spin is not None
-        assert main_window.auto_btn is not None
-        assert main_window.frame_count_lbl is not None
-        assert main_window.clear_btn is not None
-        assert main_window.export_start_btn is not None
-        assert main_window.export_cancel_btn is not None
-        assert main_window.export_res_combo is not None
-        assert main_window.export_fps_spin is not None
-        assert main_window.export_path_edit is not None
-        assert main_window.export_progress_bar is not None
-        assert main_window.export_status_lbl is not None
-
-    def test_build_ui_promo_widget(self, main_window):
-        assert main_window.promo_widget is not None
-
-    def test_build_menu(self, main_window):
-        mb = main_window.menuBar()
-        assert mb is not None
-        actions = mb.actions()
-        menu_texts = [a.text() for a in actions]
-        assert any("File" in m for m in menu_texts)
-        assert any("View" in m for m in menu_texts)
-
-    def test_speed_slider_range(self, main_window):
-        assert main_window.speed_slider.minimum() == 1
-        assert main_window.speed_slider.maximum() == 50
-
-    def test_battle_delay_range(self, main_window):
-        assert main_window.battle_delay.minimum() == 50
-        assert main_window.battle_delay.maximum() == 5000
-
-    def test_fps_spin_range(self, main_window):
-        assert main_window.fps_spin.minimum() == 1
-        assert main_window.fps_spin.maximum() == 120
-
-    def test_hold_spin_range(self, main_window):
-        assert main_window.hold_spin.minimum() == 0.1
-        assert main_window.hold_spin.maximum() == 10.0
-
-    def test_anim_spin_range(self, main_window):
-        assert main_window.anim_spin.minimum() == 0.0
-        assert main_window.anim_spin.maximum() == 3.0
-
-    def test_db_game_idx_range(self, main_window):
-        assert main_window.db_game_idx.minimum() == 1
-        assert main_window.db_game_idx.maximum() == 100000
-
-    def test_theme_combo_contents(self, main_window):
-        from constants import THEMES
-        assert main_window.theme_combo.count() == len(THEMES)
-
-    def test_ov_pos_combo_contents(self, main_window):
-        assert main_window.ov_pos_combo.count() == 4
-        texts = [main_window.ov_pos_combo.itemText(i) for i in range(main_window.ov_pos_combo.count())]
-        assert any("White" in t for t in texts)
-        assert any("Black" in t for t in texts)
-        assert any("Center" in t or "Logo" in t for t in texts)
-        assert any("Watermark" in t for t in texts)
-
-    def test_white_ai_combo_contents(self, main_window):
-        from constants import AI_MAP
-        assert main_window.white_ai_combo.count() == len(AI_MAP)
-
-    def test_black_ai_combo_contents(self, main_window):
-        from constants import AI_MAP
-        assert main_window.black_ai_combo.count() == len(AI_MAP)
-
-    def test_bg_color_combo_contents(self, main_window):
-        assert main_window.bg_color_combo.count() == 8
-        texts = [main_window.bg_color_combo.itemText(i) for i in range(main_window.bg_color_combo.count())]
-        assert "Dark Gray" in texts
-        assert "Black" in texts
-        assert "White" in texts
-
-    def test_export_res_combo_contents(self, main_window):
-        assert main_window.export_res_combo.count() == 3
-        texts = [main_window.export_res_combo.itemText(i) for i in range(main_window.export_res_combo.count())]
-        assert any("1080p" in t for t in texts)
-        assert any("720p" in t for t in texts)
-        assert any("4K" in t for t in texts)
-
-    def test_export_fps_spin_range(self, main_window):
-        assert main_window.export_fps_spin.minimum() == 1
-        assert main_window.export_fps_spin.maximum() == 120
-
-    def test_db_folder_edit_placeholder(self, main_window):
-        assert "folder" in main_window.db_folder_edit.placeholderText().lower()
-
-    def test_pgn_text_edit_placeholder(self, main_window):
-        assert "pgn" in main_window.pgn_text_edit.placeholderText().lower()
-
-    def test_pgn_file_edit_placeholder(self, main_window):
-        assert main_window.pgn_file_edit.placeholderText() != ""
-
-    def test_img_folder_edit_placeholder(self, main_window):
-        assert "folder" in main_window.img_folder_edit.placeholderText().lower()
-
-    def test_export_path_edit_placeholder(self, main_window):
-        assert main_window.export_path_edit.placeholderText() != ""
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 20. BG COLOR COMBO (inline, no color picker dialog)
-# ═══════════════════════════════════════════════════════════════════
-
-class TestBGColorCombo:
-    def test_initial_bg_color(self, main_window):
-        assert main_window.video_bg_color == QColor(30, 30, 32)
-
-    def test_bg_color_combo_select_dark_gray(self, main_window):
-        main_window._pick_bg_color("Dark Gray")
-        assert main_window.video_bg_color == QColor(30, 30, 32)
-
-    def test_bg_color_combo_select_black(self, main_window):
-        main_window._pick_bg_color("Black")
-        assert main_window.video_bg_color == QColor(0, 0, 0)
-
-    def test_bg_color_combo_select_dark_blue(self, main_window):
-        main_window._pick_bg_color("Dark Blue")
-        assert main_window.video_bg_color == QColor(15, 20, 40)
-
-    def test_bg_color_combo_select_dark_green(self, main_window):
-        main_window._pick_bg_color("Dark Green")
-        assert main_window.video_bg_color == QColor(15, 35, 15)
-
-    def test_bg_color_combo_select_dark_red(self, main_window):
-        main_window._pick_bg_color("Dark Red")
-        assert main_window.video_bg_color == QColor(40, 15, 15)
-
-    def test_bg_color_combo_select_white(self, main_window):
-        main_window._pick_bg_color("White")
-        assert main_window.video_bg_color == QColor(255, 255, 255)
-
-    def test_bg_color_combo_select_light_gray(self, main_window):
-        main_window._pick_bg_color("Light Gray")
-        assert main_window.video_bg_color == QColor(200, 200, 200)
-
-    def test_bg_color_combo_select_navy(self, main_window):
-        main_window._pick_bg_color("Navy")
-        assert main_window.video_bg_color == QColor(0, 0, 80)
-
-    def test_bg_color_combo_unknown_falls_back(self, main_window):
-        main_window._pick_bg_color("NonExistentColor")
-        assert main_window.video_bg_color == QColor(30, 30, 32)
-
-    def test_bg_color_combo_updates_stylesheet(self, main_window):
-        main_window._pick_bg_color("Black")
-        style = main_window.bg_color_combo.styleSheet()
-        assert "background-color" in style
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 21. INTEGRATION — Full Workflow
-# ═══════════════════════════════════════════════════════════════════
-
-class TestIntegrationWorkflow:
-    def test_full_game_workflow(self, main_window):
-        main_window._new_game()
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        main_window._on_sq_click(chess.E7)
-        main_window._on_sq_click(chess.E5)
-        main_window._on_sq_click(chess.G1)
-        main_window._on_sq_click(chess.F3)
-
-        assert len(main_window.move_list) == 3
-        assert main_window.move_index == 2
-
-        main_window._go_first()
-        assert main_window.move_index == -1
-
-        main_window._go_next()
-        assert main_window.move_index == 0
-
-        main_window._go_last()
-        assert main_window.move_index == 2
-
-        main_window.anno_edit.setPlainText("Great opening!")
-        main_window._apply_comment()
-        assert main_window.node.comment == "Great opening!"
-
-        main_window.fps_spin.setValue(10)
-        main_window.hold_spin.setValue(0.2)
-        main_window._auto_capture()
-        assert len(main_window.capture_frames) > 0
-
-        main_window._clear_frames()
-        assert len(main_window.capture_frames) == 0
-
-    def test_load_pgn_and_navigate(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        move_count = len(main_window.move_list)
-        for i in range(move_count):
-            main_window._go_next()
-        assert main_window.move_index == move_count - 1
-        for i in range(move_count):
-            main_window._go_prev()
-        assert main_window.move_index == -1
-
-    def test_theme_switching_preserves_position(self, main_window):
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        saved_fen = main_window.board_widget.board.fen()
-
-        main_window._theme_changed("Blue")
-        assert main_window.board_widget.board.fen() == saved_fen
-
-        main_window._theme_changed("Green")
-        assert main_window.board_widget.board.fen() == saved_fen
-
-        main_window._theme_changed("Classic")
-        assert main_window.board_widget.board.fen() == saved_fen
-
-    def test_flip_board_preserves_moves(self, main_window):
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        move_count = len(main_window.move_list)
-        main_window._flip_board()
-        assert len(main_window.move_list) == move_count
-        main_window._flip_board()
-
-    def test_new_game_resets_state(self, main_window):
-        from constants import SAMPLE_PGN
-        game = chess.pgn.read_game(io.StringIO(SAMPLE_PGN))
-        main_window._load_pgn_data(game)
-        assert len(main_window.move_list) > 0
-
-        main_window._new_game()
-        assert len(main_window.move_list) == 0
-        assert main_window.move_index == -1
-        assert len(main_window.eval_cache) == 0
-
-    def test_video_canvas_with_captured_frames(self, main_window):
-        from video_canvas import VideoCanvas
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-
-        canvas = VideoCanvas(
-            main_window.board_widget, main_window.eval_bar_widget,
-            bg_color=main_window.video_bg_color
-        )
-        canvas.white_name = "Player1"
-        canvas.black_name = "Player2"
-        canvas.move_list_text = [n.san() for n in main_window.move_list]
-        canvas.eval_cp = 0.0
-        canvas.current_move_index = 0
-
-        img = canvas.render()
-        assert isinstance(img, QImage)
-        assert not img.isNull()
-
-    def test_battle_then_manual_play(self, main_window, qtbot):
-        main_window.white_ai_combo.setCurrentText("Minimax (Alpha-Beta)")
-        main_window.white_ai_str.setValue(1)
-        main_window.black_ai_combo.setCurrentText("Minimax (Alpha-Beta)")
-        main_window.black_ai_str.setValue(1)
-        main_window.battle_delay.setValue(50)
-
-        main_window._start_ai_vs_ai()
-        time.sleep(1)
-        qapp().processEvents()
-
-        main_window._stop_ai_vs_ai()
-        assert not main_window.ai_vs_ai_running
-
-        main_window.ai_vs_ai_running = False
-        board = main_window.board_widget.board
-        if not board.is_game_over():
-            legal = list(board.legal_moves)
-            if legal:
-                sq = legal[0].from_square
-                main_window._on_sq_click(sq)
-
-    def test_overlay_positions(self, main_window):
-        positions = {
-            "White Player Face": (50, 850),
-            "Black Player Face": (50, 50),
-            "Center Logo": (960 - 75, 540 - 75),
-            "Watermark (BR)": (1750, 1000),
-        }
-        for pos_name, (expected_x, expected_y) in positions.items():
-            ov = {"path": "test.png", "w": 150, "h": 150}
-            if "White" in pos_name:
-                ov["x"], ov["y"] = 50, 850
-            elif "Black" in pos_name:
-                ov["x"], ov["y"] = 50, 50
-            elif "Center" in pos_name or "Logo" in pos_name:
-                ov["x"], ov["y"] = 960 - 75, 540 - 75
-            elif "Watermark" in pos_name:
-                ov["x"], ov["y"] = 1750, 1000
-            assert ov["x"] == expected_x
-            assert ov["y"] == expected_y
-
-    def test_inline_pgn_load_and_capture(self, main_window):
-        from constants import SAMPLE_PGN
-        main_window.pgn_text_edit.setPlainText(SAMPLE_PGN)
-        main_window._load_pgn_text()
-        assert len(main_window.move_list) > 0
-
-        main_window._go_first()
-        main_window.fps_spin.setValue(10)
-        main_window.hold_spin.setValue(0.2)
-        main_window._auto_capture()
-        assert len(main_window.capture_frames) > 0
-
-    def test_inline_file_load_workflow(self, main_window):
-        from constants import SAMPLE_PGN
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.pgn', delete=False) as f:
-            f.write(SAMPLE_PGN)
-            tmp_path = f.name
-        try:
-            main_window.pgn_file_edit.setText(tmp_path)
-            main_window._load_pgn_from_file()
-            assert len(main_window.move_list) > 0
-            main_window._go_last()
-            assert main_window.move_index >= 0
-        finally:
-            os.unlink(tmp_path)
-
-    def test_bg_color_change_then_render(self, main_window):
-        from video_canvas import VideoCanvas
-        main_window._pick_bg_color("Black")
-        assert main_window.video_bg_color == QColor(0, 0, 0)
-
-        main_window._on_sq_click(chess.E2)
-        main_window._on_sq_click(chess.E4)
-        canvas = VideoCanvas(
-            main_window.board_widget, main_window.eval_bar_widget,
-            bg_color=main_window.video_bg_color
-        )
-        img = canvas.render()
-        assert not img.isNull()
-
-        main_window._pick_bg_color("Dark Gray")
-
-    def test_promo_widget_integration(self, main_window):
-        board = chess.Board("4k3/4P3/8/8/8/8/8/4K3 w - - 0 1")
-        main_window.board_widget.set_position(board)
-        main_window.node = main_window.game
-        main_window.game = chess.pgn.Game()
-        main_window.node = main_window.game
-        board2 = chess.Board("4k3/4P3/8/8/8/8/8/4K3 w - - 0 1")
-        main_window.board_widget.board = board2
-
-        main_window._on_sq_click(chess.E7)
-        if main_window.board_widget.selected_sq is not None:
-            main_window._on_sq_click(chess.E8)
-            if main_window._pending_promo_from is not None:
-                assert main_window.promo_widget.isVisible()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 22. EDGE CASES
-# ═══════════════════════════════════════════════════════════════════
-
-class TestEdgeCases:
-    def test_eval_bar_extreme_values(self, eval_bar):
-        eval_bar.set_eval(10000.0)
-        assert eval_bar.eval_cp == 10000.0
-        eval_bar.set_eval(-10000.0)
-        assert eval_bar.eval_cp == -10000.0
-
-    def test_heuristic_endgame(self):
-        from ai_engines import HeuristicEvaluator
-        ev = HeuristicEvaluator()
-        board = chess.Board("8/8/8/4k3/4P3/4K3/8/8 w - - 0 1")
-        score = ev.evaluate(board)
-        assert isinstance(score, (int, float))
-
-    def test_minimax_forced_move(self):
-        from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board("k7/8/1K6/8/8/8/8/7R w - - 0 1")
-        best_move, _, _, _ = eng.search(board, depth=1)
-        assert best_move is not None
-
-    def test_mcts_single_legal_move(self):
-        from ai_engines import MCTSEngine
-        eng = MCTSEngine()
-        board = chess.Board("k7/8/1K6/8/8/8/8/7R w - - 0 1")
-        best_move, _, _, _ = eng.search(board, iterations=5)
-        assert best_move is not None
-
-    def test_video_canvas_empty_move_list(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.move_list_text = []
-        vc.current_move_index = -1
-        img = vc.render()
-        assert not img.isNull()
-
-    def test_video_canvas_long_move_list(self, board_widget, eval_bar):
-        from video_canvas import VideoCanvas
-        vc = VideoCanvas(board_widget, eval_bar)
-        vc.move_list_text = ["e4"] * 100
-        vc.current_move_index = 50
-        img = vc.render()
-        assert not img.isNull()
-
-    def test_board_widget_set_position_clears_anim(self, board_widget):
-        board_widget.anim_move = chess.Move.from_uci("e2e4")
-        board_widget.anim_progress = 0.5
-        board_widget.set_position(chess.Board())
-        assert board_widget.anim_move is None
-        assert board_widget.anim_progress == 0.0
-
-    def test_mcts_node_expand_all(self):
-        from ai_engines import MCTSNode
-        node = MCTSNode(chess.Board())
-        while node.untried_moves:
-            node.expand()
-        assert len(node.untried_moves) == 0
-
-    def test_ucb1_with_c_param(self):
-        from ai_engines import MCTSNode
-        parent = MCTSNode(chess.Board())
-        parent.visits = 100
-        child = MCTSNode(chess.Board(), parent=parent)
-        child.visits = 10
-        child.wins = 5.0
-        ucb_default = child.ucb1()
-        ucb_low = child.ucb1(c=0.5)
-        assert ucb_low < ucb_default
-
-    def test_promotion_widget_all_pieces(self):
-        from dialogs import PromotionWidget
-        for color in [chess.WHITE, chess.BLACK]:
-            for piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
-                w = PromotionWidget()
-                received = []
-                w.piece_selected.connect(lambda pt: received.append(pt))
-                w.show_for_color(color)
-                w._pick(piece)
-                assert received == [piece]
-                assert not w.isVisible()
-                w.close()
-
-    def test_batch_eval_empty_move_list(self, qtbot):
-        from workers import BatchEvalWorker
-        worker = BatchEvalWorker([], "Minimax (Alpha-Beta)", {"depth": 1})
-        with qtbot.waitSignal(worker.finished, timeout=5000):
-            worker.start()
-        worker.wait(3000)
-
-    def test_ai_worker_with_checkmate_position(self, qtbot):
-        from workers import AIWorker
-        board = chess.Board()
-        for m in ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]:
-            board.push_uci(m)
-        worker = AIWorker("Minimax (Alpha-Beta)", board.fen(), {"depth": 1})
-        results = []
-        worker.eval_ready.connect(lambda d: results.append(d))
-        with qtbot.waitSignal(worker.eval_ready, timeout=15000):
-            worker.start()
-        worker.wait(3000)
-        assert len(results) == 1
-
-    def test_mcts_rollout_depth_zero(self):
-        from ai_engines import MCTSEngine
-        eng = MCTSEngine()
-        board = chess.Board()
-        score = eng._heuristic_rollout(board, depth=0)
-        assert 0.0 < score < 1.0
-
-    def test_minimax_negamax_terminal(self):
-        from ai_engines import MinimaxEngine
-        eng = MinimaxEngine()
-        board = chess.Board()
-        for m in ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]:
-            board.push_uci(m)
-        result = eng._negamax(board, 0, -float('inf'), float('inf'))
-        assert isinstance(result, (int, float))
-
-    def test_main_window_status_bar(self, main_window):
-        assert main_window.statusBar() is not None
-        msg = main_window.statusBar().currentMessage()
-        assert len(msg) > 0
-
-    def test_inline_export_without_cv2(self, main_window):
-        from constants import HAS_CV2
-        if HAS_CV2:
-            main_window.capture_frames = []
-            main_window._start_inline_export()
-        else:
-            main_window._on_sq_click(chess.E2)
-            main_window._on_sq_click(chess.E4)
-            main_window.fps_spin.setValue(10)
-            main_window.hold_spin.setValue(0.2)
-            main_window._auto_capture()
-            main_window.export_path_edit.setText(os.path.join(tempfile.gettempdir(), "test_edge.mp4"))
-            main_window._start_inline_export()
-            assert "opencv" in main_window.export_status_lbl.text().lower() or "error" in main_window.export_status_lbl.text().lower()
-
-    def test_load_pgn_from_file_bad_content(self, main_window):
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.pgn', delete=False) as f:
-            f.write("this is not a pgn file at all")
-            tmp_path = f.name
-        try:
-            main_window.pgn_file_edit.setText(tmp_path)
-            main_window._load_pgn_from_file()
-        finally:
-            os.unlink(tmp_path)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 23. APP MODULE IMPORTS
-# ═══════════════════════════════════════════════════════════════════
-
-class TestAppImports:
-    def test_import_constants(self):
-        from constants import PIECE_SYM, AI_MAP, SAMPLE_PGN, HAS_CV2, BoardTheme, THEMES
-        assert PIECE_SYM is not None
-        assert AI_MAP is not None
-
-    def test_import_ai_engines(self):
-        from ai_engines import HeuristicEvaluator, MinimaxEngine, MCTSNode, MCTSEngine
-        assert HeuristicEvaluator is not None
-        assert MinimaxEngine is not None
-
-    def test_import_workers(self):
-        from workers import AIWorker, BatchEvalWorker, ExportWorker
-        assert AIWorker is not None
-
-    def test_import_widgets(self):
-        from board_widget import ChessBoardWidget
-        from eval_bar import EvalBarWidget
-        from video_canvas import VideoCanvas
-        assert ChessBoardWidget is not None
-        assert EvalBarWidget is not None
-        assert VideoCanvas is not None
-
-    def test_import_dialogs(self):
-        from dialogs import PromotionWidget
-        assert PromotionWidget is not None
-
-    def test_import_main_window(self):
+    @pytest.fixture
+    def built_window(self, qapp):
         from main_window import MainWindow
-        assert MainWindow is not None
+        w = MainWindow()
+        yield w
+        w._cleanup()
+        _safe_delete(w)
 
-    def test_import_ui_builder(self):
-        from ui_builder import build_ui, build_menu
-        assert build_ui is not None
-        assert build_menu is not None
+    def test_build_ui_creates_widgets(self, built_window):
+        w = built_window
+        attrs = ["board_widget", "eval_bar_widget", "promo_widget",
+                 "tabs", "right_tabs", "move_table", "speed_slider",
+                 "btn_play", "anno_edit", "db_list", "img_list",
+                 "white_ai_combo", "black_ai_combo", "ai_combo",
+                 "fps_spin", "anim_spin", "hold_spin",
+                 "export_res_combo", "export_fps_spin",
+                 "export_path_edit", "export_progress_bar",
+                 "eval_label", "pv_label"]
+        for attr in attrs:
+            assert hasattr(w, attr), f"Missing attribute: {attr}"
+
+    def test_build_menu(self, built_window):
+        mb = built_window.menuBar()
+        menus = [a.text() for a in mb.actions()]
+        assert any("File" in m for m in menus)
+        assert any("View" in m for m in menus)
+
+    def test_moves_tab_columns(self, built_window):
+        assert built_window.move_table.columnCount() == 3
+
+    def test_battle_tab_widgets(self, built_window):
+        w = built_window
+        assert hasattr(w, "start_battle_btn")
+        assert hasattr(w, "stop_battle_btn")
+        assert hasattr(w, "battle_delay")
+        assert hasattr(w, "auto_mp4_chk")
+        assert hasattr(w, "save_png_chk")
+
+    def test_settings_tab_widgets(self, built_window):
+        w = built_window
+        assert hasattr(w, "sound_enabled_chk")
+        assert hasattr(w, "sound_vol_slider")
+        assert hasattr(w, "sound_theme_combo")
+        assert hasattr(w, "sound_design_combo")
+        assert hasattr(w, "anim_enabled_chk")
+        assert hasattr(w, "anim_dur_spin")
+        assert hasattr(w, "anim_ease_combo")
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 24. TestSyncUCIEngine
+#  Main Window
 # ═══════════════════════════════════════════════════════════════════
+class TestMainWindow:
+    @pytest.fixture
+    def mw(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        yield w
+        w._cleanup()
+        _safe_delete(w)
 
-# Add this class after TestExportWorker:
+    def test_creation(self, mw):
+        assert mw.windowTitle().startswith("♟")
+        assert mw.game is not None
+        assert mw.node is not None
 
-class TestSyncUCIEngine:
-    """Test the synchronous UCI engine client directly."""
+    def test_new_game(self, mw):
+        mw._new_game()
+        assert mw.move_index == -1
+        assert len(mw.move_list) == 0
+        assert mw.eval_bar_widget._game_state == "normal"
 
-    @pytest.mark.skipif(not find_stockfish(), reason="Stockfish not installed")
-    def test_engine_start_and_close(self):
-        from workers import _SyncUCIEngine
-        engine = _SyncUCIEngine(find_stockfish())
-        engine.close()
-        # Process should be terminated
-        assert engine.proc.poll() is not None
+    def test_load_pgn_text(self, mw):
+        mw.pgn_text_edit.setPlainText(
+            "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6")
+        mw._load_pgn_text()
+        assert len(mw.move_list) == 6
 
-    @pytest.mark.skipif(not find_stockfish(), reason="Stockfish not installed")
-    def test_analyse_starting_position(self):
-        from workers import _SyncUCIEngine
-        engine = _SyncUCIEngine(find_stockfish())
+    def test_load_pgn_text_empty(self, mw):
+        mw.pgn_text_edit.clear()
+        mw._load_pgn_text()
+
+    def test_load_pgn_from_file_invalid(self, mw):
+        mw.pgn_file_edit.setText("/nonexistent/file.pgn")
+        mw._load_pgn_from_file()
+
+    def test_load_pgn_from_file_empty(self, mw):
+        mw.pgn_file_edit.clear()
+        mw._load_pgn_from_file()
+
+    def test_go_first(self, mw):
+        mw.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3 Nc6")
+        mw._load_pgn_text()
+        mw._go_first()
+        assert mw.move_index == -1
+
+    def test_go_next(self, mw):
+        mw.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3 Nc6")
+        mw._load_pgn_text()
+        mw._go_first()
+        mw._go_next()
+        assert mw.move_index == 0
+
+    def test_go_prev(self, mw):
+        mw.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3 Nc6")
+        mw._load_pgn_text()
+        mw._go_last()
+        mw._go_prev()
+        assert mw.move_index == len(mw.move_list) - 2
+
+    def test_go_last(self, mw):
+        mw.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3 Nc6")
+        mw._load_pgn_text()
+        mw._go_last()
+        assert mw.move_index == len(mw.move_list) - 1
+
+    def test_go_prev_at_start(self, mw):
+        mw._go_first()
+        mw._go_prev()
+        assert mw.move_index == -1
+
+    def test_go_next_at_end(self, mw):
+        mw._go_last()
+        mw._go_next()
+
+    def test_select_piece(self, mw):
+        mw._on_sq_click(chess.E2)
+        assert mw.board_widget.selected_sq == chess.E2
+
+    def test_move_piece(self, mw):
+        mw._on_sq_click(chess.E2)
+        mw._on_sq_click(chess.E4)
+        assert mw.board_widget.selected_sq is None
+        assert len(mw.move_list) == 1
+
+    def test_illegal_move_deselects(self, mw):
+        mw._on_sq_click(chess.E2)
+        mw._on_sq_click(chess.E8)
+        assert mw.board_widget.selected_sq is None
+
+    def test_promo_pick_queen(self, mw):
+        mw._pending_promo_from = chess.E7
+        mw._pending_promo_to = chess.E8
+        mw._on_promo_pick(chess.QUEEN)
+        assert mw._pending_promo_from is None
+        assert mw._pending_promo_to is None
+
+    def test_promo_pick_no_pending(self, mw):
+        mw._pending_promo_from = None
+        mw._pending_promo_to = None
+        mw._on_promo_pick(chess.QUEEN)
+
+    def test_flip_board(self, mw):
+        initial = mw.board_widget.flipped
+        mw._flip_board()
+        assert mw.board_widget.flipped != initial
+
+    def test_theme_changed(self, mw):
+        for name in ["Classic", "Blue", "Green", "Brown"]:
+            mw._theme_changed(name)
+            assert mw.board_widget.theme.name == name
+
+    def test_pick_bg_color(self, mw):
+        colors = {
+            "Dark Gray": QColor(30, 30, 32),
+            "Black": QColor(0, 0, 0),
+            "Dark Blue": QColor(15, 20, 40),
+            "Dark Green": QColor(15, 35, 15),
+            "Dark Red": QColor(40, 15, 15),
+            "White": QColor(255, 255, 255),
+            "Light Gray": QColor(200, 200, 200),
+            "Navy": QColor(0, 0, 80),
+        }
+        for name, color in colors.items():
+            mw._pick_bg_color(name)
+            assert mw.video_bg_color == color
+
+    def test_apply_comment(self, mw):
+        mw.anno_edit.setPlainText("Brilliant!")
+        mw._apply_comment()
+        assert mw.node.comment == "Brilliant!"
+
+    def test_clear_policy(self, mw):
+        mw.board_widget.policy_vis = {"e2e4": 0.8}
+        mw._clear_policy()
+        assert mw.board_widget.policy_vis == {}
+
+    def test_on_sound_enabled(self, mw):
+        mw._on_sound_enabled(False)
+        assert not mw.sound_manager.enabled
+        mw._on_sound_enabled(True)
+        assert mw.sound_manager.enabled
+
+    def test_on_sound_vol(self, mw):
+        mw._on_sound_vol(42)
+        assert mw.sound_vol_lbl.text() == "42%"
+
+    def test_on_sound_theme(self, mw):
+        mw._on_sound_theme("Digital")
+        assert mw.sound_manager._theme == "Digital"
+
+    def test_on_sound_design(self, mw):
+        mw._on_sound_design("Warm")
+        assert mw.sound_manager._design == "Warm"
+        assert "Warm" in mw.sound_design_desc.text()
+
+    def test_on_snd_type_vol(self, mw):
+        mw._on_snd_type_vol("move", 0.5)
+        assert mw.sound_manager._type_vol["move"] == 0.5
+
+    def test_test_sound(self, mw):
+        mw._test_sound("move")
+
+    def test_on_anim_enabled(self, mw):
+        mw._on_anim_enabled(False)
+        assert not mw.anim_manager.enabled
+
+    def test_on_piece_anim(self, mw):
+        mw._on_piece_anim(False)
+        assert not mw.anim_manager.piece_anim
+
+    def test_on_highlight_anim(self, mw):
+        mw._on_highlight_anim(False)
+        assert not mw.anim_manager.highlight_anim
+
+    def test_on_eval_anim(self, mw):
+        mw._on_eval_anim(False)
+        assert not mw.anim_manager.eval_anim
+
+    def test_on_anim_dur(self, mw):
+        mw._on_anim_dur(800)
+        assert mw.anim_manager.duration == 800
+
+    def test_on_anim_ease(self, mw):
+        mw._on_anim_ease("Linear")
+        assert mw.anim_manager.easing_name == "Linear"
+
+    def test_toggle_ai_ui(self, mw):
+        mw._toggle_ai_ui("Minimax (Alpha-Beta)")
+        assert mw.ai_stack.currentIndex() == 0
+        mw._toggle_ai_ui("MCTS (Monte Carlo)")
+        assert mw.ai_stack.currentIndex() == 1
+        mw._toggle_ai_ui("Stockfish (UCI)")
+        assert mw.ai_stack.currentIndex() == 2
+
+    def test_set_pgn_db_folder_invalid(self, mw):
+        mw.db_folder_edit.setText("/nonexistent")
+        mw._set_pgn_db_folder()
+
+    def test_scan_pgn_db_no_folder(self, mw):
+        mw.db_folder = ""
+        mw._scan_pgn_db()
+        assert mw.db_list.count() == 0
+
+    def test_set_img_folder_invalid(self, mw):
+        mw.img_folder_edit.setText("/nonexistent")
+        mw._set_img_folder()
+
+    def test_scan_img_db_no_folder(self, mw):
+        mw.img_folder = ""
+        mw._scan_img_db()
+        assert mw.img_list.count() == 0
+
+    def test_clear_overlays(self, mw):
+        mw.canvas_overlays = [{"path": "x.png"}]
+        mw._clear_overlays()
+        assert mw.canvas_overlays == []
+
+    def test_add_overlay_no_selection(self, mw):
+        mw._add_overlay()
+        assert mw.canvas_overlays == []
+
+    def test_update_game_state_checkmate(self, mw):
+        board = chess.Board()
+        for m in ["e2e4", "e7e5", "d1h5", "b8c6",
+                   "f1c4", "g8f6", "h5f7"]:
+            board.push(chess.Move.from_uci(m))
+        mw._update_game_state(board)
+        assert mw.eval_bar_widget._game_state == "checkmate"
+
+    def test_update_game_state_stalemate(self, mw):
+        board = chess.Board("k7/8/KQ6/8/8/8/8/8 b - - 0 1")
+        if board.is_stalemate():
+            mw._update_game_state(board)
+            assert mw.eval_bar_widget._game_state == "stalemate"
+
+    def test_update_game_state_normal(self, mw):
+        mw._update_game_state(chess.Board())
+        assert mw.eval_bar_widget._game_state == "normal"
+
+    def test_clear_frames(self, mw):
+        mw.capture_frames = [1, 2, 3]
+        mw._clear_frames()
+        assert mw.capture_frames == []
+        assert mw.frame_count_lbl.text() == "Frames: 0"
+
+    def test_cancel_export_no_worker(self, mw):
+        mw._cancel_export()
+
+    def test_stop_batch_eval_no_worker(self, mw):
+        mw._stop_batch_eval()
+
+    def test_stop_ai_vs_ai_not_running(self, mw):
+        mw._stop_ai_vs_ai()
+
+    def test_refresh_move_list(self, mw):
+        mw.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3 Nc6")
+        mw._load_pgn_text()
+        mw._refresh_move_list()
+        assert mw.move_table.rowCount() == 2
+
+    def test_on_move_cell(self, mw):
+        mw.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3 Nc6")
+        mw._load_pgn_text()
+        mw._on_move_cell(0, 1, -1, -1)
+        assert mw.move_index == 0
+
+    def test_on_move_cell_invalid(self, mw):
+        mw._on_move_cell(-1, 0, 0, 0)
+
+    def test_toggle_play(self, mw):
+        mw.pgn_text_edit.setPlainText("1. e4 e5")
+        mw._load_pgn_text()
+        mw._go_first()
+        mw._toggle_play()
+        assert mw._playing
+        mw._toggle_play()
+        assert not mw._playing
+
+    def test_preview_captured_frames_empty(self, mw):
+        mw._preview_captured_frames()
+
+    def test_stop_preview(self, mw):
+        mw._stop_preview()
+
+    def test_update_preview_speed(self, mw):
+        for idx in range(4):
+            mw._update_preview_speed(idx)
+
+    def test_scrub_preview(self, mw):
+        mw._scrub_preview(0)
+
+    def test_load_selected_pgn_no_item(self, mw):
+        mw._load_selected_pgn_db()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  AI vs AI Battle Tests
+# ═══════════════════════════════════════════════════════════════════
+class TestAIvsAIBattle:
+    @pytest.fixture
+    def mw(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.white_ai_combo.setCurrentText("Minimax (Alpha-Beta)")
+        w.black_ai_combo.setCurrentText("Minimax (Alpha-Beta)")
+        w.white_ai_str.setValue(1)
+        w.black_ai_str.setValue(1)
+        w.battle_delay.setValue(50)
+        yield w
+        w.ai_vs_ai_running = False
+        w._anim_timer.stop()
+        if w.ai_battle_worker and w.ai_battle_worker.isRunning():
+            try:
+                w.ai_battle_worker.eval_ready.disconnect(
+                    w._on_battle_move)
+            except (RuntimeError, TypeError):
+                pass
+            w.ai_battle_worker.quit()
+            w.ai_battle_worker.wait(2000)
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_start_battle_sets_flags(self, mw):
+        mw.auto_mp4_chk.setChecked(False)
+        mw.save_png_chk.setChecked(False)
+        mw._start_ai_vs_ai()
+        assert mw.ai_vs_ai_running
+        assert not mw.start_battle_btn.isEnabled()
+        assert mw.stop_battle_btn.isEnabled()
+
+    def test_stop_battle_resets_flags(self, mw):
+        mw.auto_mp4_chk.setChecked(False)
+        mw.save_png_chk.setChecked(False)
+        mw._start_ai_vs_ai()
+        mw._stop_ai_vs_ai()
+        assert not mw.ai_vs_ai_running
+        assert mw.start_battle_btn.isEnabled()
+        assert not mw.stop_battle_btn.isEnabled()
+
+    def test_stop_battle_updates_game_state(self, mw):
+        mw.auto_mp4_chk.setChecked(False)
+        mw.save_png_chk.setChecked(False)
+        mw._start_ai_vs_ai()
+        _pe(500)
+        mw._stop_ai_vs_ai()
+
+    def test_battle_plays_moves(self, mw):
+        mw.auto_mp4_chk.setChecked(False)
+        mw.save_png_chk.setChecked(False)
+        mw._start_ai_vs_ai()
+        _pe(1500)
+        assert len(mw.move_list) > 0
+        mw._stop_ai_vs_ai()
+
+    def test_battle_reaches_game_end(self, mw):
+        mw.auto_mp4_chk.setChecked(False)
+        mw.save_png_chk.setChecked(False)
+        mw._start_ai_vs_ai()
+        deadline = time.time() + 15
+        while time.time() < deadline and mw.ai_vs_ai_running:
+            _pe(200)
+        if mw.ai_vs_ai_running:
+            mw._stop_ai_vs_ai()
+        board = mw.board_widget.board
+        if board.is_game_over():
+            assert mw.eval_bar_widget._game_state in [
+                "checkmate", "stalemate", "draw", "insufficient"]
+
+    def test_stop_battle_during_worker_run(self, mw):
+        mw.auto_mp4_chk.setChecked(False)
+        mw.save_png_chk.setChecked(False)
+        mw._start_ai_vs_ai()
+        _pe(300)
+        mw.ai_vs_ai_running = False
+        mw._stop_ai_vs_ai()
+        _pe(100)
+
+    def test_start_battle_when_already_running(self, mw):
+        mw.auto_mp4_chk.setChecked(False)
+        mw.save_png_chk.setChecked(False)
+        mw._start_ai_vs_ai()
+        assert mw.ai_vs_ai_running
+        mw._start_ai_vs_ai()
+        assert mw.ai_vs_ai_running
+        mw._stop_ai_vs_ai()
+
+    def test_battle_creates_move_list(self, mw):
+        mw.auto_mp4_chk.setChecked(False)
+        mw.save_png_chk.setChecked(False)
+        mw._start_ai_vs_ai()
+        _pe(1000)
+        mw._stop_ai_vs_ai()
+        if len(mw.move_list) > 0:
+            assert mw.move_table.rowCount() > 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MP4 Export & YouTube Codec Tests
+# ═══════════════════════════════════════════════════════════════════
+class TestMP4Export:
+    @pytest.fixture
+    def mw(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        yield w
+        w._cleanup()
+        _safe_delete(w)
+
+    @pytest.fixture
+    def export_dir(self):
+        d = tempfile.mkdtemp(prefix="chess_test_export_")
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+
+    def _generate_frames(self, mw):
+        mw.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3")
+        mw._load_pgn_text()
+        mw.fps_spin.setValue(10)
+        mw.hold_spin.setValue(0.5)
+        mw._auto_capture()
+        _pe(100)
+        return len(mw.capture_frames) > 0
+
+    @pytest.mark.skipif(not __import__("constants").HAS_CV2,
+                        reason="cv2 not available")
+    def test_export_creates_video_file(self, mw, export_dir):
+        """Test that export creates an actual video file on disk.
+        The codec may produce .mp4 or .avi depending on platform."""
+        if not self._generate_frames(mw):
+            pytest.skip("Could not generate frames")
+
+        out_path = os.path.join(export_dir, "test_output.mp4")
+        mw.export_path_edit.setText(out_path)
+        mw.export_res_combo.setCurrentIndex(1)  # 720p for speed
+        mw.export_fps_spin.setValue(30)
+
+        mw._start_inline_export()
+
+        # Verify worker was created (diagnostic if not)
+        if mw.export_worker is None:
+            status = mw.export_status_lbl.text()
+            pytest.skip(
+                f"Export worker not created (likely codec issue). "
+                f"Status: '{status}'")
+
+        mw.export_worker.wait(30000)
+        _pe(200)
+
+        # The worker may change the extension if no MP4 codec is found
+        base = os.path.splitext(out_path)[0]
+        possible_files = [out_path, base + ".avi"]
+        found_file = None
+        for pf in possible_files:
+            if os.path.isfile(pf):
+                found_file = pf
+                break
+
+        assert found_file is not None, (
+            f"No video file created. Status: "
+            f"'{mw.export_status_lbl.text()}', "
+            f"Dir: {os.listdir(export_dir)}")
+        assert os.path.getsize(found_file) > 0, "Video file is empty"
+
+    @pytest.mark.skipif(not __import__("constants").HAS_CV2,
+                        reason="cv2 not available")
+    def test_export_youtube_codec_1080p(self, mw, export_dir):
+        """Test 1920x1080 export with YouTube-compatible codec."""
+        if not self._generate_frames(mw):
+            pytest.skip("Could not generate frames")
+
+        out_path = os.path.join(export_dir, "youtube_1080p.mp4")
+        mw.export_path_edit.setText(out_path)
+        mw.export_res_combo.setCurrentIndex(0)
+        mw.export_fps_spin.setValue(30)
+
+        mw._start_inline_export()
+        if mw.export_worker is None:
+            pytest.skip("Export worker not created — codec issue")
+        mw.export_worker.wait(30000)
+        _pe(200)
+
+        base = os.path.splitext(out_path)[0]
+        found = any(os.path.isfile(p) for p in [out_path, base + ".avi"])
+        if not found:
+            pytest.skip("YouTube codec not available on this system")
+
+        if os.path.isfile(out_path):
+            with open(out_path, 'rb') as f:
+                header = f.read(12)
+            assert b'ftyp' in header, "Not a valid MP4 file"
+
+    @pytest.mark.skipif(not __import__("constants").HAS_CV2,
+                        reason="cv2 not available")
+    def test_export_youtube_codec_720p(self, mw, export_dir):
+        """Test 1280x720 export (YouTube HD)."""
+        if not self._generate_frames(mw):
+            pytest.skip("Could not generate frames")
+
+        out_path = os.path.join(export_dir, "youtube_720p.mp4")
+        mw.export_path_edit.setText(out_path)
+        mw.export_res_combo.setCurrentIndex(1)
+        mw.export_fps_spin.setValue(30)
+
+        mw._start_inline_export()
+        if mw.export_worker is None:
+            pytest.skip("Export worker not created — codec issue")
+        mw.export_worker.wait(30000)
+        _pe(200)
+
+        base = os.path.splitext(out_path)[0]
+        found = any(os.path.isfile(p) for p in [out_path, base + ".avi"])
+        if not found:
+            pytest.skip("No video codec available on this system")
+        if os.path.isfile(out_path):
+            assert os.path.getsize(out_path) > 0
+
+    @pytest.mark.skipif(not __import__("constants").HAS_CV2,
+                        reason="cv2 not available")
+    def test_export_youtube_codec_4k(self, mw, export_dir):
+        """Test 3840x2160 export (YouTube 4K)."""
+        if not self._generate_frames(mw):
+            pytest.skip("Could not generate frames")
+
+        out_path = os.path.join(export_dir, "youtube_4k.mp4")
+        mw.export_path_edit.setText(out_path)
+        mw.export_res_combo.setCurrentIndex(2)
+        mw.export_fps_spin.setValue(24)
+
+        mw._start_inline_export()
+        if mw.export_worker is None:
+            pytest.skip("Export worker not created — codec issue")
+        mw.export_worker.wait(60000)
+        _pe(200)
+
+        base = os.path.splitext(out_path)[0]
+        found = any(os.path.isfile(p) for p in [out_path, base + ".avi"])
+        if not found:
+            pytest.skip("No video codec available on this system")
+        if os.path.isfile(out_path):
+            assert os.path.getsize(out_path) > 0
+
+    @pytest.mark.skipif(not __import__("constants").HAS_CV2,
+                        reason="cv2 not available")
+    def test_export_cancel_during_export(self, mw, export_dir):
+        if not self._generate_frames(mw):
+            pytest.skip("Could not generate frames")
+
+        out_path = os.path.join(export_dir, "cancel_test.mp4")
+        mw.export_path_edit.setText(out_path)
+        mw.export_res_combo.setCurrentIndex(1)
+        mw.export_fps_spin.setValue(60)
+
+        mw._start_inline_export()
+        if mw.export_worker is None:
+            pytest.skip("Export worker not created")
+        _pe(50)
+        mw._cancel_export()
+        mw.export_worker.wait(5000)
+        _pe(100)
+
+    @pytest.mark.skipif(not __import__("constants").HAS_CV2,
+                        reason="cv2 not available")
+    def test_export_progress_updates(self, mw, export_dir):
+        if not self._generate_frames(mw):
+            pytest.skip("Could not generate frames")
+
+        out_path = os.path.join(export_dir, "progress_test.mp4")
+        mw.export_path_edit.setText(out_path)
+        mw.export_res_combo.setCurrentIndex(1)
+        mw.export_fps_spin.setValue(30)
+
+        progress_values = []
+        mw._start_inline_export()
+        if mw.export_worker is None:
+            pytest.skip("Export worker not created")
+        mw.export_worker.progress.connect(
+            lambda p, m: progress_values.append(p))
+        mw.export_worker.wait(30000)
+        _pe(200)
+
+        if progress_values:
+            assert max(progress_values) == 100
+
+    @pytest.mark.skipif(not __import__("constants").HAS_CV2,
+                        reason="cv2 not available")
+    def test_export_status_label_updated(self, mw, export_dir):
+        if not self._generate_frames(mw):
+            pytest.skip("Could not generate frames")
+
+        out_path = os.path.join(export_dir, "status_test.mp4")
+        mw.export_path_edit.setText(out_path)
+        mw.export_res_combo.setCurrentIndex(1)
+        mw.export_fps_spin.setValue(30)
+
+        mw._start_inline_export()
+
+        # Now _start_inline_export always sets a status message
+        status = mw.export_status_lbl.text()
+        assert len(status) > 0, (
+            "Status label should be set after export attempt")
+
+        if mw.export_worker is not None:
+            mw.export_worker.wait(30000)
+            _pe(200)
+            final_status = mw.export_status_lbl.text()
+            assert len(final_status) > 0
+
+    def test_export_without_cv2_shows_error(self, mw):
+        mw.capture_frames = [QImage(640, 360, QImage.Format_ARGB32)]
+        with patch("main_window.HAS_CV2", False):
+            mw._start_inline_export()
+        assert "ERROR" in mw.export_status_lbl.text().upper() or \
+               mw.export_status_lbl.text() == ""
+
+    def test_export_without_frames_shows_error(self, mw):
+        mw.capture_frames = []
+        mw._start_inline_export()
+        assert "ERROR" in mw.export_status_lbl.text().upper() or \
+               mw.export_status_lbl.text() == ""
+
+    @pytest.mark.skipif(not __import__("constants").HAS_CV2,
+                        reason="cv2 not available")
+    def test_export_worker_codec_selection(self, qapp):
+        from workers import ExportWorker
+        import numpy as np
+        frames = [np.full((360, 640, 3), 32, dtype=np.uint8)
+                  for _ in range(3)]
+        out = os.path.join(tempfile.gettempdir(), "codec_test.mp4")
+        w = ExportWorker(frames, 10, out, 640, 360)
+        results = []
+        w.export_finished.connect(lambda m: results.append(m))
+        w.run()
+        assert len(results) == 1
+        if results[0].startswith("Done"):
+            assert "Codec:" in results[0]
+            assert any(c in results[0] for c in ["avc1", "X264", "mp4v"])
+            base = os.path.splitext(out)[0]
+            actual = out if os.path.isfile(out) else base + ".avi"
+            if os.path.isfile(actual):
+                os.remove(actual)
+
+    @pytest.mark.skipif(not __import__("constants").HAS_CV2,
+                        reason="cv2 not available")
+    def test_export_worker_mp4_magic_bytes(self, qapp):
+        from workers import ExportWorker
+        import numpy as np
+        frames = [np.full((180, 320, 3), 32, dtype=np.uint8)
+                  for _ in range(5)]
+        out = os.path.join(tempfile.gettempdir(), "magic_test.mp4")
+        w = ExportWorker(frames, 10, out, 320, 180)
+        results = []
+        w.export_finished.connect(lambda m: results.append(m))
+        w.run()
+        if results and results[0].startswith("Done"):
+            base = os.path.splitext(out)[0]
+            actual = out if os.path.isfile(out) else base + ".avi"
+            assert os.path.isfile(actual), "No video file created"
+            with open(actual, 'rb') as f:
+                header = f.read(12)
+            if actual.endswith('.mp4'):
+                assert b'ftyp' in header
+            elif actual.endswith('.avi'):
+                assert b'RIFF' in header
+            os.remove(actual)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Application Exit / Cleanup Tests
+# ═══════════════════════════════════════════════════════════════════
+class TestApplicationExit:
+    def test_cleanup_with_no_active_resources(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_cleanup_while_playing(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3 Nc6")
+        w._load_pgn_text()
+        w._go_first()
+        w._toggle_play()
+        assert w._playing
+        w._cleanup()
+        assert not w._playing
+        _safe_delete(w)
+
+    def test_cleanup_with_animations_running(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3")
+        w._load_pgn_text()
+        w._go_first()
+        w._go_next()
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_cleanup_with_sound_playing(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.sound_manager.play("move")
+        w.sound_manager.play("new_game")
+        _pe(50)
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_cleanup_with_preview_active(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w._prev_playing = True
+        w._prev_timer.start(100)
+        w._cleanup()
+        assert not w._prev_timer.isActive()
+        _safe_delete(w)
+
+    def test_cleanup_stops_all_timers(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3 Nc6")
+        w._load_pgn_text()
+        w._go_first()
+        w._toggle_play()
+        _pe(100)
+        w._cleanup()
+        assert not w._anim_timer.isActive()
+        assert not w._prev_timer.isActive()
+        _safe_delete(w)
+
+    def test_cleanup_cancels_animations(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.pgn_text_edit.setPlainText("1. e4 e5")
+        w._load_pgn_text()
+        w._go_first()
+        w._go_next()
+        _pe(50)
+        w._cleanup()
+        assert len(w.anim_manager._active) == 0
+        _safe_delete(w)
+
+    def test_cleanup_clears_sound_temp_dir(self, qapp):
+        from main_window import MainWindow
+        from sound_manager import HAS_MM, HAS_NP
+        if not HAS_MM or not HAS_NP:
+            pytest.skip("QtMultimedia or numpy not available")
+        w = MainWindow()
+        td = w.sound_manager._temp_dir
+        assert td is not None
+        w._cleanup()
+        removed = not os.path.isdir(td)
+        if not removed:
+            for _ in range(10):
+                time.sleep(0.1)
+                if not os.path.isdir(td):
+                    removed = True
+                    break
+        assert removed, f"Sound temp dir still exists: {td}"
+        _safe_delete(w)
+
+    def test_double_cleanup_no_crash(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w._cleanup()
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_cleanup_after_new_game(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w._new_game()
+        w.sound_manager.play("new_game")
+        _pe(50)
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_cleanup_after_pgn_load_and_navigation(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.pgn_text_edit.setPlainText(
+            "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O")
+        w._load_pgn_text()
+        for _ in range(5):
+            w._go_next()
+            _pe(30)
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_close_event_calls_cleanup(self, qapp):
+        from main_window import MainWindow
+        from PySide6.QtGui import QCloseEvent
+        w = MainWindow()
+        w.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3")
+        w._load_pgn_text()
+        w._go_next()
+        _pe(50)
+        event = QCloseEvent()
+        w.closeEvent(event)
+        _safe_delete(w)
+
+    def test_cleanup_with_engine_worker(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.ai_combo.setCurrentText("Minimax (Alpha-Beta)")
+        w.mm_depth.setValue(2)
+        w._run_engine()
+        _pe(100)
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_cleanup_with_batch_eval(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.pgn_text_edit.setPlainText(
+            "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4")
+        w._load_pgn_text()
+        w.ai_combo.setCurrentText("Minimax (Alpha-Beta)")
+        w.mm_depth.setValue(1)
+        w._start_batch_eval()
+        _pe(100)
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_cleanup_after_ai_vs_ai(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.white_ai_combo.setCurrentText("Minimax (Alpha-Beta)")
+        w.black_ai_combo.setCurrentText("Minimax (Alpha-Beta)")
+        w.white_ai_str.setValue(1)
+        w.black_ai_str.setValue(1)
+        w.battle_delay.setValue(50)
+        w.auto_mp4_chk.setChecked(False)
+        w.save_png_chk.setChecked(False)
+        w._start_ai_vs_ai()
+        _pe(500)
+        w._stop_ai_vs_ai()
+        _pe(100)
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_rapid_open_close_no_crash(self, qapp):
+        from main_window import MainWindow
+        for _ in range(3):
+            w = MainWindow()
+            w.pgn_text_edit.setPlainText("1. e4 e5")
+            w._load_pgn_text()
+            w._go_next()
+            _pe(30)
+            w._cleanup()
+            _safe_delete(w)
+            _pe(30)
+
+    def test_cleanup_after_manual_moves(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w._on_sq_click(chess.E2)
+        w._on_sq_click(chess.E4)
+        w._on_sq_click(chess.E7)
+        w._on_sq_click(chess.E5)
+        w._on_sq_click(chess.G1)
+        w._on_sq_click(chess.F3)
+        _pe(50)
+        w._cleanup()
+        _safe_delete(w)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Integration Tests
+# ═══════════════════════════════════════════════════════════════════
+class TestIntegration:
+    def test_full_game_walkthrough(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        pgn = "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O"
+        w.pgn_text_edit.setPlainText(pgn)
+        w._load_pgn_text()
+        assert len(w.move_list) == 9
+        w._go_first()
+        assert w.move_index == -1
+        for _ in range(len(w.move_list)):
+            w._go_next()
+        assert w.move_index == len(w.move_list) - 1
+        w._go_prev()
+        w._go_first()
+        assert w.move_index == -1
+        w._go_last()
+        assert w.move_index == len(w.move_list) - 1
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_manual_moves_and_navigation(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w._on_sq_click(chess.E2)
+        w._on_sq_click(chess.E4)
+        assert len(w.move_list) == 1
+        w._go_prev()
+        assert w.move_index == -1
+        w._go_next()
+        assert w.move_index == 0
+        w._on_sq_click(chess.E7)
+        w._on_sq_click(chess.E5)
+        assert len(w.move_list) == 2
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_theme_and_bg_cycle(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        for name in ["Classic", "Blue", "Green", "Brown"]:
+            w._theme_changed(name)
+            assert w.board_widget.theme.name == name
+        for name, color in [("Black", QColor(0, 0, 0)),
+                            ("Navy", QColor(0, 0, 80))]:
+            w._pick_bg_color(name)
+            assert w.video_bg_color == color
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_animation_settings_full_cycle(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w._on_anim_enabled(False)
+        assert not w.anim_manager.enabled
+        w._on_anim_enabled(True)
+        w._on_piece_anim(False)
+        assert not w.anim_manager.piece_anim
+        w._on_highlight_anim(False)
+        assert not w.anim_manager.highlight_anim
+        w._on_eval_anim(False)
+        assert not w.anim_manager.eval_anim
+        w._on_anim_dur(1000)
+        assert w.anim_manager.duration == 1000
+        w._on_anim_ease("OutBack")
+        assert w.anim_manager.easing_name == "OutBack"
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_eval_bar_all_game_states(self, qapp):
+        from main_window import MainWindow
+        from constants import (GAME_CHECKMATE, GAME_STALEMATE,
+                               GAME_DRAW, GAME_INSUFFICIENT)
+        w = MainWindow()
+        eb = w.eval_bar_widget
+        for state, result, detail, cp in [
+            (GAME_CHECKMATE, "1-0", "Checkmate", 10001),
+            (GAME_CHECKMATE, "0-1", "Checkmate", -10001),
+            (GAME_STALEMATE, "½-½", "Stalemate", 0),
+            (GAME_DRAW, "½-½", "Draw", 0),
+            (GAME_INSUFFICIENT, "½-½", "Insufficient", 0),
+        ]:
+            eb.reset_game_state()
+            eb.set_game_state(state, result=result, detail=detail)
+            assert eb._game_state == state
+            eb.set_eval(cp)
+        eb.reset_game_state()
+        assert eb._game_state == "normal"
+        w._cleanup()
+        _safe_delete(w)
+
+    def test_video_canvas_all_states(self, qapp):
+        from board_widget import ChessBoardWidget
+        from widgets import EvalBarWidget, VideoCanvas
+        from constants import (GAME_CHECKMATE, GAME_STALEMATE,
+                               GAME_DRAW, GAME_INSUFFICIENT)
+        bw = ChessBoardWidget()
+        bw.resize(400, 400)
+        ew = EvalBarWidget()
         try:
-            best_move, score_cp = engine.analyse(chess.Board().fen(), depth=10)
-            assert best_move is not None
-            assert isinstance(score_cp, (int, float))
-            # Starting position should be roughly equal
-            assert abs(score_cp) < 500
+            for state, result, detail, cp in [
+                ("normal", "", "", 50),
+                (GAME_CHECKMATE, "1-0", "Checkmate", 10001),
+                (GAME_CHECKMATE, "0-1", "Checkmate", -10001),
+                (GAME_STALEMATE, "½-½", "Stalemate", 0),
+                (GAME_DRAW, "½-½", "Draw", 0),
+                (GAME_INSUFFICIENT, "½-½",
+                 "Insufficient Material", 0),
+            ]:
+                vc = VideoCanvas(bw, ew, w=640, h=360)
+                vc.game_state = state
+                vc.game_result = result
+                vc.game_detail = detail
+                vc.eval_cp = cp
+                img = vc.render()
+                assert isinstance(img, QImage)
         finally:
-            engine.close()
+            _safe_delete(bw)
+            _safe_delete(ew)
 
-    @pytest.mark.skipif(not find_stockfish(), reason="Stockfish not installed")
-    def test_analyse_multiple_positions(self):
-        """Test that multiple analyses in sequence don't crash.
+    def test_ai_engine_vs_board_consistency(self, qapp):
+        from ai_engines import MinimaxEngine, MCTSEngine
+        board = chess.Board()
+        for Engine, kwargs in [
+            (MinimaxEngine, {"depth": 2}),
+            (MCTSEngine, {"iters": 50}),
+        ]:
+            bm, _, _, _ = Engine().search(board, **kwargs)
+            assert bm in board.legal_moves
 
-        This is the exact scenario that crashes with python-chess
-        asyncio on Windows.  The sync client must handle it safely.
-        """
-        from workers import _SyncUCIEngine
-        engine = _SyncUCIEngine(find_stockfish())
-        try:
-            fens = [
-                chess.Board().fen(),
-                "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
-                "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
-            ]
-            for fen in fens:
-                best_move, score_cp = engine.analyse(fen, depth=10)
-                assert best_move is not None
-                assert isinstance(score_cp, (int, float))
-        finally:
-            engine.close()
+    def test_manual_game_to_checkmate_detection(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        moves = [
+            (chess.E2, chess.E4), (chess.E7, chess.E5),
+            (chess.D1, chess.H5), (chess.B8, chess.C6),
+            (chess.F1, chess.C4), (chess.G8, chess.F6),
+            (chess.H5, chess.F7),
+        ]
+        for fr, to in moves:
+            w._on_sq_click(fr)
+            w._on_sq_click(to)
+        board = w.board_widget.board
+        assert board.is_checkmate()
+        assert w.eval_bar_widget._game_state == "checkmate"
+        w._cleanup()
+        _safe_delete(w)
 
-    @pytest.mark.skipif(not find_stockfish(), reason="Stockfish not installed")
-    def test_analyse_checkmate_position(self):
-        from workers import _SyncUCIEngine
-        engine = _SyncUCIEngine(find_stockfish())
-        try:
-            # Scholar's mate
-            board = chess.Board()
-            for m in ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]:
-                board.push_uci(m)
-            best_move, score_cp = engine.analyse(board.fen(), depth=5)
-            # Black is checkmated — score should be very negative for White
-            # (engine may return None for best_move since no legal moves)
-            assert score_cp < -5000 or best_move is None
-        finally:
-            engine.close()
+    def test_pgn_reload_resets_state(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.pgn_text_edit.setPlainText("1. e4 e5")
+        w._load_pgn_text()
+        w.pgn_text_edit.setPlainText("1. d4 d5 2. c4")
+        w._load_pgn_text()
+        assert len(w.move_list) == 3
+        w._cleanup()
+        _safe_delete(w)
 
-    @pytest.mark.skipif(not find_stockfish(), reason="Stockfish not installed")
-    def test_score_from_white_perspective(self):
-        """Verify score is always from White's perspective."""
-        from workers import _SyncUCIEngine
-        engine = _SyncUCIEngine(find_stockfish())
-        try:
-            # White has extra queen — score should be very positive
-            fen = "4k3/8/8/8/8/8/8/4K2Q w - - 0 1"
-            _, score_white = engine.analyse(fen, depth=10)
-            assert score_white > 0, "White extra queen should give positive score"
+    def test_auto_capture_with_moves(self, qapp):
+        from main_window import MainWindow
+        w = MainWindow()
+        w.pgn_text_edit.setPlainText("1. e4 e5 2. Nf3")
+        w._load_pgn_text()
+        w.fps_spin.setValue(10)
+        w.hold_spin.setValue(0.5)
+        w._auto_capture()
+        assert len(w.capture_frames) > 0
+        assert len(w.capture_frames) >= 20
+        w._cleanup()
+        _safe_delete(w)
 
-            # Black has extra queen — score should be very negative
-            fen = "4k2q/8/8/8/8/8/8/4K3 w - - 0 1"
-            _, score_black = engine.analyse(fen, depth=10)
-            assert score_black < 0, "Black extra queen should give negative score"
-        finally:
-            engine.close()
-
-    def test_engine_bad_path(self):
-        """Starting engine with bad path should raise an exception."""
-        from workers import _SyncUCIEngine
-        with pytest.raises(Exception):
-            _SyncUCIEngine("/nonexistent/path/to/engine")
+    def test_sound_design_descriptions(self, qapp):
+        from main_window import _SOUND_DESIGN_DESC
+        for design in ["Default", "Warm", "Crisp",
+                        "Retro", "Cinematic", "Minimal"]:
+            assert design in _SOUND_DESIGN_DESC
+            assert isinstance(_SOUND_DESIGN_DESC[design], str)

@@ -9,7 +9,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QFont, QShortcut, QKeySequence
-from constants import AI_MAP, THEMES, SOUND_THEMES, SOUND_DESIGNS, SOUND_TYPES, ANIM_EASINGS
+from constants import (AI_MAP, THEMES, SOUND_THEMES, SOUND_DESIGNS, SOUND_TYPES,
+                       ANIM_EASINGS, QUALITY_PRESETS, RESOLUTION_LIST,
+                       get_system_ram_gb, get_gpu_info, get_recommended_preset,
+                       estimate_memory_gb)
 from board_widget import ChessBoardWidget
 from widgets import EvalBarWidget, PromotionWidget
 
@@ -452,6 +455,47 @@ def _build_video_tab(w):
     vl = QVBoxLayout(inner)
     vl.setContentsMargins(8, 8, 8, 8)
 
+    # ── Performance & Quality ──────────────────────────────────────
+    perf_group = QGroupBox("⚡ Performance & Quality")
+    perf_l = QFormLayout(perf_group)
+
+    w.quality_preset_combo = QComboBox()
+    for name, p in QUALITY_PRESETS.items():
+        w.quality_preset_combo.addItem(p["label"], name)
+    rec = get_recommended_preset()
+    idx = list(QUALITY_PRESETS.keys()).index(rec)
+    w.quality_preset_combo.setCurrentIndex(idx)
+    w.quality_preset_combo.currentIndexChanged.connect(w._on_quality_preset)
+    perf_l.addRow("Preset:", w.quality_preset_combo)
+
+    # System info
+    ram = get_system_ram_gb()
+    gpu_name, gpu_vram = get_gpu_info()
+    gpu_str = f"{gpu_name} ({gpu_vram:.1f} GB)" if gpu_vram > 0 else gpu_name
+    sys_text = f"RAM: {ram:.1f} GB  |  GPU: {gpu_str}"
+    w.sys_info_lbl = QLabel(sys_text)
+    w.sys_info_lbl.setStyleSheet("color:#8ab;font-size:11px;padding:2px")
+    w.sys_info_lbl.setWordWrap(True)
+    perf_l.addRow("System:", w.sys_info_lbl)
+
+    # Memory estimate
+    w.mem_estimate_lbl = QLabel("Est. memory: —")
+    w.mem_estimate_lbl.setStyleSheet("color:#c90;font-size:11px;padding:2px")
+    w.mem_estimate_lbl.setWordWrap(True)
+    perf_l.addRow("Memory:", w.mem_estimate_lbl)
+
+    # Disk cache
+    w.disk_cache_chk = QCheckBox("💾 Disk Cache (low memory mode)")
+    w.disk_cache_chk.setToolTip(
+        "Write frames to disk during capture instead of keeping them in RAM.\n"
+        "Recommended for systems with ≤8 GB RAM or long videos.")
+    w.disk_cache_chk.setChecked(QUALITY_PRESETS[rec]["disk_cache"])
+    w.disk_cache_chk.toggled.connect(w._on_disk_cache_toggled)
+    perf_l.addRow(w.disk_cache_chk)
+
+    vl.addWidget(perf_group)
+
+    # ── Players & Canvas ───────────────────────────────────────────
     pg = QGroupBox("Players & Canvas")
     pcl = QFormLayout(pg)
     w.bg_color_combo = QComboBox()
@@ -469,6 +513,7 @@ def _build_video_tab(w):
     pcl.addRow("Black:", w.black_name_edit)
     vl.addWidget(pg)
 
+    # ── Board Appearance ───────────────────────────────────────────
     bg = QGroupBox("Board Appearance")
     bl = QFormLayout(bg)
     w.theme_combo = QComboBox()
@@ -480,11 +525,13 @@ def _build_video_tab(w):
     bl.addRow(w.flip_btn)
     vl.addWidget(bg)
 
-    eg = QGroupBox("Export Settings")
+    # ── Capture Settings ───────────────────────────────────────────
+    eg = QGroupBox("Capture Settings")
     el = QFormLayout(eg)
     w.fps_spin = QSpinBox()
-    w.fps_spin.setRange(1, 120)
-    w.fps_spin.setValue(60)
+    w.fps_spin.setRange(1, 60)
+    w.fps_spin.setValue(QUALITY_PRESETS[rec]["capture_fps"])
+    w.fps_spin.valueChanged.connect(w._update_mem_estimate)
     el.addRow("Capture FPS:", w.fps_spin)
     w.anim_spin = QDoubleSpinBox()
     w.anim_spin.setRange(0.0, 3.0)
@@ -494,12 +541,14 @@ def _build_video_tab(w):
     el.addRow("Anim:", w.anim_spin)
     w.hold_spin = QDoubleSpinBox()
     w.hold_spin.setRange(0.1, 10.0)
-    w.hold_spin.setValue(1.5)
+    w.hold_spin.setValue(QUALITY_PRESETS[rec]["hold"])
     w.hold_spin.setSingleStep(0.1)
     w.hold_spin.setSuffix(" s")
+    w.hold_spin.valueChanged.connect(w._update_mem_estimate)
     el.addRow("Hold:", w.hold_spin)
     vl.addWidget(eg)
 
+    # ── Capture ────────────────────────────────────────────────────
     cg = QGroupBox("Capture")
     ccl = QVBoxLayout(cg)
     w.auto_btn = QPushButton("🎬 Auto-Capture All")
@@ -513,14 +562,17 @@ def _build_video_tab(w):
     ccl.addWidget(w.clear_btn)
     vl.addWidget(cg)
 
+    # ── Export Video ───────────────────────────────────────────────
     xg = QGroupBox("💾 Export Video")
     xl = QFormLayout(xg)
     w.export_res_combo = QComboBox()
-    w.export_res_combo.addItems(["1920×1080", "1280×720", "3840×2160"])
+    w.export_res_combo.addItems(RESOLUTION_LIST)  # No 4K — 720p & 1080p only
+    w.export_res_combo.setCurrentIndex(QUALITY_PRESETS[rec]["resolution_index"])
+    w.export_res_combo.currentTextChanged.connect(w._update_mem_estimate)
     xl.addRow("Resolution:", w.export_res_combo)
     w.export_fps_spin = QSpinBox()
-    w.export_fps_spin.setRange(1, 120)
-    w.export_fps_spin.setValue(60)
+    w.export_fps_spin.setRange(1, 60)
+    w.export_fps_spin.setValue(QUALITY_PRESETS[rec]["fps"])
     xl.addRow("Export FPS:", w.export_fps_spin)
     w.export_path_edit = QLineEdit()
     w.export_path_edit.setPlaceholderText("Output path…")
@@ -530,6 +582,8 @@ def _build_video_tab(w):
     xl.addRow(w.export_progress_bar)
     w.export_status_lbl = QLabel("")
     xl.addRow(w.export_status_lbl)
+
+    # Export buttons — regular + streaming
     xr = QHBoxLayout()
     w.export_start_btn = QPushButton("🎬 Export")
     w.export_start_btn.clicked.connect(w._start_inline_export)
@@ -539,6 +593,15 @@ def _build_video_tab(w):
     xr.addWidget(w.export_start_btn)
     xr.addWidget(w.export_cancel_btn)
     xl.addRow(xr)
+
+    # Streaming export (constant memory)
+    w.stream_export_btn = QPushButton("🚀 Stream Export (Low RAM)")
+    w.stream_export_btn.setToolTip(
+        "Render and export in one pass with constant memory usage.\n"
+        "No preview, but works on any system regardless of RAM.")
+    w.stream_export_btn.clicked.connect(w._start_streaming_export)
+    xl.addRow(w.stream_export_btn)
+
     vl.addWidget(xg)
 
     vl.addStretch()
@@ -610,7 +673,6 @@ def _build_settings_tab(w):
     tr.addWidget(w.sound_theme_combo, stretch=1)
     sgl.addLayout(tr)
 
-    # ── Sound Design combo ─────────────────────────────────────────
     dr = QHBoxLayout()
     dr.addWidget(QLabel("Design:"))
     w.sound_design_combo = QComboBox()
@@ -619,7 +681,6 @@ def _build_settings_tab(w):
     dr.addWidget(w.sound_design_combo, stretch=1)
     sgl.addLayout(dr)
 
-    # ── Sound Design description ───────────────────────────────────
     w.sound_design_desc = QLabel(
         "🎵 Default — Standard balanced sound")
     w.sound_design_desc.setWordWrap(True)

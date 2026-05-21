@@ -71,8 +71,6 @@ class ChessBoardWidget(QWidget):
         return t, m, s
 
     def _sq_rect(self, sq, t, m, sz):
-        """Return the QRectF for a given square.  *t* is total board px (unused
-        internally but kept for API compatibility), *m* is margin, *sz* is square size."""
         f, r = chess.square_file(sq), chess.square_rank(sq)
         c = (7 - f) if self.flipped else f
         rw = r if self.flipped else (7 - r)
@@ -152,9 +150,16 @@ class ChessBoardWidget(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
         t, m, sz = self._layout()
+        self._paint_content(p, t, m, sz)
+        p.end()
+
+    def _paint_content(self, p, t, m, sz):
+        """Core board painting logic.  Works with any QPainter — can be
+        called from ``paintEvent`` (widget on screen) or from
+        ``render_to_image`` (off-screen QImage).  No backing store needed."""
 
         # Background & border
-        p.fillRect(self.rect(), self.theme.bg)
+        p.fillRect(QRectF(0, 0, t, t), self.theme.bg)
         p.setPen(Qt.NoPen)
         p.setBrush(self.theme.border)
         p.drawRect(QRectF(0, 0, t, t))
@@ -224,7 +229,7 @@ class ChessBoardWidget(QWidget):
 
         # Arrows
         for fr, to, clr in self.arrows:
-            self._draw_arrow(p, fr, to, clr, t, m, sz)       # FIX: pass t and m separately
+            self._draw_arrow(p, fr, to, clr, t, m, sz)
         if self._draw_arr and self._arr_s and self._arr_e:
             self._draw_arrow(p, self._arr_s, self._arr_e,
                              QColor(self.theme.arrow_clr), t, m, sz)
@@ -265,7 +270,6 @@ class ChessBoardWidget(QWidget):
                                  QRectF(rf.x() + (rt.x() - rf.x()) * pr,
                                         rf.y() + (rt.y() - rf.y()) * pr,
                                         sz, sz), sz)
-        p.end()
 
     def _draw_piece(self, p, piece, rect, sz):
         sym = PIECE_SYM.get((piece.piece_type, piece.color), "?")
@@ -273,10 +277,8 @@ class ChessBoardWidget(QWidget):
         fnt.setStyleStrategy(QFont.PreferAntialias)
         p.setFont(fnt)
         if piece.color == chess.WHITE:
-            # Outline pass
             p.setPen(QPen(QColor(0, 0, 0, 200), max(1, sz * 0.04)))
             p.drawText(rect, Qt.AlignCenter, sym)
-            # Fill pass — white on top of outline
             p.setPen(QColor(255, 255, 255))
             p.drawText(rect, Qt.AlignCenter, sym)
         else:
@@ -284,11 +286,6 @@ class ChessBoardWidget(QWidget):
             p.drawText(rect, Qt.AlignCenter, sym)
 
     def _draw_arrow(self, p, fr, to, color, total, margin, sz):
-        """Draw an arrow from *fr* to *to*.
-
-        FIX: accepts *total* and *margin* as separate params instead of
-        the old single *margin* that was incorrectly used for both.
-        """
         r1 = self._sq_rect(fr, total, margin, sz)
         r2 = self._sq_rect(to, total, margin, sz)
         c1, c2 = r1.center(), r2.center()
@@ -304,7 +301,6 @@ class ChessBoardWidget(QWidget):
         p.setBrush(color)
         p.save()
         p.setOpacity(color.alphaF())
-        # Shaft
         px, py = -uy, ux
         path = QPainterPath()
         path.moveTo(start.x() + px * pw / 2, start.y() + py * pw / 2)
@@ -313,7 +309,6 @@ class ChessBoardWidget(QWidget):
         path.lineTo(start.x() - px * pw / 2, start.y() - py * pw / 2)
         path.closeSubpath()
         p.drawPath(path)
-        # Arrowhead
         hw = pw * 2.0
         hl = pw * 1.8
         tip = QPointF(end.x() + ux * hl, end.y() + uy * hl)
@@ -328,14 +323,17 @@ class ChessBoardWidget(QWidget):
     def render_to_image(self, size=1080):
         """Render the board directly to a QImage at the requested resolution.
 
-        FIX: Uses ``self.render(painter)`` instead of ``self.grab().scaled()``
-        so the output is crisp at any size rather than a blurry upscale.
+        Paints directly onto the image using the same ``_paint_content``
+        method as ``paintEvent``, so **no widget backing store is needed**.
+        Works even for widgets that have never been shown.
         """
         img = QImage(size, size, QImage.Format_ARGB32)
         img.fill(QColor(0, 0, 0, 0))
         p = QPainter(img)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        self.render(p)
+        m = size * 0.05 if self.show_coords else 0
+        sz = (size - 2 * m) / 8
+        self._paint_content(p, size, m, sz)
         p.end()
         return img
