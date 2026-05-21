@@ -1,57 +1,53 @@
 """Chess Video Maker Pro — Constants, Themes, and Configuration"""
-
+import os
+import shutil
 import chess
 from PySide6.QtGui import QColor
 
-# ─── Optional Dependencies ──────────────────────────────────────────
-
 try:
-    import cv2  # noqa: F401
-    import numpy as np  # noqa: F401
+    import cv2
+    import numpy as np
     HAS_CV2 = True
 except ImportError:
     HAS_CV2 = False
 
-# ─── Piece Symbols ──────────────────────────────────────────────────
-
 PIECE_SYM = {
-    (chess.PAWN,   chess.WHITE): "♙", (chess.PAWN,   chess.BLACK): "♟",
+    (chess.PAWN, chess.WHITE): "♙", (chess.PAWN, chess.BLACK): "♟",
     (chess.KNIGHT, chess.WHITE): "♘", (chess.KNIGHT, chess.BLACK): "♞",
     (chess.BISHOP, chess.WHITE): "♗", (chess.BISHOP, chess.BLACK): "♝",
-    (chess.ROOK,   chess.WHITE): "♖", (chess.ROOK,   chess.BLACK): "♜",
-    (chess.QUEEN,  chess.WHITE): "♕", (chess.QUEEN,  chess.BLACK): "♛",
-    (chess.KING,   chess.WHITE): "♔", (chess.KING,   chess.BLACK): "♚",
+    (chess.ROOK, chess.WHITE): "♖", (chess.ROOK, chess.BLACK): "♜",
+    (chess.QUEEN, chess.WHITE): "♕", (chess.QUEEN, chess.BLACK): "♛",
+    (chess.KING, chess.WHITE): "♔", (chess.KING, chess.BLACK): "♚",
 }
 
-# ─── AI Engine Mapping ──────────────────────────────────────────────
+AI_MAP = {0: "Minimax (Alpha-Beta)", 1: "MCTS (Monte Carlo)", 2: "Stockfish (UCI)"}
 
-AI_MAP = {
-    0: "Minimax (Alpha-Beta)",
-    1: "MCTS (Monte Carlo)",
-    2: "Stockfish (UCI)",
-}
+SOUND_THEMES = ["Classic", "Digital", "Tournament", "Silent"]
+SOUND_DESIGNS = ["Default", "Warm", "Crisp", "Retro", "Cinematic", "Minimal"]
+SOUND_TYPES = ["move", "capture", "check", "checkmate", "castle",
+               "illegal", "new_game", "promotion", "ui_click"]
+ANIM_EASINGS = ["OutCubic", "Linear", "InOutCubic", "OutBack", "OutBounce", "InCubic"]
 
-# ─── Sample PGN ─────────────────────────────────────────────────────
+# Game states for eval bar professional indications
+GAME_NORMAL = "normal"
+GAME_CHECKMATE = "checkmate"
+GAME_STALEMATE = "stalemate"
+GAME_DRAW = "draw"
+GAME_INSUFFICIENT = "insufficient"
 
-SAMPLE_PGN = """\
-[Event "World Championship 2023"]
-[Site "London ENG"]
-[Date "2023.04.09"]
-[White "Carlsen, Magnus"]
-[Black "Nepomniachtchi, Ian"]
-[Result "1-0"]
 
-1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5
-7. Bb3 d6 8. c3 O-O 9. h3 Nb8 10. d4 Nbd7 11. Nbd2 Bb7 12. Bc2 Re8
-13. Nf1 Bf8 14. Ng3 g6 15. a4 Bg7 16. Bd3 c6 17. Bg5 Qc7 18. Qd2 Nh5
-19. Nxh5 gxh5 20. Bh6 Bxh6 21. Qxh6 Qd8 22. Rab1 Qe7 23. b4 a5 1-0"""
-
-# ─── Board Themes ───────────────────────────────────────────────────
+def find_stockfish():
+    p = shutil.which("stockfish")
+    if p:
+        return p
+    for d in ["/usr/games/stockfish", "/usr/local/bin/stockfish",
+              r"C:\Stockfish\stockfish.exe"]:
+        if os.path.isfile(d):
+            return d
+    return None
 
 
 class BoardTheme:
-    """Chess board visual theme with configurable colors."""
-
     def __init__(self, name="Classic", light=(240, 217, 181), dark=(181, 136, 99),
                  border=(48, 26, 7), highlight=(255, 255, 0, 100),
                  last_move=(155, 199, 0, 100), arrow=(220, 50, 47, 200)):

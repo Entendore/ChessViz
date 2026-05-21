@@ -1,18 +1,13 @@
 """Chess Video Maker Pro — Chess Board Widget"""
-
 import math
 import chess
 from PySide6.QtWidgets import QWidget, QSizePolicy
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF
-from PySide6.QtGui import (QPainter, QColor, QFont, QPen, QImage,
-                            QPainterPath, QPolygonF)
-
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF, Property
+from PySide6.QtGui import QPainter, QColor, QFont, QPen, QImage, QPainterPath, QPolygonF
 from constants import PIECE_SYM, BoardTheme
 
 
 class ChessBoardWidget(QWidget):
-    """Custom Qt Widget for rendering and interacting with a Chess Board."""
-
     squareClicked = Signal(int)
 
     def __init__(self, parent=None):
@@ -26,57 +21,107 @@ class ChessBoardWidget(QWidget):
         self.last_move = None
         self.highlighted = set()
         self.arrows = []
-        self._arrow_start = self._arrow_end = None
-        self._drawing_arrow = False
+        self._arr_s = self._arr_e = None
+        self._draw_arr = False
         self.anim_move = None
-        self.anim_progress = 0.0
+        self.anim_rook_move = None
+        self._anim_progress_val = 1.0
+        self._check_square = None
+        self._check_opacity_val = 0.0
+        self._flash_squares = ()
+        self._flash_opacity_val = 0.0
         self.policy_vis = {}
         self.setMinimumSize(400, 400)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
 
+    # ── Qt Properties ──────────────────────────────────────────────
+    def _get_ap(self):
+        return self._anim_progress_val
+
+    def _set_ap(self, v):
+        self._anim_progress_val = v
+        self.update()
+
+    animProgress = Property(float, _get_ap, _set_ap)
+
+    def _get_co(self):
+        return self._check_opacity_val
+
+    def _set_co(self, v):
+        self._check_opacity_val = v
+        self.update()
+
+    checkOpacity = Property(float, _get_co, _set_co)
+
+    def _get_fo(self):
+        return self._flash_opacity_val
+
+    def _set_fo(self, v):
+        self._flash_opacity_val = v
+        self.update()
+
+    flashOpacity = Property(float, _get_fo, _set_fo)
+
+    # ── Layout helpers ─────────────────────────────────────────────
     def _layout(self):
-        total = min(self.width(), self.height())
-        margin = total * 0.05 if self.show_coords else 0
-        sq = (total - 2 * margin) / 8
-        return total, margin, sq
+        t = min(self.width(), self.height())
+        m = t * 0.05 if self.show_coords else 0
+        s = (t - 2 * m) / 8
+        return t, m, s
 
-    def _sq_rect(self, sq, total, margin, sq_sz):
+    def _sq_rect(self, sq, t, m, sz):
+        """Return the QRectF for a given square.  *t* is total board px (unused
+        internally but kept for API compatibility), *m* is margin, *sz* is square size."""
         f, r = chess.square_file(sq), chess.square_rank(sq)
-        col = (7 - f) if self.flipped else f
-        row = r if self.flipped else (7 - r)
-        return QRectF(margin + col * sq_sz, margin + row * sq_sz, sq_sz, sq_sz)
+        c = (7 - f) if self.flipped else f
+        rw = r if self.flipped else (7 - r)
+        return QRectF(m + c * sz, m + rw * sz, sz, sz)
 
-    def _pos_to_sq(self, pos, total, margin, sq_sz):
-        col = int((pos.x() - margin) / sq_sz)
-        row = int((pos.y() - margin) / sq_sz)
-        if not (0 <= col < 8 and 0 <= row < 8):
+    def _pos_to_sq(self, pos, t, m, sz):
+        c = int((pos.x() - m) / sz)
+        r = int((pos.y() - m) / sz)
+        if not (0 <= c < 8 and 0 <= r < 8):
             return None
-        return chess.square(7 - col, row) if self.flipped else chess.square(col, 7 - row)
+        return chess.square(7 - c, r) if self.flipped else chess.square(c, 7 - r)
 
+    # ── Public setters ─────────────────────────────────────────────
     def set_theme(self, t):
         self.theme = t
         self.update()
 
-    def set_position(self, board, last_move=None):
+    def set_position(self, board, lm=None):
         self.board = board
-        self.last_move = last_move
+        self.last_move = lm
         self.selected_sq = None
         self.legal_targets = []
         self.anim_move = None
-        self.anim_progress = 0.0
+        self.anim_rook_move = None
+        self._anim_progress_val = 1.0
+        self._check_square = None
+        self._check_opacity_val = 0.0
+        self._flash_squares = ()
+        self._flash_opacity_val = 0.0
         self.update()
 
+    def set_position_animated(self, board, lm=None):
+        self.board = board
+        self.last_move = lm
+        self.selected_sq = None
+        self.legal_targets = []
+        self.update()
+
+    # ── Mouse events ───────────────────────────────────────────────
     def mousePressEvent(self, e):
-        total, margin, sq_sz = self._layout()
-        sq = self._pos_to_sq(e.position().toPoint(), total, margin, sq_sz)
+        t, m, sz = self._layout()
+        sq = self._pos_to_sq(e.position().toPoint(), t, m, sz)
         if sq is None:
             return
         if e.button() == Qt.LeftButton:
             if e.modifiers() & Qt.ShiftModifier:
-                self._arrow_start = sq
-                self._drawing_arrow = True
-                self._arrow_end = sq
+                self._arr_s = sq
+                self._draw_arr = True
+                self._arr_e = sq
             else:
                 self.squareClicked.emit(sq)
         elif e.button() == Qt.RightButton:
@@ -84,35 +129,39 @@ class ChessBoardWidget(QWidget):
             self.update()
 
     def mouseMoveEvent(self, e):
-        if self._drawing_arrow:
-            total, margin, sq_sz = self._layout()
-            sq = self._pos_to_sq(e.position().toPoint(), total, margin, sq_sz)
+        if self._draw_arr:
+            t, m, sz = self._layout()
+            sq = self._pos_to_sq(e.position().toPoint(), t, m, sz)
             if sq is not None:
-                self._arrow_end = sq
+                self._arr_e = sq
                 self.update()
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.LeftButton and self._drawing_arrow:
-            total, margin, sq_sz = self._layout()
-            sq = self._pos_to_sq(e.position().toPoint(), total, margin, sq_sz)
-            if sq and self._arrow_start is not None and sq != self._arrow_start:
-                self.arrows.append((self._arrow_start, sq, QColor(self.theme.arrow_clr)))
+        if e.button() == Qt.LeftButton and self._draw_arr:
+            t, m, sz = self._layout()
+            sq = self._pos_to_sq(e.position().toPoint(), t, m, sz)
+            if sq and self._arr_s is not None and sq != self._arr_s:
+                self.arrows.append((self._arr_s, sq, QColor(self.theme.arrow_clr)))
                 self.update()
-            self._drawing_arrow = False
-            self._arrow_start = self._arrow_end = None
+            self._draw_arr = False
+            self._arr_s = self._arr_e = None
 
+    # ── Painting ───────────────────────────────────────────────────
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        total, margin, sq = self._layout()
+        t, m, sz = self._layout()
+
+        # Background & border
         p.fillRect(self.rect(), self.theme.bg)
         p.setPen(Qt.NoPen)
         p.setBrush(self.theme.border)
-        p.drawRect(QRectF(0, 0, total, total))
+        p.drawRect(QRectF(0, 0, t, t))
 
+        # Squares
         for s in chess.SQUARES:
-            rect = self._sq_rect(s, total, margin, sq)
+            rect = self._sq_rect(s, t, m, sz)
             f, r = chess.square_file(s), chess.square_rank(s)
             base = self.theme.light_sq if (f + r) % 2 == 0 else self.theme.dark_sq
             p.fillRect(rect, base)
@@ -123,117 +172,170 @@ class ChessBoardWidget(QWidget):
             if s in self.highlighted:
                 p.fillRect(rect, QColor(0, 130, 255, 80))
 
+        # Flash overlay
+        if self._flash_squares and self._flash_opacity_val > 0:
+            for fsq in self._flash_squares:
+                p.fillRect(self._sq_rect(fsq, t, m, sz),
+                           QColor(255, 255, 180, int(self._flash_opacity_val * 140)))
+
+        # Check highlight
+        if self._check_square is not None and self._check_opacity_val > 0:
+            p.fillRect(self._sq_rect(self._check_square, t, m, sz),
+                       QColor(255, 30, 30, int(self._check_opacity_val * 130)))
+
+        # Coordinates
         if self.show_coords:
-            fnt = QFont("Arial", max(7, int(sq * 0.14)))
+            fnt = QFont("Arial", max(7, int(sz * 0.14)))
             fnt.setBold(True)
             p.setFont(fnt)
             p.setPen(self.theme.coord)
             for i in range(8):
                 fl = chr(ord('h') - i if self.flipped else ord('a') + i)
                 rn = str(i + 1 if self.flipped else 8 - i)
-                x = margin + i * sq + sq / 2
-                p.drawText(QRectF(x - sq / 2, total - margin, sq, margin), Qt.AlignCenter, fl)
-                p.drawText(QRectF(0, margin + i * sq, margin, sq), Qt.AlignCenter, rn)
+                p.drawText(QRectF(m + i * sz + sz / 2 - sz / 2, t - m, sz, m),
+                           Qt.AlignCenter, fl)
+                p.drawText(QRectF(0, m + i * sz, m, sz), Qt.AlignCenter, rn)
 
+        # Legal-move dots
         for mv in self.legal_targets:
-            rect = self._sq_rect(mv, total, margin, sq)
+            rect = self._sq_rect(mv, t, m, sz)
             p.setPen(Qt.NoPen)
             if self.board.piece_at(mv):
                 p.setBrush(QColor(0, 0, 0, 60))
-                p.drawEllipse(rect.adjusted(sq * 0.1, sq * 0.1, -sq * 0.1, -sq * 0.1))
+                p.drawEllipse(rect.adjusted(sz * 0.1, sz * 0.1, -sz * 0.1, -sz * 0.1))
             else:
                 p.setBrush(QColor(0, 0, 0, 40))
-                p.drawEllipse(rect.center(), sq * 0.15, sq * 0.15)
+                p.drawEllipse(rect.center(), sz * 0.15, sz * 0.15)
 
+        # Policy visualization
         if self.policy_vis:
             p.setPen(Qt.NoPen)
-            for uci, prob in self.policy_vis.items():
+            for uci, pr in self.policy_vis.items():
                 try:
-                    move = chess.Move.from_uci(uci)
-                    if move in self.board.legal_moves:
-                        to_sq = move.to_square
-                        rect = self._sq_rect(to_sq, total, margin, sq)
-                        color = QColor.fromHsvF(0.33 * prob, 0.9, 0.9, 0.6 * prob + 0.1)
-                        p.setBrush(color)
-                        p.drawEllipse(rect.center(), sq * 0.4 * prob + sq * 0.1, sq * 0.4 * prob + sq * 0.1)
+                    mv = chess.Move.from_uci(uci)
+                    if mv in self.board.legal_moves:
+                        rect = self._sq_rect(mv.to_square, t, m, sz)
+                        p.setBrush(QColor.fromHsvF(0.33 * pr, 0.9, 0.9, 0.6 * pr + 0.1))
+                        p.drawEllipse(rect.center(),
+                                      sz * 0.4 * pr + sz * 0.1,
+                                      sz * 0.4 * pr + sz * 0.1)
                 except Exception:
                     pass
 
-        for (fr, to, clr) in self.arrows:
-            self._draw_arrow(p, fr, to, clr, margin, sq)
-        if self._drawing_arrow and self._arrow_start and self._arrow_end:
-            self._draw_arrow(p, self._arrow_start, self._arrow_end, QColor(self.theme.arrow_clr), margin, sq)
+        # Arrows
+        for fr, to, clr in self.arrows:
+            self._draw_arrow(p, fr, to, clr, t, m, sz)       # FIX: pass t and m separately
+        if self._draw_arr and self._arr_s and self._arr_e:
+            self._draw_arrow(p, self._arr_s, self._arr_e,
+                             QColor(self.theme.arrow_clr), t, m, sz)
 
+        # Pieces — skip squares that are being animated
+        ats = self.anim_move.to_square if self.anim_move else None
+        rts = self.anim_rook_move[1] if self.anim_rook_move else None
         for s in chess.SQUARES:
             pc = self.board.piece_at(s)
             if pc:
-                if self.anim_move and s == self.anim_move.from_square:
+                if self.anim_move and s == ats:
                     continue
-                self._draw_piece(p, pc, self._sq_rect(s, total, margin, sq), sq)
+                if self.anim_rook_move and s == rts:
+                    continue
+                self._draw_piece(p, pc, self._sq_rect(s, t, m, sz), sz)
 
+        # Animated main piece
         if self.anim_move:
-            pc = self.board.piece_at(self.anim_move.from_square)
+            pc = self.board.piece_at(self.anim_move.to_square)
             if pc:
-                r_from = self._sq_rect(self.anim_move.from_square, total, margin, sq)
-                r_to = self._sq_rect(self.anim_move.to_square, total, margin, sq)
-                x = r_from.x() + (r_to.x() - r_from.x()) * self.anim_progress
-                y = r_from.y() + (r_to.y() - r_from.y()) * self.anim_progress
-                self._draw_piece(p, pc, QRectF(x, y, sq, sq), sq)
+                pr = self._anim_progress_val
+                rf = self._sq_rect(self.anim_move.from_square, t, m, sz)
+                rt = self._sq_rect(self.anim_move.to_square, t, m, sz)
+                self._draw_piece(p, pc,
+                                 QRectF(rf.x() + (rt.x() - rf.x()) * pr,
+                                        rf.y() + (rt.y() - rf.y()) * pr,
+                                        sz, sz), sz)
+
+        # Animated rook (castling)
+        if self.anim_rook_move:
+            rfs, rts = self.anim_rook_move
+            pc = self.board.piece_at(rts)
+            if pc:
+                pr = self._anim_progress_val
+                rf = self._sq_rect(rfs, t, m, sz)
+                rt = self._sq_rect(rts, t, m, sz)
+                self._draw_piece(p, pc,
+                                 QRectF(rf.x() + (rt.x() - rf.x()) * pr,
+                                        rf.y() + (rt.y() - rf.y()) * pr,
+                                        sz, sz), sz)
         p.end()
 
-    def _draw_piece(self, p, piece, rect, sq_sz):
+    def _draw_piece(self, p, piece, rect, sz):
         sym = PIECE_SYM.get((piece.piece_type, piece.color), "?")
-        fnt = QFont("Segoe UI Symbol", sq_sz * 0.72)
+        fnt = QFont("Segoe UI Symbol", sz * 0.72)
         fnt.setStyleStrategy(QFont.PreferAntialias)
         p.setFont(fnt)
-        p.setPen(QPen(QColor(0, 0, 0, 180), max(1, sq_sz * 0.03)))
         if piece.color == chess.WHITE:
+            # Outline pass
+            p.setPen(QPen(QColor(0, 0, 0, 200), max(1, sz * 0.04)))
             p.drawText(rect, Qt.AlignCenter, sym)
-            p.setPen(Qt.NoPen)
-            p.drawText(rect.adjusted(0, -1, 0, -1), Qt.AlignCenter, sym)
+            # Fill pass — white on top of outline
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(rect, Qt.AlignCenter, sym)
         else:
+            p.setPen(QColor(30, 30, 30))
             p.drawText(rect, Qt.AlignCenter, sym)
 
-    def _draw_arrow(self, p, fr, to, color, margin, sq_sz):
-        r1 = self._sq_rect(fr, margin, margin, sq_sz)
-        r2 = self._sq_rect(to, margin, margin, sq_sz)
+    def _draw_arrow(self, p, fr, to, color, total, margin, sz):
+        """Draw an arrow from *fr* to *to*.
+
+        FIX: accepts *total* and *margin* as separate params instead of
+        the old single *margin* that was incorrectly used for both.
+        """
+        r1 = self._sq_rect(fr, total, margin, sz)
+        r2 = self._sq_rect(to, total, margin, sz)
         c1, c2 = r1.center(), r2.center()
         dx, dy = c2.x() - c1.x(), c2.y() - c1.y()
         length = math.hypot(dx, dy)
         if length < 1:
             return
         ux, uy = dx / length, dy / length
-        start = QPointF(c1.x() + ux * sq_sz * 0.35, c1.y() + uy * sq_sz * 0.35)
-        end = QPointF(c2.x() - ux * sq_sz * 0.35, c2.y() - uy * sq_sz * 0.35)
-        pw = sq_sz * 0.13
+        start = QPointF(c1.x() + ux * sz * 0.35, c1.y() + uy * sz * 0.35)
+        end = QPointF(c2.x() - ux * sz * 0.35, c2.y() - uy * sz * 0.35)
+        pw = sz * 0.13
         p.setPen(Qt.NoPen)
         p.setBrush(color)
         p.save()
         p.setOpacity(color.alphaF())
-        shaft = QPainterPath()
-        perp_x, perp_y = -uy, ux
-        shaft.moveTo(start.x() + perp_x * pw / 2, start.y() + perp_y * pw / 2)
-        shaft.lineTo(end.x() + perp_x * pw / 2, end.y() + perp_y * pw / 2)
-        shaft.lineTo(end.x() - perp_x * pw / 2, end.y() - perp_y * pw / 2)
-        shaft.lineTo(start.x() - perp_x * pw / 2, start.y() - perp_y * pw / 2)
-        shaft.closeSubpath()
-        p.drawPath(shaft)
+        # Shaft
+        px, py = -uy, ux
+        path = QPainterPath()
+        path.moveTo(start.x() + px * pw / 2, start.y() + py * pw / 2)
+        path.lineTo(end.x() + px * pw / 2, end.y() + py * pw / 2)
+        path.lineTo(end.x() - px * pw / 2, end.y() - py * pw / 2)
+        path.lineTo(start.x() - px * pw / 2, start.y() - py * pw / 2)
+        path.closeSubpath()
+        p.drawPath(path)
+        # Arrowhead
         hw = pw * 2.0
         hl = pw * 1.8
         tip = QPointF(end.x() + ux * hl, end.y() + uy * hl)
-        tri = QPolygonF([end, QPointF(end.x() + perp_x * hw / 2, end.y() + perp_y * hw / 2), tip,
-                         QPointF(end.x() - perp_x * hw / 2, end.y() - perp_y * hw / 2)])
-        p.drawPolygon(tri)
+        p.drawPolygon(QPolygonF([
+            end,
+            QPointF(end.x() + px * hw / 2, end.y() + py * hw / 2),
+            tip,
+            QPointF(end.x() - px * hw / 2, end.y() - py * hw / 2),
+        ]))
         p.restore()
 
     def render_to_image(self, size=1080):
-        pixmap = self.grab()
-        if not pixmap.isNull():
-            return pixmap.toImage().scaled(size, size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        """Render the board directly to a QImage at the requested resolution.
+
+        FIX: Uses ``self.render(painter)`` instead of ``self.grab().scaled()``
+        so the output is crisp at any size rather than a blurry upscale.
+        """
         img = QImage(size, size, QImage.Format_ARGB32)
         img.fill(QColor(0, 0, 0, 0))
         p = QPainter(img)
         p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
         self.render(p)
         p.end()
         return img
