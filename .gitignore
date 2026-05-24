@@ -39,4 +39,5 @@ dist/
 # >>> AUTO DISCOVERED RULES >>>
 __pycache__/
 MP4Files/
+*.parquet
 # <<< AUTO DISCOVERED RULES <<<
