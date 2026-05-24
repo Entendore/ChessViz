@@ -38,4 +38,5 @@ dist/
 
 # >>> AUTO DISCOVERED RULES >>>
 __pycache__/
+MP4Files/
 # <<< AUTO DISCOVERED RULES <<<
