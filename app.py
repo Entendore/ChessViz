@@ -6,7 +6,10 @@ from PySide6.QtWidgets import QApplication
 from main_window import MainWindow
 
 def main():
-    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)-7s] %(name)s — %(message)s", datefmt="%H:%M:%S")
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)-7s] %(name)s — %(message)s",
+        datefmt="%H:%M:%S")
     logger = logging.getLogger("ChessVideoMaker")
     logger.info("═══════════════════════════════════════════════")
     logger.info("  Chess Video Maker Pro — starting up")

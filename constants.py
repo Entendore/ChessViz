@@ -32,58 +32,29 @@ SOUND_TYPES = ["move", "capture", "check", "checkmate", "castle",
                "illegal", "new_game", "promotion", "ui_click"]
 ANIM_EASINGS = ["OutCubic", "Linear", "InOutCubic", "OutBack", "OutBounce", "InCubic"]
 
-# Game states for eval bar professional indications
 GAME_NORMAL = "normal"
 GAME_CHECKMATE = "checkmate"
 GAME_STALEMATE = "stalemate"
 GAME_DRAW = "draw"
 GAME_INSUFFICIENT = "insufficient"
 
-# ── Quality Presets & System Detection ─────────────────────────────
-QUALITY_PRESETS = {
-    "Low": {
-        "resolution_index": 1,   # 1280×720
-        "fps": 24,
-        "capture_fps": 24,
-        "hold": 1.0,
-        "disk_cache": True,
-        "label": "🐢 Low — 720p · 24 fps · disk cache",
-    },
-    "Medium": {
-        "resolution_index": 0,   # 1920×1080
-        "fps": 30,
-        "capture_fps": 30,
-        "hold": 1.5,
-        "disk_cache": False,
-        "label": "⚖️ Medium — 1080p · 30 fps · balanced",
-    },
-    "High": {
-        "resolution_index": 0,   # 1920×1080
-        "fps": 60,
-        "capture_fps": 60,
-        "hold": 1.5,
-        "disk_cache": False,
-        "label": "🚀 High — 1080p · 60 fps · best quality",
-    },
-}
+# ── No more QUALITY_PRESETS — direct controls only ────────────────
 
-# Memory thresholds (GB) — used to auto-select quality preset
-LOW_RAM_THRESHOLD = 8.0
-MED_RAM_THRESHOLD = 16.0
-
-# Max in-memory frames before auto disk-cache kicks in
 MAX_FRAMES_IN_MEMORY = 1500
 
-# Resolution sizes (no 4K — removed for low-end GPU scalability)
 RESOLUTION_SIZES = {
     "1920×1080": (1920, 1080),
-    "1280×720":  (1280, 720),
+    "1280×720": (1280, 720),
 }
 RESOLUTION_LIST = ["1920×1080", "1280×720"]
 
+# Default capture/export values
+DEFAULT_FPS = 30
+DEFAULT_HOLD = 1.5
+DEFAULT_RESOLUTION_INDEX = 0
+
 
 def get_system_ram_gb():
-    """Get total system RAM in GB. Returns best estimate or 8.0 default."""
     try:
         import psutil
         return psutil.virtual_memory().total / (1024 ** 3)
@@ -93,8 +64,7 @@ def get_system_ram_gb():
         if platform.system() == "Windows":
             import ctypes
             class _MEMSTAT(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
+                _fields_ = [("dwLength", ctypes.c_ulong),
                     ("dwMemoryLoad", ctypes.c_ulong),
                     ("ullTotalPhys", ctypes.c_ulonglong),
                     ("ullAvailPhys", ctypes.c_ulonglong),
@@ -102,8 +72,7 @@ def get_system_ram_gb():
                     ("ullAvailPageFile", ctypes.c_ulonglong),
                     ("ullTotalVirtual", ctypes.c_ulonglong),
                     ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
             stat = _MEMSTAT()
             stat.dwLength = ctypes.sizeof(stat)
             ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
@@ -124,23 +93,18 @@ def get_system_ram_gb():
 
 
 def get_gpu_info():
-    """Try to detect GPU name and VRAM. Returns (name, vram_gb) or ("Unknown", 0)."""
     try:
         if platform.system() == "Windows":
             import subprocess
             r = subprocess.run(
-                ['wmic', 'path', 'win32_VideoController',
-                 'get', 'Name,AdapterRAM'],
+                ['wmic', 'path', 'win32_VideoController', 'get', 'Name,AdapterRAM'],
                 capture_output=True, text=True, timeout=5)
             for line in r.stdout.strip().split('\n')[1:]:
                 parts = line.strip().split()
                 if not parts:
                     continue
                 try:
-                    vram_str = parts[-1]
-                    name = ' '.join(parts[:-1])
-                    vram = int(vram_str) / (1024 ** 3)
-                    return name, vram
+                    return ' '.join(parts[:-1]), int(parts[-1]) / (1024 ** 3)
                 except (ValueError, IndexError):
                     return ' '.join(parts), 0.0
         elif platform.system() == "Linux":
@@ -150,8 +114,7 @@ def get_gpu_info():
                  '--format=csv,noheader,nounits'],
                 capture_output=True, text=True, timeout=5)
             if r.returncode == 0 and r.stdout.strip():
-                line = r.stdout.strip().split('\n')[0]
-                parts = line.split(',')
+                parts = r.stdout.strip().split('\n')[0].split(',')
                 name = parts[0].strip() if len(parts) > 0 else "Unknown"
                 vram = float(parts[1].strip()) / 1024 if len(parts) > 1 else 0.0
                 return name, vram
@@ -160,23 +123,10 @@ def get_gpu_info():
     return "Unknown", 0.0
 
 
-def get_recommended_preset():
-    """Auto-detect recommended quality preset based on system specs."""
-    ram = get_system_ram_gb()
-    gpu_name, vram = get_gpu_info()
-    # GTX 1080 = 8 GB VRAM → Medium
-    if ram < LOW_RAM_THRESHOLD or (0 < vram < 4):
-        return "Low"
-    elif ram < MED_RAM_THRESHOLD or (0 < vram <= 8):
-        return "Medium"
-    return "High"
-
-
 def estimate_memory_gb(resolution_str, fps, hold_seconds, move_count):
-    """Estimate peak memory usage in GB for video capture (RGBA frames)."""
     res = RESOLUTION_SIZES.get(resolution_str, (1920, 1080))
     w, h = res
-    frame_bytes = w * h * 4  # RGBA uint8
+    frame_bytes = w * h * 4
     total_frames = max(1, int(hold_seconds * fps)) * max(1, move_count + 1)
     return (total_frames * frame_bytes) / (1024 ** 3)
 
