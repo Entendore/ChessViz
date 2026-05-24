@@ -1,11 +1,11 @@
-"""Openings data loader — CSV, Parquet, DuckDB, SQLite."""
+"""Puzzle database loader — CSV, Parquet, DuckDB, SQLite with dynamic auto-naming."""
 
 import csv, sqlite3
 from pathlib import Path
-from constants import log, HAS_PANDAS, HAS_PYARROW, HAS_DUCKDB, parse_opening_image
+from constants import log, HAS_PANDAS, HAS_PYARROW, HAS_DUCKDB
 
 
-def load_openings(filepath):
+def load_puzzles(filepath):
     ext = Path(filepath).suffix.lower()
     if ext == '.csv':       rows = _parse_csv(filepath)
     elif ext == '.parquet': rows = _parse_parquet(filepath)
@@ -45,13 +45,33 @@ def _parse_sqlite(filepath):
     rows = [dict(zip(col_names, row)) for row in cursor.fetchall()]; conn.close()
     return rows
 
+def _generate_name(row, uci_moves, idx):
+    name = str(row.get('name', '')).strip()
+    if name: return name
+    white = str(row.get('white', '')).strip()
+    black = str(row.get('black', '')).strip()
+    if white and black: return f"{white} vs {black}"
+    event = str(row.get('event', '')).strip()
+    if event: return event
+    ignore_keys = {'fen', 'moves', 'uci', 'pgn', 'id', 'name', 'img', 'desc', 'description', 'white', 'black', 'event'}
+    parts = []
+    for k, v in row.items():
+        val = str(v).strip()
+        if k not in ignore_keys and val and val.lower() not in ('nan', 'none', ''):
+            parts.append(f"{k.title()}: {val}")
+            if len(parts) == 3: break
+    if parts: return " | ".join(parts)
+    fen = str(row.get('fen', ''))
+    if uci_moves: return f"Puzzle: {uci_moves[0]} ({fen[:10]}...)" if fen else f"Puzzle: {uci_moves[0]}"
+    return f"Puzzle #{idx + 1}"
+
 def _process_rows(rows):
-    openings = []
-    for row in rows:
+    puzzles = []
+    for idx, row in enumerate(rows):
         row = {str(k).lower(): (v if v is not None else '') for k, v in row.items()}
-        pixmap = parse_opening_image(row.get('img', ''))
-        uci_val = row.get('uci', '')
+        uci_val = row.get('moves', row.get('uci', ''))
         if isinstance(uci_val, list): uci_moves = [str(m).strip() for m in uci_val if m]
         else: uci_moves = [m.strip() for m in str(uci_val).split(',') if m.strip()]
-        openings.append({'volume': str(row.get('eco-volume', '')), 'eco': str(row.get('eco', '')), 'name': str(row.get('name', 'Unknown')), 'pixmap': pixmap, 'pgn': str(row.get('pgn', '')), 'uci_moves': uci_moves, 'epd': str(row.get('epd', ''))})
-    return openings
+        name = _generate_name(row, uci_moves, idx)
+        puzzles.append({'name': name, 'fen': str(row.get('fen', '')), 'moves': uci_moves, 'desc': str(row.get('desc', row.get('description', '')))})
+    return puzzles
