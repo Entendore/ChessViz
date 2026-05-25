@@ -1,15 +1,43 @@
-"""Chess board widget — renders the board with themes, move badges, lift animations, and cached assets."""
+"""Chess board widget — python-chess integration, premium pieces, themes, animations.
+Numba JIT stride-correction and CuPy batch frame helpers when available.
+"""
 
-import math, time
+import chess, math, time
+import numpy as np
 from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import Qt, QRect, QRectF, Signal, QTimer, QPointF
 from PySide6.QtGui import (QPainter, QColor, QFont, QPen, QBrush,
-                            QRadialGradient, QImage, QPixmap, QPolygonF)
+                            QRadialGradient, QImage, QPixmap, QPolygonF,
+                            QPainterPath, QTransform)
 
 from constants import (
-    SQ_SIZE, UNICODE_PIECES, FILES_STR, RANKS_STR, ANIM_SPEED_DEFAULT, ANIM_FPS,
-    log, get_render_assets, THEMES, MQ_COLORS, MQ_ICONS, MQ_SHOW_BADGE
+    SQ_SIZE, PIECE_SYM, FILES_STR, RANKS_STR, ANIM_SPEED_DEFAULT, ANIM_FPS,
+    log, get_render_assets, THEMES, HAS_NUMBA, HAS_CUPY
 )
+
+# ── Numba-accelerated stride fix for qimage_to_np ────────────────────────────
+if HAS_NUMBA:
+    from numba import njit
+
+    @njit(cache=True, nogil=True)
+    def _fix_stride_nb(raw, w, h, bpl):
+        out = np.empty((h, w, 3), dtype=np.uint8)
+        w3 = w * 3
+        for i in range(h):
+            src = i * bpl
+            dst = i * w3
+            for j in range(w3):
+                out.flat[dst + j] = raw.flat[src + j]
+        return out
+
+    log("Numba JIT stride-fixer loaded", "BOARD")
+else:
+    def _fix_stride_nb(raw, w, h, bpl):
+        return raw[:, :w * 3].reshape(h, w, 3)
+
+
+def _ease_out_cubic(t):
+    return 1.0 - (1.0 - t) ** 3
 
 
 class ChessBoardWidget(QWidget):
@@ -17,261 +45,309 @@ class ChessBoardWidget(QWidget):
 
     def __init__(self, engine, sound_mgr, parent=None):
         super().__init__(parent)
-        self.engine = engine
-        self.snd = sound_mgr
-        self.selected = None
-        self.legal_targets = []
-        self.setFixedSize(SQ_SIZE * 8, SQ_SIZE * 8)
-        self.setMouseTracking(True)
-
-        self.animating = False
-        self.anim_from = None
-        self.anim_to = None
-        self.anim_piece = None
-        self.anim_captured = '.'
-        self.anim_progress = 0.0
-        self.anim_speed = ANIM_SPEED_DEFAULT
-        self.anim_start_time = 0.0
-        self.pending_notation = None
-        self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(1000 // ANIM_FPS)
+        self.engine = engine; self.snd = sound_mgr
+        self.selected = None; self.legal_targets = []
+        self.setFixedSize(SQ_SIZE * 8, SQ_SIZE * 8); self.setMouseTracking(True)
+        self.animating = False; self.anim_from = None; self.anim_to = None
+        self.anim_piece_obj = None
+        self.anim_captured = '.'; self.anim_progress = 0.0; self.anim_speed = ANIM_SPEED_DEFAULT
+        self.anim_start_time = 0.0; self.pending_notation = None
+        self._anim_timer = QTimer(self); self._anim_timer.setInterval(1000 // ANIM_FPS)
         self._anim_timer.timeout.connect(self._anim_tick)
-
         self.current_theme = THEMES["Classic"]
-        self.move_quality = None
 
-    def start_animation(self, fr, fc, tr, tc, piece, captured='.', notation=''):
-        self.animating = True
-        self.anim_from = (fr, fc); self.anim_to = (tr, tc)
-        self.anim_piece = piece; self.anim_captured = captured
-        self.anim_progress = 0.0; self.anim_start_time = time.perf_counter()
-        self.pending_notation = notation
-        self._anim_timer.start()
+    def start_animation(self, fr, fc, tr, tc, piece_obj, captured='.', notation=''):
+        self.animating = True; self.anim_from = (fr, fc); self.anim_to = (tr, tc)
+        self.anim_piece_obj = piece_obj; self.anim_captured = captured; self.anim_progress = 0.0
+        self.anim_start_time = time.perf_counter(); self.pending_notation = notation; self._anim_timer.start()
 
     def _anim_tick(self):
-        elapsed = time.perf_counter() - self.anim_start_time
-        duration = self.anim_speed / 1000.0
-        self.anim_progress = min(1.0, elapsed / duration) if duration > 0 else 1.0
-        self.update()
+        elapsed = time.perf_counter() - self.anim_start_time; duration = self.anim_speed / 1000.0
+        self.anim_progress = min(1.0, elapsed / duration) if duration > 0 else 1.0; self.update()
         if self.anim_progress >= 1.0:
-            self._anim_timer.stop(); self.animating = False; self.update()
-            if self.pending_notation:
-                self.move_made.emit(self.pending_notation); self.pending_notation = None
+            self._anim_timer.stop(); self.animating = False; self.anim_piece_obj = None; self.update()
+            if self.pending_notation: self.move_made.emit(self.pending_notation); self.pending_notation = None
 
     def _get_anim_state(self):
         if not self.animating: return None
-        return {'from': self.anim_from, 'to': self.anim_to, 'piece': self.anim_piece, 'progress': self.anim_progress}
+        t_eased = _ease_out_cubic(self.anim_progress)
+        return {'from': self.anim_from, 'to': self.anim_to,
+                'piece_obj': self.anim_piece_obj, 'progress': t_eased}
 
     def paintEvent(self, e):
         chk = self.engine.check_squares()
-        img = self.render_frame(
-            self.engine.board, self.engine.last_move, self.selected, self.legal_targets,
-            check_squares=chk, anim_state=self._get_anim_state(), 
-            theme=self.current_theme, move_quality=self.move_quality)
-        pix = QPixmap.fromImage(img)
-        painter = QPainter(self)
-        painter.drawPixmap(0, 0, pix)
+        img = self.render_frame(self.engine.board, self.engine.last_move, self.selected,
+                                self.legal_targets, check_squares=chk,
+                                anim_state=self._get_anim_state(), theme=self.current_theme)
+        pix = QPixmap.fromImage(img); painter = QPainter(self); painter.drawPixmap(0, 0, pix)
 
     @staticmethod
     def render_frame(board, last_move=None, selected=None, legal_targets=None,
                      text_overlay="", check_squares=None, anim_state=None,
-                     sq_size=SQ_SIZE, show_arrow=True, theme=None, move_quality=None):
+                     sq_size=SQ_SIZE, show_arrow=True, theme=None):
         if theme is None: theme = THEMES["Classic"]
-        sz = sq_size
-        img = QImage(sz * 8, sz * 8, QImage.Format_ARGB32_Premultiplied)
+        sz = sq_size; img = QImage(sz * 8, sz * 8, QImage.Format_ARGB32_Premultiplied)
         img.fill(Qt.transparent)
-        p = QPainter(img)
-        p.setRenderHint(QPainter.Antialiasing)
+        p = QPainter(img); p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
+        (font_piece, font_coord, font_badge_normal, font_badge_symbol, pen_badge_outline) = get_render_assets(sz)
+        check_set = set(check_squares or []); skip_sq = set()
+        if anim_state: skip_sq.add(anim_state['from']); skip_sq.add(anim_state['to'])
 
-        (font_piece, font_coord, font_badge_normal, font_badge_symbol,
-         pen_white_shadow, pen_white_outline, pen_black_shadow, pen_badge_outline) = get_render_assets(sz)
+        # ── Square fills & highlights ──────────────────────────────────────
+        for sq in chess.SQUARES:
+            r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
+            x, y = c * sz, r * sz
+            is_light = (r + c) % 2 == 0
+            color = theme.light_sq if is_light else theme.dark_sq
+            p.fillRect(x, y, sz, sz, color)
 
-        check_set = set(check_squares or [])
-        skip_sq = set()
-        if anim_state: skip_sq.add(anim_state['to'])
+            if last_move and (r, c) in last_move:
+                p.fillRect(x, y, sz, sz, theme.last_move)
 
-        for r in range(8):
-            for c in range(8):
-                x, y = c * sz, r * sz
-                color = theme.light_sq if (r+c)%2==0 else theme.dark_sq
-                p.fillRect(x, y, sz, sz, color)
-                if last_move and (r,c) in last_move: p.fillRect(x, y, sz, sz, theme.last_move)
-                if selected and (r,c)==selected: p.fillRect(x, y, sz, sz, theme.highlight)
-                if (r,c) in check_set:
-                    grad = QRadialGradient(x+sz/2, y+sz/2, sz*0.7)
-                    grad.setColorAt(0, QColor(255, 30, 30, 160))
-                    grad.setColorAt(1, QColor(255, 0, 0, 0))
-                    p.setBrush(QBrush(grad)); p.setPen(Qt.NoPen); p.drawRect(x, y, sz, sz)
-                if legal_targets and (r,c) in legal_targets:
-                    cx, cy = x+sz//2, y+sz//2
-                    if board[r][c] != '.':
-                        p.setPen(QPen(QColor(0,0,0,50), max(3, sz//18))); p.setBrush(Qt.NoBrush)
-                        p.drawEllipse(cx-sz//3, cy-sz//3, sz*2//3, sz*2//3)
-                    else:
-                        p.setPen(Qt.NoPen); p.setBrush(QColor(0,0,0,60))
-                        p.drawEllipse(cx-sz//8, cy-sz//8, sz//4, sz//4)
+            if selected and (r, c) == selected:
+                p.fillRect(x, y, sz, sz, theme.highlight)
 
+            if (r, c) in check_set:
+                grad = QRadialGradient(x + sz / 2, y + sz / 2, sz * 0.7)
+                grad.setColorAt(0, QColor(255, 30, 30, 180))
+                grad.setColorAt(1, QColor(255, 0, 0, 0))
+                p.setBrush(QBrush(grad)); p.setPen(Qt.NoPen)
+                p.drawRect(x, y, sz, sz)
+
+            if legal_targets and (r, c) in legal_targets:
+                cx, cy = x + sz // 2, y + sz // 2
+                if board.piece_at(sq) is not None:
+                    p.setPen(QPen(QColor(0, 0, 0, 90), max(3, sz // 14)))
+                    p.setBrush(Qt.NoBrush)
+                    p.drawEllipse(cx - sz * 5 // 12, cy - sz * 5 // 12,
+                                  sz * 10 // 12, sz * 10 // 12)
+                else:
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(QColor(0, 0, 0, 90))
+                    p.drawEllipse(cx - sz // 6, cy - sz // 6,
+                                  sz // 3, sz // 3)
+
+        # ── Last-move arrow ────────────────────────────────────────────────
         if show_arrow and last_move:
-            (fr,fc),(tr,tc) = last_move
-            ChessBoardWidget._draw_arrow(p, fc*sz+sz//2, fr*sz+sz//2, tc*sz+sz//2, tr*sz+sz//2, theme.arrow_clr, sz)
+            (fr, fc), (tr, tc) = last_move
+            ChessBoardWidget._draw_arrow(
+                p, fc * sz + sz // 2, fr * sz + sz // 2,
+                tc * sz + sz // 2, tr * sz + sz // 2, theme.arrow_clr, sz)
 
-        for r in range(8):
-            for c in range(8):
-                if (r,c) in skip_sq: continue
-                piece = board[r][c]
-                if piece != '.': ChessBoardWidget._draw_piece(p, piece, r, c, sz, font_piece, pen_white_shadow, pen_white_outline, pen_black_shadow)
+        # ── Pieces (skip animated squares) ─────────────────────────────────
+        for sq in chess.SQUARES:
+            r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
+            if (r, c) in skip_sq: continue
+            piece = board.piece_at(sq)
+            if piece:
+                ChessBoardWidget._draw_piece(p, piece, r, c, sz, font_piece)
 
+        # ── Animated piece ─────────────────────────────────────────────────
         if anim_state:
             fr, fc_ = anim_state['from']; tr, tc_ = anim_state['to']
             t = anim_state['progress']
-            lift = 4.0 * t * (1.0 - t) * 0.18
-            scale = 1.0 + 4.0 * t * (1.0 - t) * 0.1
-            ir = fr + (tr - fr) * t; ic = fc_ + (tc_ - fc_) * t
-            
-            # Shadow
-            so = 30 + int(70 * (lift / 0.18))
-            p.setPen(Qt.NoPen); p.setBrush(QColor(0,0,0, so))
-            sy = ir * sz + sz * 0.85
-            p.drawEllipse(QRectF(ic*sz + (sz*scale - sz*0.7)/2, sy, sz*0.7, sz*0.15))
-            
-            # Lifted Piece
-            w, h = sz * scale, sz * scale
-            y_lift = ir * sz - (sz * lift)
-            ChessBoardWidget._draw_piece_at(p, anim_state['piece'], y_lift / sz, ic, sz, w, h, font_piece, pen_white_shadow, pen_white_outline, pen_black_shadow)
+            anim_piece_obj = anim_state.get('piece_obj')
+            if anim_piece_obj:
+                lift = 4.0 * t * (1.0 - t) * 0.15
+                scale = 1.0 + 4.0 * t * (1.0 - t) * 0.08
+                ir = fr + (tr - fr) * t
+                ic = fc_ + (tc_ - fc_) * t
 
-        # Move Quality Badge
-        if last_move and move_quality and move_quality in MQ_SHOW_BADGE:
-            (fr, fc), (tr, tc) = last_move
-            ChessBoardWidget._draw_quality_badge(p, tr, tc, sz, move_quality, font_badge_normal, font_badge_symbol, pen_badge_outline)
+                shadow_alpha = 30 + int(70 * (lift / 0.15))
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(0, 0, 0, shadow_alpha))
+                sy = ir * sz + sz * 0.82
+                p.drawEllipse(QRectF(ic * sz + (sz * scale - sz * 0.65) / 2,
+                                     sy, sz * 0.65, sz * 0.12))
 
+                w, h = sz * scale, sz * scale
+                y_lift = ir * sz - (sz * lift)
+                ChessBoardWidget._draw_piece_at(
+                    p, anim_piece_obj, y_lift / sz, ic, sz, w, h, font_piece)
+
+        # ── Coordinate labels ──────────────────────────────────────────────
         p.setFont(font_coord)
+        coord_margin = max(3, int(sz * 0.04))
+        coord_sz = max(12, sz // 5)
         for c in range(8):
-            col = theme.dark_sq if (7+c)%2==0 else theme.light_sq
+            is_light = (7 + c) % 2 == 0
+            col = theme.dark_sq if is_light else theme.light_sq
             p.setPen(col)
-            p.drawText(QRect(c*sz+sz-max(12,sz//5), 7*sz+2, max(12,sz//5), max(12,sz//5)), Qt.AlignCenter, FILES_STR[c])
+            p.drawText(QRect(c * sz + sz - coord_sz - coord_margin,
+                             7 * sz + coord_margin,
+                             coord_sz, coord_sz),
+                       Qt.AlignCenter, FILES_STR[c])
         for r in range(8):
-            col = theme.dark_sq if r%2==0 else theme.light_sq
+            is_light = r % 2 == 0
+            col = theme.dark_sq if is_light else theme.light_sq
             p.setPen(col)
-            p.drawText(QRect(2, r*sz+2, max(12,sz//5), max(12,sz//5)), Qt.AlignCenter, RANKS_STR[r])
+            p.drawText(QRect(coord_margin, r * sz + coord_margin,
+                             coord_sz, coord_sz),
+                       Qt.AlignCenter, RANKS_STR[r])
 
+        # ── Text overlay (e.g. puzzle instructions) ───────────────────────
         if text_overlay:
-            p.fillRect(0, sz*4-28, sz*8, 56, QColor(0,0,0,200))
-            p.setPen(Qt.white); p.setFont(QFont("Sans", max(12, sz//4), QFont.Bold))
-            p.drawText(QRect(0, sz*4-28, sz*8, 56), Qt.AlignCenter, text_overlay)
-        p.end()
-        return img
+            p.fillRect(0, sz * 4 - 28, sz * 8, 56, QColor(0, 0, 0, 200))
+            p.setPen(Qt.white)
+            p.setFont(QFont("Sans", max(12, sz // 4), QFont.Bold))
+            p.drawText(QRect(0, sz * 4 - 28, sz * 8, 56),
+                       Qt.AlignCenter, text_overlay)
+        p.end(); return img
 
     @staticmethod
-    def render_card(text, bg_color, fg_color, width, height, font_size=36, sub_text=""):
-        img = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
-        img.fill(QColor(bg_color))
+    def render_card(text, bg="#1a1a2e", fg="#e0e0e0", w=544, h=544,
+                    width=None, height=None, font_size=36, sub_text="",
+                    bg_color=None, fg_color=None):
+        bg_val   = bg if bg != "#1a1a2e" else (bg_color or bg)
+        fg_val   = fg if fg != "#e0e0e0" else (fg_color or fg)
+        w_val    = width  if width  is not None else w
+        h_val    = height if height is not None else h
+        img = QImage(w_val, h_val, QImage.Format_ARGB32_Premultiplied)
+        img.fill(QColor(bg_val))
         p = QPainter(img); p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(QColor(fg_color)); p.setFont(QFont("Sans", font_size, QFont.Bold))
-        p.drawText(QRect(0, 0, width, height), Qt.AlignCenter, text)
+        p.setPen(QColor(fg_val)); p.setFont(QFont("Sans", font_size, QFont.Bold))
+        p.drawText(QRect(0, 0, w_val, h_val), Qt.AlignCenter, text)
         if sub_text:
-            p.setFont(QFont("Sans", max(10, font_size//2)))
-            p.setPen(QColor(fg_color).lighter(140))
-            p.drawText(QRect(0, height*3//5, width, height//4), Qt.AlignCenter, sub_text)
-        p.end()
-        return img
+            p.setFont(QFont("Sans", max(10, font_size // 2)))
+            p.setPen(QColor(fg_val).lighter(140))
+            p.drawText(QRect(0, h_val * 3 // 5, w_val, h_val // 4),
+                       Qt.AlignCenter, sub_text)
+        p.end(); return img
 
     @staticmethod
-    def _draw_quality_badge(p, r, c, sz, quality, font_n, font_s, pen_ol):
-        color = MQ_COLORS.get(quality, QColor(150, 150, 150))
-        icon = MQ_ICONS.get(quality, "")
-        rect = QRect(c*sz, r*sz, sz, sz)
+    def _draw_piece(p, piece_obj, row, col, sz, font):
+        ChessBoardWidget._draw_piece_at(p, piece_obj, float(row), float(col),
+                                        sz, sz, sz, font)
+
+    @staticmethod
+    def _draw_piece_at(p, piece_obj, row_f, col_f, sz, w, h, font):
+        """Draw a chess piece glyph scaled to fit within the target rect (w × h).
         
-        rad = sz * 0.19
-        cx = rect.right() - rad - sz * 0.06
-        cy = rect.top() + rad + sz * 0.06
-        center = QPointF(cx, cy)
+        The glyph path is created from the font, measured, then uniformly
+        scaled so its bounding box occupies at most ``FIT_FRAC`` of the
+        target width/height — so it always sits neatly inside the square.
+        """
+        FIT_FRAC = 0.85          # piece fills 85 % of the square
 
-        if quality == "brilliant":
-            glow = QRadialGradient(center, rad * 3.0)
-            glow.setColorAt(0.0, QColor(0, 210, 175, 90)); glow.setColorAt(1.0, QColor(0, 210, 175, 0))
-            p.setPen(Qt.NoPen); p.setBrush(glow); p.drawEllipse(QRectF(cx-rad*3, cy-rad*3, rad*6, rad*6))
-        elif quality == "blunder":
-            glow = QRadialGradient(center, rad * 3.0)
-            glow.setColorAt(0.0, QColor(220, 45, 45, 90)); glow.setColorAt(1.0, QColor(220, 45, 45, 0))
-            p.setPen(Qt.NoPen); p.setBrush(glow); p.drawEllipse(QRectF(cx-rad*3, cy-rad*3, rad*6, rad*6))
-
-        p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 70))
-        p.drawEllipse(QRectF(cx-rad+1, cy-rad+1.5, 2*rad, 2*rad))
-        p.setBrush(color); p.drawEllipse(QRectF(cx-rad, cy-rad, 2*rad, 2*rad))
-        p.setPen(pen_ol); p.setBrush(Qt.NoBrush); p.drawEllipse(QRectF(cx-rad, cy-rad, 2*rad, 2*rad))
-
-        if icon:
-            p.setFont(font_s if icon in ("★", "✕") else font_n)
-            p.setPen(QColor(255, 255, 255))
-            p.drawText(QRectF(cx-rad, cy-rad, 2*rad, 2*rad), Qt.AlignCenter, icon)
-
-    @staticmethod
-    def _draw_piece(p, piece, row, col, sz, font, pw_s, pw_o, pb_s):
-        ChessBoardWidget._draw_piece_at(p, piece, float(row), float(col), sz, sz, sz, font, pw_s, pw_o, pb_s)
-
-    @staticmethod
-    def _draw_piece_at(p, piece, row_f, col_f, sz, w, h, font, pw_s, pw_o, pb_s):
-        is_w = piece.isupper()
-        glyph = UNICODE_PIECES[piece]
+        is_w = piece_obj.color == chess.WHITE
+        glyph = PIECE_SYM[(piece_obj.piece_type, piece_obj.color)]
         px = col_f * sz; py = row_f * sz
-        rect = QRectF(px + (sz - w)/2, py + (sz - h)/2, w, h)
+        rect = QRectF(px + (sz - w) / 2, py + (sz - h) / 2, w, h)
+        center = rect.center()
 
         p.setFont(font)
+
+        # ── Build glyph path at font size, centre at origin ────────────
+        path = QPainterPath()
+        path.addText(QPointF(0, 0), font, glyph)
+        br = path.boundingRect()
+        path.translate(-br.center().x(), -br.center().y())
+
+        # ── Scale to fit inside FIT_FRAC of the target box ─────────────
+        if br.width() > 0 and br.height() > 0:
+            sx = (w * FIT_FRAC) / br.width()
+            sy = (h * FIT_FRAC) / br.height()
+            s = min(sx, sy)
+            path = QTransform.fromScale(s, s).map(path)
+
+        path.translate(center.x(), center.y())
+
+        # ── Shadow + outline + fill ────────────────────────────────────
         if is_w:
-            p.setPen(pw_s); p.drawText(rect.adjusted(0, sz*0.02, 0, sz*0.02), Qt.AlignCenter, glyph)
-            p.setPen(pw_o); p.drawText(rect, Qt.AlignCenter, glyph)
-            p.setPen(QColor(255, 255, 255)); p.drawText(rect, Qt.AlignCenter, glyph)
+            shadow = QPainterPath(path)
+            shadow.translate(1.5, 2.0)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 50))
+            p.drawPath(shadow)
+
+            olw = max(1.2, sz * 0.028)
+            p.setPen(QPen(QColor(30, 30, 30), olw,
+                          Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setBrush(QColor(255, 255, 255))
+            p.drawPath(path)
         else:
-            p.setPen(pb_s); p.drawText(rect.adjusted(0, sz*0.02, 0, sz*0.02), Qt.AlignCenter, glyph)
-            p.setPen(QColor(30, 30, 30)); p.drawText(rect, Qt.AlignCenter, glyph)
+            shadow = QPainterPath(path)
+            shadow.translate(1.5, 2.0)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 60))
+            p.drawPath(shadow)
+
+            olw = max(0.8, sz * 0.018)
+            p.setPen(QPen(QColor(10, 10, 10), olw,
+                          Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setBrush(QColor(40, 40, 40))
+            p.drawPath(path)
 
     @staticmethod
     def _draw_arrow(painter, fx, fy, tx, ty, color, sz):
-        dx = tx-fx; dy = ty-fy; dist = max(1, math.hypot(dx, dy))
-        margin = sz * 0.22
-        fx2 = fx + dx*margin/dist; fy2 = fy + dy*margin/dist
-        tx2 = tx - dx*margin/dist; ty2 = ty - dy*margin/dist
-        painter.setPen(QPen(color, max(2, sz//20), Qt.SolidLine, Qt.RoundCap))
+        dx = tx - fx; dy = ty - fy
+        dist = max(1, math.hypot(dx, dy)); margin = sz * 0.22
+        fx2 = fx + dx * margin / dist; fy2 = fy + dy * margin / dist
+        tx2 = tx - dx * margin / dist; ty2 = ty - dy * margin / dist
+        painter.setPen(QPen(color, max(2, sz // 20), Qt.SolidLine, Qt.RoundCap))
         painter.drawLine(int(fx2), int(fy2), int(tx2), int(ty2))
         angle = math.atan2(dy, dx); a_sz = sz * 0.22
-        p1x = tx2 - a_sz*math.cos(angle-0.45); p1y = ty2 - a_sz*math.sin(angle-0.45)
-        p2x = tx2 - a_sz*math.cos(angle+0.45); p2y = ty2 - a_sz*math.sin(angle+0.45)
-        tri = QPolygonF([QPointF(tx2,ty2), QPointF(p1x,p1y), QPointF(p2x,p2y)])
-        painter.setBrush(color); painter.setPen(Qt.NoPen); painter.drawPolygon(tri)
+        p1x = tx2 - a_sz * math.cos(angle - 0.45)
+        p1y = ty2 - a_sz * math.sin(angle - 0.45)
+        p2x = tx2 - a_sz * math.cos(angle + 0.45)
+        p2y = ty2 - a_sz * math.sin(angle + 0.45)
+        tri = QPolygonF([QPointF(tx2, ty2), QPointF(p1x, p1y), QPointF(p2x, p2y)])
+        painter.setBrush(color); painter.setPen(Qt.NoPen)
+        painter.drawPolygon(tri)
 
     @staticmethod
     def qimage_to_np(img):
-        import numpy as np
         img2 = img.convertToFormat(QImage.Format_RGB888)
-        ptr = img2.constBits(); ptr.setsize(img2.sizeInBytes())
+        ptr = img2.constBits()
+        # Older PySide6 returns sip.voidptr (needs setsize);
+        # newer returns memoryview (already sized correctly).
+        if hasattr(ptr, 'setsize'):
+            ptr.setsize(img2.sizeInBytes())
         w = img2.width(); h = img2.height(); bpl = img2.bytesPerLine()
-        if bpl == w * 3: return np.frombuffer(ptr, dtype=np.uint8).reshape((h, w, 3)).copy()
-        raw = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl))
-        return raw[:, :w*3].reshape(h, w, 3).copy()
+        raw = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl)).copy()
+        if bpl == w * 3:
+            return raw.reshape((h, w, 3))
+        return _fix_stride_nb(raw, w, h, bpl)
+
+    @staticmethod
+    def qimage_to_np_batch(images, use_gpu=False):
+        if not images:
+            return np.empty((0, 0, 0, 3), dtype=np.uint8)
+        arrays = [ChessBoardWidget.qimage_to_np(im) for im in images]
+        stack = np.stack(arrays)
+        if use_gpu and HAS_CUPY:
+            import cupy as _cp
+            return _cp.asarray(stack)
+        return stack
 
     def mousePressEvent(self, e):
         if self.animating or self.engine.game_over: return
-        c = int(e.position().x()) // SQ_SIZE; r = int(e.position().y()) // SQ_SIZE
-        if not (0<=r<8 and 0<=c<8): return
-        piece = self.engine.board[r][c]
-
+        c = int(e.position().x()) // SQ_SIZE
+        r = int(e.position().y()) // SQ_SIZE
+        if not (0 <= r < 8 and 0 <= c < 8): return
+        sq = self.engine.rc_to_sq(r, c)
+        piece = self.engine.board.piece_at(sq)
         if self.selected:
             sr, sc = self.selected
-            if (r,c) in self.legal_targets:
+            if (r, c) in self.legal_targets:
                 info = self.engine.make_move(sr, sc, r, c)
                 if info:
-                    sfx = ("capture" if info['captured']!='.' else "castle" if info['castle'] else "move")
+                    sfx = ("capture" if info['captured'] != '.'
+                           else "castle" if info['castle'] else "move")
                     if info['mate']: sfx = "checkmate"
                     elif info['check']: sfx = "check"
                     self.snd.play(sfx)
                     if self.anim_speed > 0:
-                        self.start_animation(sr, sc, r, c, info['piece'], info['captured'], info['notation'])
+                        self.start_animation(sr, sc, r, c, info['piece_obj'],
+                                             info['captured'], info['notation'])
                     else:
                         self.move_made.emit(info['notation'])
             self.selected = None; self.legal_targets = []
         else:
-            if piece!='.' and self.engine.color_of(piece)==self.engine.turn:
-                self.selected = (r,c); self.legal_targets = self.engine.legal_moves(r,c)
-                if not self.legal_targets: self.snd.play("error"); self.selected = None
+            if piece and piece.color == self.engine.board.turn:
+                self.selected = (r, c)
+                self.legal_targets = self.engine.legal_moves(r, c)
+                if not self.legal_targets:
+                    self.snd.play("error"); self.selected = None
         self.update()

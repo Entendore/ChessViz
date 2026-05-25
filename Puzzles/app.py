@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Chess Learning App — PySide6
-Install:  pip install PySide6 numpy imageio[ffmpeg]
+Install:  pip install PySide6 numpy imageio[ffmpeg] chess
 Optional: pip install pandas pyarrow duckdb
+GPU/Accel: pip install numba cupy-cuda121
 """
 
 import sys
