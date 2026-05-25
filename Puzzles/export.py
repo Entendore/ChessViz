@@ -85,9 +85,6 @@ def _render_puzzle_frames(puzzle, cfg, abort_check=None):
     theme = THEMES.get(cfg.theme_name, THEMES["Classic"])
     tasks = []
 
-    # Determine the title screen text:
-    # 1. Use explicit user override from UI if provided
-    # 2. Otherwise, use the dynamic display_title (Puzzle #1 or Opening Name)
     title_text = cfg.title_text
     if not title_text:
         title_text = puzzle.get('display_title', puzzle.get('name', ''))
@@ -105,35 +102,26 @@ def _render_puzzle_frames(puzzle, cfg, abort_check=None):
     else: eng.reset()
 
     for uci in puzzle["moves"]:
-        if abort_check and abort_check():
-            return None
-
+        if abort_check and abort_check(): return None
         uci = uci.strip()
-        if not uci:
-            continue
+        if not uci: continue
 
         board_before_move = eng.board.copy()
         try:
             move = chess.Move.from_uci(uci)
         except ValueError:
-            log(f"Skipping invalid UCI format: {uci}", "EXPORT")
-            continue
+            log(f"Skipping invalid UCI format: {uci}", "EXPORT"); continue
 
         if move not in eng.board.legal_moves:
-            log(f"Skipping illegal move {uci} in export", "EXPORT")
-            continue
+            log(f"Skipping illegal move {uci} in export", "EXPORT"); continue
 
-        from_sq = move.from_square
-        to_sq = move.to_square
-        fr = 7 - chess.square_rank(from_sq)
-        fc = chess.square_file(from_sq)
-        tr = 7 - chess.square_rank(to_sq)
-        tc = chess.square_file(to_sq)
+        from_sq = move.from_square; to_sq = move.to_square
+        fr = 7 - chess.square_rank(from_sq); fc = chess.square_file(from_sq)
+        tr = 7 - chess.square_rank(to_sq); tc = chess.square_file(to_sq)
 
         piece_obj = board_before_move.piece_at(from_sq)
         if piece_obj is None:
-            log(f"Skipping invalid move {uci} in export", "EXPORT")
-            continue
+            log(f"Skipping invalid move {uci} in export", "EXPORT"); continue
 
         n_highlight = max(1, int(fps * cfg.highlight_duration))
         for _ in range(n_highlight):
@@ -165,8 +153,7 @@ def _render_puzzle_frames(puzzle, cfg, abort_check=None):
                                    'font_size': cfg.end_font_size}))
 
     total = len(tasks)
-    if total == 0:
-        return []
+    if total == 0: return []
 
     frames = [None] * total
 
@@ -187,52 +174,42 @@ def _render_puzzle_frames(puzzle, cfg, abort_check=None):
         futures = {executor.submit(render_task, (i, t)): i for i, t in enumerate(tasks)}
         for future in as_completed(futures):
             if abort_check and abort_check():
-                executor.shutdown(wait=False, cancel_futures=True)
-                return None
+                executor.shutdown(wait=False, cancel_futures=True); return None
             try:
-                idx, np_arr = future.result()
-                frames[idx] = np_arr
+                idx, np_arr = future.result(); frames[idx] = np_arr
             except Exception as e:
                 log(f"Frame render error: {e}", "EXPORT")
 
     frames = [f for f in frames if f is not None]
     if not frames:
-        log("All frames failed to render", "EXPORT")
-        return None
-
+        log("All frames failed to render", "EXPORT"); return None
     return frames
 
 
 def _post_process_frames(frames, cfg, abort_check=None):
-    if not frames:
-        return frames
+    if not frames: return frames
 
     target_h, target_w = cfg.sq_size * 8, cfg.sq_size * 8
     needs_resize = any(f.shape[0] != target_h or f.shape[1] != target_w
                        for f in frames if f is not None)
     if needs_resize:
         frame_ptrs = np.empty(len(frames), dtype=object)
-        for i, f in enumerate(frames):
-            frame_ptrs[i] = f
+        for i, f in enumerate(frames): frame_ptrs[i] = f
         frames_np = _normalize_frames_nb(frame_ptrs, target_h, target_w)
         frames = [frames_np[i] for i in range(len(frames))]
 
     use_gpu = (HAS_CUPY and cfg.gpu_post_process and
-               (cfg.gpu_vignette > 0 or cfg.gpu_contrast != 1.0 or
-                cfg.gpu_saturation != 1.0))
+               (cfg.gpu_vignette > 0 or cfg.gpu_contrast != 1.0 or cfg.gpu_saturation != 1.0))
     if use_gpu:
-        try:
-            frames = _gpu_post_process(frames, cfg)
+        try: frames = _gpu_post_process(frames, cfg)
         except Exception as e:
             log(f"CuPy GPU post-processing failed ({e}), skipping", "EXPORT")
-
     return frames
 
 
 def _gpu_post_process(frames, cfg):
     n = len(frames)
-    if n == 0:
-        return frames
+    if n == 0: return frames
     h, w, c = frames[0].shape
     frame_bytes = h * w * c
     chunk = max(1, min(200, (1 << 30) // frame_bytes))
@@ -242,26 +219,20 @@ def _gpu_post_process(frames, cfg):
         end = min(start + chunk, n)
         stack_np = np.stack(frames[start:end])
         gpu = _cp.asarray(stack_np)
-
         if cfg.gpu_contrast != 1.0 or cfg.gpu_saturation != 1.0:
             gpu = _gpu_color_grade(gpu, contrast=cfg.gpu_contrast,
                                    saturation=cfg.gpu_saturation)
         if cfg.gpu_vignette > 0.0:
             gpu = _gpu_vignette(gpu, strength=cfg.gpu_vignette)
-
         cpu = _cp.asnumpy(gpu)
-        for i in range(end - start):
-            result[start + i] = cpu[i]
+        for i in range(end - start): result[start + i] = cpu[i]
         del gpu, stack_np, cpu
         _cp.get_default_memory_pool().free_all_blocks()
-
     return result
 
 
 def _write_mp4(filepath, frames, fps):
-    if not HAS_IMAGEIO:
-        return False, "imageio not installed"
-
+    if not HAS_IMAGEIO: return False, "imageio not installed"
     try:
         import imageio.v3 as iio
         iio.imwrite(filepath, frames, fps=fps)
@@ -272,13 +243,9 @@ def _write_mp4(filepath, frames, fps):
             imageio.mimwrite(filepath, frames, fps=fps)
             return True, f"Saved: {filepath}"
         except Exception as e2:
-            msg = f"Error writing {filepath}: {e2}"
-            log(msg, "EXPORT")
-            return False, msg
+            msg = f"Error writing {filepath}: {e2}"; log(msg, "EXPORT"); return False, msg
     except Exception as e:
-        msg = f"Error writing {filepath}: {e}"
-        log(msg, "EXPORT")
-        return False, msg
+        msg = f"Error writing {filepath}: {e}"; log(msg, "EXPORT"); return False, msg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -291,13 +258,10 @@ class ExportWorker(QThread):
 
     def __init__(self, puzzle, file_path, config=None):
         super().__init__()
-        self.puzzle = puzzle
-        self.file_path = file_path
-        self.config = config or ExportConfig()
-        self._abort = False
+        self.puzzle = puzzle; self.file_path = file_path
+        self.config = config or ExportConfig(); self._abort = False
 
-    def abort(self):
-        self._abort = True
+    def abort(self): self._abort = True
 
     def run(self):
         if not HAS_NUMPY or not HAS_IMAGEIO:
@@ -309,14 +273,12 @@ class ExportWorker(QThread):
 
         frames = _render_puzzle_frames(self.puzzle, self.config,
                                        abort_check=lambda: self._abort)
-        if frames is None:
-            self.finished.emit("Export cancelled."); return
+        if frames is None: self.finished.emit("Export cancelled."); return
         self.progress.emit(60)
 
         frames = _post_process_frames(frames, self.config,
                                       abort_check=lambda: self._abort)
-        if frames is None:
-            self.finished.emit("Export cancelled."); return
+        if frames is None: self.finished.emit("Export cancelled."); return
         self.progress.emit(80)
 
         ok, msg = _write_mp4(self.file_path, frames, self.config.fps)
@@ -337,91 +299,61 @@ class BatchExportWorker(QThread):
 
     def __init__(self, puzzles, output_dir, config=None):
         super().__init__()
-        self.puzzles = puzzles
-        self.output_dir = output_dir
-        self.config = config or ExportConfig()
-        self._abort = False
+        self.puzzles = puzzles; self.output_dir = output_dir
+        self.config = config or ExportConfig(); self._abort = False
 
-    def abort(self):
-        self._abort = True
+    def abort(self): self._abort = True
 
     def _unique_path(self, base_name, ext=".mp4"):
         safe = sanitize_filename(base_name)
         path = os.path.join(self.output_dir, safe + ext)
-        if not os.path.exists(path):
-            return path
+        if not os.path.exists(path): return path
         i = 2
         while True:
             path = os.path.join(self.output_dir, f"{safe}_{i}{ext}")
-            if not os.path.exists(path):
-                return path
+            if not os.path.exists(path): return path
             i += 1
 
     def run(self):
         if not HAS_NUMPY or not HAS_IMAGEIO:
             msg = "ERROR: Missing numpy or imageio. pip install numpy imageio[ffmpeg]"
-            log(msg, "EXPORT")
-            self.all_done.emit(0, len(self.puzzles), self.output_dir)
-            return
+            log(msg, "EXPORT"); self.all_done.emit(0, len(self.puzzles), self.output_dir); return
 
         os.makedirs(self.output_dir, exist_ok=True)
-        total = len(self.puzzles)
-        exported = 0
-        errors = 0
-
+        total = len(self.puzzles); exported = 0; errors = 0
         log(f"Batch export: {total} puzzles -> {self.output_dir}", "EXPORT")
 
         for i, puzzle in enumerate(self.puzzles):
-            if self._abort:
-                log("Batch export cancelled", "EXPORT")
-                break
-
+            if self._abort: log("Batch export cancelled", "EXPORT"); break
             name = puzzle.get('name', f'puzzle_{i+1}')
             self.batch_progress.emit(i, total, name)
             self.puzzle_progress.emit(i, 0)
-
             filepath = self._unique_path(name)
 
             try:
-                frames = _render_puzzle_frames(
-                    puzzle, self.config,
-                    abort_check=lambda: self._abort)
-
+                frames = _render_puzzle_frames(puzzle, self.config,
+                                               abort_check=lambda: self._abort)
                 if frames is None:
-                    self.puzzle_error.emit(i, "Cancelled")
-                    errors += 1
-                    continue
-
+                    self.puzzle_error.emit(i, "Cancelled"); errors += 1; continue
                 self.puzzle_progress.emit(i, 50)
 
-                frames = _post_process_frames(
-                    frames, self.config,
-                    abort_check=lambda: self._abort)
-
+                frames = _post_process_frames(frames, self.config,
+                                              abort_check=lambda: self._abort)
                 if frames is None:
-                    self.puzzle_error.emit(i, "Cancelled")
-                    errors += 1
-                    continue
-
+                    self.puzzle_error.emit(i, "Cancelled"); errors += 1; continue
                 self.puzzle_progress.emit(i, 80)
 
                 ok, msg = _write_mp4(filepath, frames, self.config.fps)
-
                 if ok:
-                    exported += 1
-                    self.puzzle_done.emit(i, filepath)
+                    exported += 1; self.puzzle_done.emit(i, filepath)
                     self.puzzle_progress.emit(i, 100)
                     log(f"Batch [{i+1}/{total}] saved: {filepath}", "EXPORT")
                 else:
-                    errors += 1
-                    self.puzzle_error.emit(i, msg)
+                    errors += 1; self.puzzle_error.emit(i, msg)
 
             except Exception as e:
                 err_msg = f"Error exporting '{name}': {e}"
-                log(err_msg, "EXPORT")
-                self.puzzle_error.emit(i, err_msg)
-                errors += 1
+                log(err_msg, "EXPORT"); self.puzzle_error.emit(i, err_msg); errors += 1
 
-        log(f"Batch export complete: {exported}/{total} exported, {errors} errors",
-            "EXPORT")
+        log(f"Batch export complete: {exported}/{total} exported, {errors} errors", "EXPORT")
         self.all_done.emit(exported, errors, self.output_dir)

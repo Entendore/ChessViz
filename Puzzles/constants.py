@@ -49,10 +49,9 @@ try:
 except ImportError:
     pass
 
-# ── FIX: Safer CuPy detection — do NOT touch the GPU at import time ────────
 HAS_CUPY = False
 try:
-    import cupy as cp              # import alone proves the package exists
+    import cupy as cp
     HAS_CUPY = True
 except Exception:
     cp = None
@@ -182,8 +181,6 @@ _thread_local = threading.local()
 def get_render_assets(sz):
     isz = int(sz * 100)
     if getattr(_thread_local, 'cache_sz', -1) == isz: return _thread_local.assets
-    # FIX: use a larger base font so the glyph path is high-quality,
-    # then _draw_piece_at scales it to fit the square exactly.
     font_piece = QFont("Segoe UI Emoji", sz * 0.9)
     font_piece.setStyleStrategy(QFont.PreferAntialias)
     font_coord = QFont("Sans", max(7, int(sz * 0.13)), QFont.Bold)

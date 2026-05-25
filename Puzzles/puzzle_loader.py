@@ -13,7 +13,7 @@ import numpy as np
 from constants import log, HAS_PANDAS, HAS_PYARROW, HAS_DUCKDB, HAS_NUMBA, HAS_CUPY
 
 _CHUNK = 4096
-_CSV_PROCESS_CHUNK = 50_000       # rows processed at a time for memory control
+_CSV_PROCESS_CHUNK = 50_000
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Numba JIT helpers
@@ -32,12 +32,9 @@ if HAS_NUMBA:
             if ln == 0:
                 out[i] = 0
                 continue
-            c = 1
-            s = offsets[i]
-            e = s + ln
+            c = 1; s = offsets[i]; e = s + ln
             for j in range(s, e):
-                if data[j] == comma:
-                    c += 1
+                if data[j] == comma: c += 1
             out[i] = c
         return out
 
@@ -46,8 +43,7 @@ if HAS_NUMBA:
         n = len(offsets)
         valid = np.ones(n, dtype=np.bool_)
         for i in range(n):
-            s = offsets[i]
-            ln = lengths[i]
+            s = offsets[i]; ln = lengths[i]
             if ln == 0 or ln < 4:
                 valid[i] = False
                 continue
@@ -78,8 +74,7 @@ else:
     def _count_moves_nb(data, offsets, lengths):
         out = np.empty(len(offsets), dtype=np.int64)
         for i in range(len(offsets)):
-            if lengths[i] == 0:
-                out[i] = 0
+            if lengths[i] == 0: out[i] = 0
             else:
                 seg = data[offsets[i]:offsets[i] + lengths[i]].tobytes()
                 out[i] = seg.count(b',') + 1
@@ -88,8 +83,7 @@ else:
     def _validate_uci_first_nb(data, offsets, lengths):
         valid = np.ones(len(offsets), dtype=np.bool_)
         for i in range(len(offsets)):
-            if lengths[i] < 4:
-                valid[i] = lengths[i] > 0
+            if lengths[i] < 4: valid[i] = lengths[i] > 0
         return valid
 
     def _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals):
@@ -110,23 +104,20 @@ def _pack_strings(strings):
     offsets = np.empty(len(encoded), dtype=np.int64)
     total = 0
     for i in range(len(encoded)):
-        offsets[i] = total
-        total += lengths[i]
+        offsets[i] = total; total += lengths[i]
     buf = b''.join(encoded)
     data = np.frombuffer(buf, dtype=np.uint8).copy() if buf else np.empty(0, dtype=np.uint8)
     return data, offsets, lengths
 
 
 def batch_count_moves(move_strings):
-    if not move_strings:
-        return np.array([], dtype=np.int64)
+    if not move_strings: return np.array([], dtype=np.int64)
     data, offsets, lengths = _pack_strings(move_strings)
     return _count_moves_nb(data, offsets, lengths)
 
 
 def batch_validate_uci(move_strings):
-    if not move_strings:
-        return np.array([], dtype=np.bool_)
+    if not move_strings: return np.array([], dtype=np.bool_)
     data, offsets, lengths = _pack_strings(move_strings)
     return _validate_uci_first_nb(data, offsets, lengths)
 
@@ -139,17 +130,14 @@ if HAS_CUPY:
     import cupy as _cp
 
     def gpu_difficulty_scores(move_counts, has_fen, has_rating, rating_vals):
-        mc_gpu   = _cp.asarray(move_counts.astype(np.float64))
-        hf_gpu   = _cp.asarray(has_fen.astype(np.float64))
-        hr_gpu   = _cp.asarray(has_rating.astype(np.float64))
-        rv_gpu   = _cp.asarray(rating_vals.astype(np.float64))
-
-        base    = _cp.clip(mc_gpu / 8.0, 0.0, 1.0)
-        fen_b   = 0.15 * hf_gpu
-        rating  = _cp.where(hr_gpu > 0, _cp.clip(rv_gpu / 3000.0, 0.0, 1.0), 0.5)
-        scores  = 0.4 * base + 0.2 * fen_b + 0.4 * rating
-
-        return _cp.asnumpy(scores)
+        mc_gpu = _cp.asarray(move_counts.astype(np.float64))
+        hf_gpu = _cp.asarray(has_fen.astype(np.float64))
+        hr_gpu = _cp.asarray(has_rating.astype(np.float64))
+        rv_gpu = _cp.asarray(rating_vals.astype(np.float64))
+        base = _cp.clip(mc_gpu / 8.0, 0.0, 1.0)
+        fen_b = 0.15 * hf_gpu
+        rating = _cp.where(hr_gpu > 0, _cp.clip(rv_gpu / 3000.0, 0.0, 1.0), 0.5)
+        return _cp.asnumpy(0.4 * base + 0.2 * fen_b + 0.4 * rating)
 
     def gpu_sort_by_difficulty(puzzles, scores):
         idx = _cp.asnumpy(_cp.argsort(_cp.asarray(scores))).tolist()
@@ -195,7 +183,6 @@ def load_puzzles(filepath):
         del rows; gc.collect()
     else:
         raise ValueError(f"Unsupported file format: {ext}")
-
     gc.collect()
 
 
@@ -213,16 +200,13 @@ def _load_csv_chunked(filepath):
         rows = _parse_csv_stdlib(filepath)
         for i in range(0, len(rows), _CSV_PROCESS_CHUNK):
             yield _process_rows(rows[i:i + _CSV_PROCESS_CHUNK])
-        del rows
-        gc.collect()
+        del rows; gc.collect()
 
 
 def _parse_csv_stdlib(filepath):
     rows = []
     with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
+        for row in csv.DictReader(f): rows.append(row)
     log(f"Parsed {len(rows)} CSV rows (stdlib)", "PUZZLE")
     return rows
 
@@ -243,14 +227,12 @@ def _parse_parquet(filepath):
 
 
 def _parse_duckdb(filepath):
-    if not HAS_DUCKDB:
-        raise ImportError("DuckDB requires 'duckdb'")
+    if not HAS_DUCKDB: raise ImportError("DuckDB requires 'duckdb'")
     import duckdb
     con = duckdb.connect(filepath, read_only=True)
     try:
         tables = con.execute("SHOW TABLES").fetchall()
-        if not tables:
-            raise ValueError("No tables found in DuckDB database")
+        if not tables: raise ValueError("No tables found in DuckDB database")
         table_name = tables[0][0]
         df = con.execute(f'SELECT * FROM "{table_name}"').fetchdf()
         log(f"Parsed {len(df)} DuckDB rows", "PUZZLE")
@@ -262,11 +244,9 @@ def _parse_duckdb(filepath):
 def _parse_sqlite(filepath):
     conn = sqlite3.connect(filepath)
     try:
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table';")
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
         tables = cursor.fetchall()
-        if not tables:
-            raise ValueError("No tables found in SQLite database")
+        if not tables: raise ValueError("No tables found in SQLite database")
         table_name = tables[0][0]
         cursor = conn.execute(f'SELECT * FROM "{table_name}"')
         col_names = [desc[0] for desc in cursor.description]
@@ -282,16 +262,12 @@ def _parse_sqlite(filepath):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _process_rows(rows):
-    if not rows:
-        return []
+    if not rows: return []
     n = len(rows)
-
     if HAS_PANDAS and n > 100:
-        try:
-            return _process_rows_vectorized(rows)
+        try: return _process_rows_vectorized(rows)
         except Exception as exc:
             log(f"Vectorized path failed ({exc}); falling back to iterative", "PUZZLE")
-
     return _process_rows_iterative(rows)
 
 
@@ -299,22 +275,14 @@ def _parse_uci_value(val):
     if isinstance(val, list):
         flat = []
         for item in val:
-            if isinstance(item, str):
-                flat.extend(item.replace(',', ' ').split())
+            if isinstance(item, str): flat.extend(item.replace(',', ' ').split())
             elif item is not None:
                 s = str(item).strip().replace(',', ' ')
-                if s:
-                    flat.extend(s.split())
+                if s: flat.extend(s.split())
         return flat
     s = str(val).strip().replace(',', ' ')
-    if not s:
-        return []
-    return s.split()
+    return s.split() if s else []
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Iterative path
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _process_rows_iterative(rows):
     puzzles = []
@@ -324,17 +292,11 @@ def _process_rows_iterative(rows):
         uci_moves = _parse_uci_value(uci_val)
         name = _generate_name(row, uci_moves, idx)
         puzzles.append({
-            'name':  name,
-            'fen':   str(row.get('fen', '')),
-            'moves': uci_moves,
-            'desc':  str(row.get('desc', row.get('description', ''))),
+            'name': name, 'fen': str(row.get('fen', '')),
+            'moves': uci_moves, 'desc': str(row.get('desc', row.get('description', ''))),
         })
     return puzzles
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Vectorized path
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _process_rows_vectorized(rows):
     import pandas as pd
@@ -344,28 +306,22 @@ def _process_rows_vectorized(rows):
     df[str_cols] = df[str_cols].fillna('')
     n = len(df)
 
-    moves_col = ('moves' if 'moves' in df.columns
-                 else 'uci' if 'uci' in df.columns
-                 else None)
+    moves_col = ('moves' if 'moves' in df.columns else 'uci' if 'uci' in df.columns else None)
     moves_series = df[moves_col] if moves_col else pd.Series([''] * n, index=df.index)
     uci_moves_list = moves_series.apply(_parse_uci_value)
 
     move_strs = moves_series.astype(str).tolist()
     move_counts = batch_count_moves(move_strs)
-    uci_valid   = batch_validate_uci(move_strs)
-    invalid_n   = int((~uci_valid).sum())
+    uci_valid = batch_validate_uci(move_strs)
+    invalid_n = int((~uci_valid).sum())
     if invalid_n:
         log(f"Warning: {invalid_n}/{n} puzzles have unusual UCI format", "PUZZLE")
 
-    has_fen = np.array(
-        [bool(str(v).strip()) for v in df.get('fen', pd.Series('', index=df.index))],
-        dtype=np.bool_)
+    has_fen = np.array([bool(str(v).strip()) for v in df.get('fen', pd.Series('', index=df.index))], dtype=np.bool_)
 
     rating_col = None
     for candidate in ('rating', 'difficulty', 'score', 'elo'):
-        if candidate in df.columns:
-            rating_col = candidate
-            break
+        if candidate in df.columns: rating_col = candidate; break
     if rating_col:
         rating_vals = pd.to_numeric(df[rating_col], errors='coerce').fillna(0).values.astype(np.float64)
         has_rating = rating_vals > 0
@@ -376,23 +332,17 @@ def _process_rows_vectorized(rows):
     difficulty = gpu_difficulty_scores(move_counts, has_fen, has_rating, rating_vals)
     names = _generate_names_vectorized(df, uci_moves_list, move_counts)
 
-    fen_col  = ('fen' if 'fen' in df.columns else None)
-    desc_col = ('desc' if 'desc' in df.columns
-                else 'description' if 'description' in df.columns
-                else None)
-    fens  = df[fen_col].astype(str)  if fen_col  else pd.Series([''] * n, index=df.index)
+    fen_col = ('fen' if 'fen' in df.columns else None)
+    desc_col = ('desc' if 'desc' in df.columns else 'description' if 'description' in df.columns else None)
+    fens = df[fen_col].astype(str) if fen_col else pd.Series([''] * n, index=df.index)
     descs = df[desc_col].astype(str) if desc_col else pd.Series([''] * n, index=df.index)
 
     puzzles = []
     for i in range(n):
         puzzles.append({
-            'name':       names[i],
-            'fen':        fens.iloc[i],
-            'moves':      uci_moves_list.iloc[i],
-            'desc':       descs.iloc[i],
-            'difficulty': float(difficulty[i]),
+            'name': names[i], 'fen': fens.iloc[i], 'moves': uci_moves_list.iloc[i],
+            'desc': descs.iloc[i], 'difficulty': float(difficulty[i]),
         })
-
     return puzzles
 
 
@@ -401,7 +351,7 @@ def _process_rows_vectorized(rows):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _rating_category(rating):
-    if rating < 800:  return "Beginner"
+    if rating < 800: return "Beginner"
     if rating < 1200: return "Easy"
     if rating < 1600: return "Medium"
     if rating < 2000: return "Hard"
@@ -409,146 +359,90 @@ def _rating_category(rating):
 
 
 def _generate_name(row, uci_moves, idx):
-    number = idx + 1
-    attrs = []
-
+    number = idx + 1; attrs = []
     name = str(row.get('name', '')).strip()
-    if name and name.lower() not in ('nan', 'none', ''):
-        attrs.append(name)
-
+    if name and name.lower() not in ('nan', 'none', ''): attrs.append(name)
     themes = str(row.get('themes', row.get('theme', ''))).strip()
-    if themes and themes.lower() not in ('nan', 'none', ''):
-        attrs.append(themes)
-
-    opening = str(row.get('opening',
-                 row.get('opening_tags',
-                 row.get('openingtags', '')))).strip()
-    if opening and opening.lower() not in ('nan', 'none', ''):
-        attrs.append(opening)
-
+    if themes and themes.lower() not in ('nan', 'none', ''): attrs.append(themes)
+    opening = str(row.get('opening', row.get('opening_tags', row.get('openingtags', '')))).strip()
+    if opening and opening.lower() not in ('nan', 'none', ''): attrs.append(opening)
     for rkey in ('rating', 'elo', 'difficulty', 'score'):
         rval = str(row.get(rkey, '')).strip()
         if rval and rval.lower() not in ('nan', 'none', ''):
             try:
-                rv = float(rval)
-                attrs.append(f"{_rating_category(rv)} ({int(rv)})")
-                break
-            except ValueError:
-                pass
-
+                rv = float(rval); attrs.append(f"{_rating_category(rv)} ({int(rv)})"); break
+            except ValueError: pass
     if not name:
-        white = str(row.get('white', '')).strip()
-        black = str(row.get('black', '')).strip()
-        if white and black:
-            attrs.append(f"{white} vs {black}")
-
+        white = str(row.get('white', '')).strip(); black = str(row.get('black', '')).strip()
+        if white and black: attrs.append(f"{white} vs {black}")
     if not name:
         event = str(row.get('event', '')).strip()
-        if event and event.lower() not in ('nan', 'none', ''):
-            attrs.append(event)
-
+        if event and event.lower() not in ('nan', 'none', ''): attrs.append(event)
     eco = str(row.get('eco', '')).strip()
-    if eco and eco.lower() not in ('nan', 'none', ''):
-        attrs.append(f"ECO {eco}")
-
-    if attrs:
-        return f"Puzzle #{number} — {' | '.join(attrs)}"
+    if eco and eco.lower() not in ('nan', 'none', ''): attrs.append(f"ECO {eco}")
+    if attrs: return f"Puzzle #{number} — {' | '.join(attrs)}"
     return _generate_name_fallback(row, uci_moves, idx)
 
 
 def _generate_name_fallback(row, uci_moves, idx):
     number = idx + 1
-    ignore = frozenset({
-        'fen', 'moves', 'uci', 'pgn', 'id', 'name', 'img',
-        'desc', 'description', 'white', 'black', 'event',
-        'rating', 'difficulty', 'score', 'elo', 'themes', 'theme',
-        'opening', 'opening_tags', 'openingtags', 'eco',
-    })
+    ignore = frozenset({'fen','moves','uci','pgn','id','name','img','desc','description',
+                        'white','black','event','rating','difficulty','score','elo',
+                        'themes','theme','opening','opening_tags','openingtags','eco'})
     parts = []
     for k, v in row.items():
         val = str(v).strip() if v is not None else ''
         if k not in ignore and val and val.lower() not in ('nan', 'none', ''):
             parts.append(f"{k.title()}: {val}")
-            if len(parts) == 2:
-                break
-    if parts:
-        return f"Puzzle #{number} — {' | '.join(parts)}"
-    if uci_moves:
-        return f"Puzzle #{number} — {uci_moves[0]}…"
+            if len(parts) == 2: break
+    if parts: return f"Puzzle #{number} — {' | '.join(parts)}"
+    if uci_moves: return f"Puzzle #{number} — {uci_moves[0]}…"
     return f"Puzzle #{number}"
 
 
 def _generate_names_vectorized(df, uci_moves_list, move_counts):
     import pandas as pd
-    n = len(df)
-    names = np.empty(n, dtype=object)
+    n = len(df); names = np.empty(n, dtype=object)
 
     def _str_col(col_name):
         s = df.get(col_name, pd.Series('', index=df.index))
-        return (s.fillna('').astype(str).str.strip()
-                if isinstance(s, pd.Series)
-                else pd.Series('', index=df.index))
+        return s.fillna('').astype(str).str.strip() if isinstance(s, pd.Series) else pd.Series('', index=df.index)
 
-    name_col    = _str_col('name')
-    themes_col  = _str_col('themes')
-    if (themes_col == '').all():
-        themes_col = _str_col('theme')
+    name_col = _str_col('name'); themes_col = _str_col('themes')
+    if (themes_col == '').all(): themes_col = _str_col('theme')
     opening_col = _str_col('opening')
-    if (opening_col == '').all():
-        opening_col = _str_col('opening_tags')
-    if (opening_col == '').all():
-        opening_col = _str_col('openingtags')
-    rating_col  = _str_col('rating')
-    eco_col     = _str_col('eco')
-    white_col   = _str_col('white')
-    black_col   = _str_col('black')
-    event_col   = _str_col('event')
+    if (opening_col == '').all(): opening_col = _str_col('opening_tags')
+    if (opening_col == '').all(): opening_col = _str_col('openingtags')
+    rating_col = _str_col('rating'); eco_col = _str_col('eco')
+    white_col = _str_col('white'); black_col = _str_col('black'); event_col = _str_col('event')
 
     for i in range(n):
-        number = i + 1
-        attrs = []
-
+        number = i + 1; attrs = []
         nm = name_col.iloc[i]
-        if nm and nm.lower() not in ('nan', 'none', ''):
-            attrs.append(nm)
-
+        if nm and nm.lower() not in ('nan', 'none', ''): attrs.append(nm)
         th = themes_col.iloc[i]
-        if th and th.lower() not in ('nan', 'none', ''):
-            attrs.append(th)
-
+        if th and th.lower() not in ('nan', 'none', ''): attrs.append(th)
         op = opening_col.iloc[i]
-        if op and op.lower() not in ('nan', 'none', ''):
-            attrs.append(op)
-
+        if op and op.lower() not in ('nan', 'none', ''): attrs.append(op)
         rv = rating_col.iloc[i]
         if rv and rv.lower() not in ('nan', 'none', ''):
             try:
-                rvf = float(rv)
-                attrs.append(f"{_rating_category(rvf)} ({int(rvf)})")
-            except ValueError:
-                pass
-
+                rvf = float(rv); attrs.append(f"{_rating_category(rvf)} ({int(rvf)})")
+            except ValueError: pass
         if not nm:
             w, b = white_col.iloc[i], black_col.iloc[i]
-            if w and b:
-                attrs.append(f"{w} vs {b}")
-
+            if w and b: attrs.append(f"{w} vs {b}")
         if not nm:
             ev = event_col.iloc[i]
-            if ev and ev.lower() not in ('nan', 'none', ''):
-                attrs.append(ev)
-
+            if ev and ev.lower() not in ('nan', 'none', ''): attrs.append(ev)
         eco = eco_col.iloc[i]
-        if eco and eco.lower() not in ('nan', 'none', ''):
-            attrs.append(f"ECO {eco}")
-
+        if eco and eco.lower() not in ('nan', 'none', ''): attrs.append(f"ECO {eco}")
         if attrs:
             names[i] = f"Puzzle #{number} — {' | '.join(attrs)}"
         else:
             row_dict = df.iloc[i].to_dict()
             uci_moves = uci_moves_list.iloc[i]
             names[i] = _generate_name_fallback(row_dict, uci_moves, i)
-
     return names
 
 
@@ -557,14 +451,11 @@ def _generate_names_vectorized(df, uci_moves_list, move_counts):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def sort_by_difficulty(puzzles, ascending=True):
-    if not puzzles:
-        return []
-    scores = np.array([p.get('difficulty', 0.5) for p in puzzles],
-                      dtype=np.float64)
+    if not puzzles: return []
+    scores = np.array([p.get('difficulty', 0.5) for p in puzzles], dtype=np.float64)
     if HAS_CUPY:
         idx = _cp.asnumpy(_cp.argsort(_cp.asarray(scores))).tolist()
     else:
         idx = np.argsort(scores).tolist()
-    if not ascending:
-        idx = idx[::-1]
+    if not ascending: idx = idx[::-1]
     return [puzzles[i] for i in idx]

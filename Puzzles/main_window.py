@@ -1,8 +1,5 @@
-"""Main application window — batch-enabled, no popups.
-Paginated lists for databases of millions of rows.
-Checked state tracked in sets (O(1) cross-page operations).
-Debounced filter for responsive search on huge datasets.
-Professional layout with grouped sections and dedicated settings tab.
+"""Main application window — core layout, puzzle tab, settings tab.
+Openings tab is provided by the OpeningsMixin in openings_tab.py.
 """
 
 import os, math
@@ -14,8 +11,8 @@ from PySide6.QtWidgets import (
     QSpinBox, QLineEdit, QFormLayout, QComboBox,
     QProgressBar, QGroupBox, QCheckBox, QScrollArea
 )
-from PySide6.QtCore import Qt, QTimer, QThread
-from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont
 from constants import (
     log, ExportConfig, ANIM_SPEED_DEFAULT, ANIM_SPEED_SLOW,
     DATA_DIR, THEMES, HAS_CUPY, HAS_NUMBA
@@ -24,7 +21,8 @@ from engine import ChessEngine
 from sound import SoundManager
 from board_widget import ChessBoardWidget
 from export import ExportWorker, BatchExportWorker
-from data_manager import DataLoadWorker
+from data_manager import DataProvider, DataLoadWorker
+from openings_tab import OpeningsMixin
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -50,7 +48,7 @@ class CheckableListWidget(QListWidget):
 #  Main Window
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class MainWindow(QWidget):
+class MainWindow(QWidget, OpeningsMixin):
     _PAGE_SIZE = 100
 
     def __init__(self):
@@ -60,14 +58,13 @@ class MainWindow(QWidget):
 
         self._apply_professional_style()
 
+        # ── Core state ────────────────────────────────────────────────────
         self.engine = ChessEngine()
         self.snd = SoundManager()
+        self.db = DataProvider()
         self.board_widget = ChessBoardWidget(self.engine, self.snd)
         self.board_widget.move_made.connect(self.on_move)
 
-        self.opening_data = []
-        self.opening_step_idx = 0
-        self.puzzle_data = []
         self.export_worker = None
         self.batch_worker = None
         self.puzzles_loaded = False
@@ -76,24 +73,26 @@ class MainWindow(QWidget):
 
         self._pz_page = 0
         self._pz_checked = set()
-        self._pz_filtered = None
-
+        
+        # Openings mixin state
         self._op_page = 0
         self._op_checked = set()
-        self._op_filtered = None
+        self._current_opening = None
+        self.opening_step_idx = 0
 
+        # ── Layout ────────────────────────────────────────────────────────
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
 
         self.tabs = QTabWidget()
         self.tabs.setFixedWidth(460)
-        self.tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tabs)
 
         board_frame = QFrame()
         board_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
-        board_frame.setStyleSheet("QFrame { border: 1px solid #4a4a4f; border-radius: 6px; background: #25252a; }")
+        board_frame.setStyleSheet(
+            "QFrame { border: 1px solid #4a4a4f; border-radius: 6px; background: #25252a; }")
         bl = QVBoxLayout(board_frame)
         bl.setContentsMargins(8, 8, 8, 8)
         bl.setSpacing(8)
@@ -123,7 +122,7 @@ class MainWindow(QWidget):
         layout.addWidget(board_frame, alignment=Qt.AlignCenter)
 
         self._build_puzzle_tab()
-        self._build_openings_tab()
+        self._build_openings_tab()  # Defined in OpeningsMixin
         self._build_settings_tab()
 
         self.snd.play("start")
@@ -131,6 +130,33 @@ class MainWindow(QWidget):
 
         QTimer.singleShot(50,  lambda: self._start_data_load("puzzles"))
         QTimer.singleShot(100, lambda: self._start_data_load("openings"))
+
+    # ── Fix: Prevent threads from being destroyed while running on exit ────
+
+    def closeEvent(self, event):
+        """Gracefully stop all running threads before closing the window."""
+        log("Closing application, waiting for threads to finish...", "APP")
+        
+        # Stop data load workers
+        for worker in self._active_workers[:]:
+            if worker.isRunning():
+                worker.abort()
+                worker.wait(2000)  # Wait up to 2 seconds for it to finish
+                
+        # Stop export workers
+        if self.export_worker and self.export_worker.isRunning():
+            self.export_worker.abort()
+            self.export_worker.wait(2000)
+            
+        if self.batch_worker and self.batch_worker.isRunning():
+            self.batch_worker.abort()
+            self.batch_worker.wait(2000)
+            
+        event.accept()
+
+    def on_move(self, notation):
+        """Handle a move made on the board widget."""
+        pass
 
     # ── Styling ───────────────────────────────────────────────────────────────
 
@@ -288,9 +314,6 @@ class MainWindow(QWidget):
             self.settings_anim_slider.setValue(raw_val)
             self.settings_anim_slider.blockSignals(False)
 
-    def _on_tab_changed(self, index):
-        pass
-
     # ── Thread-safe data loading ─────────────────────────────────────────────
 
     def _start_data_load(self, db_type, single_file=None):
@@ -309,6 +332,7 @@ class MainWindow(QWidget):
             directory = str(Path(DATA_DIR) / db_type)
             worker = DataLoadWorker(db_type, directory=directory)
 
+        worker.setObjectName(f"DataLoadWorker_{db_type}")  # Fix: Name the thread
         worker.data_ready.connect(self._on_data_ready)
         worker.load_error.connect(self._on_load_error)
         worker.finished.connect(lambda w=worker: self._cleanup_worker(w))
@@ -339,12 +363,9 @@ class MainWindow(QWidget):
     def _cleanup_worker(self, worker):
         if worker in self._active_workers:
             self._active_workers.remove(worker)
-        # Use deleteLater so the worker is only destroyed after its event
-        # processing is fully complete — never while run() is executing.
         if not worker.isRunning():
             worker.deleteLater()
         else:
-            # Safety: schedule deletion once the thread actually finishes
             worker.finished.connect(worker.deleteLater)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -591,6 +612,15 @@ class MainWindow(QWidget):
         total = self.db.get_count('puzzles')
         self.puzzle_sel_label.setText(f"Selected: {cnt:,} / {total:,}")
 
+    def _on_puzzle_item_changed(self, item):
+        di = item.data(Qt.UserRole + 1)
+        if di is None: return
+        if item.checkState() == Qt.Checked:
+            self._pz_checked.add(di)
+        else:
+            self._pz_checked.discard(di)
+        self._update_puzzle_sel_label()
+
     def _apply_puzzle_filter(self):
         self._pz_page = 0
         self._populate_puzzle_page()
@@ -617,6 +647,22 @@ class MainWindow(QWidget):
         for i in range(start, end + 1):
             self._pz_checked.add(i)
         self._populate_puzzle_page()
+
+    def _pz_prev_page(self):
+        if self._pz_page > 0:
+            self._pz_page -= 1
+            self._populate_puzzle_page()
+
+    def _pz_next_page(self):
+        if self._pz_page < self._pz_page_count() - 1:
+            self._pz_page += 1
+            self._populate_puzzle_page()
+
+    def _pz_jump_page(self):
+        page = self.pz_jump_spin.value() - 1
+        if 0 <= page < self._pz_page_count():
+            self._pz_page = page
+            self._populate_puzzle_page()
 
     # ── Build export config ──────────────────────────────────────────────────
 
@@ -662,9 +708,7 @@ class MainWindow(QWidget):
         if not pz:
             self.puzzle_status.setText("No puzzle data."); return
 
-        # Create a copy so we don't mutate the cached data
         pz_copy = dict(pz)
-        # Use the exact database ID for the title screen
         pz_copy['display_title'] = f"Puzzle #{pz_copy['id']}"
 
         out_dir = self._ensure_output_dir()
@@ -683,8 +727,6 @@ class MainWindow(QWidget):
         log(f"Exporting current puzzle: {pz_copy['name']} -> {filepath}", "EXPORT")
         self._set_exporting(True)
         self.export_worker = ExportWorker(pz_copy, filepath, cfg)
-        self.export_worker.progress.connect(self._on_single_progress)
-        self.export_worker.finished.connect(self._on_single_finished)
         self.export_worker.start()
 
     def _export_selected_batch(self):
@@ -693,7 +735,6 @@ class MainWindow(QWidget):
             
         puzzles = self.db.get_items_by_ids('puzzles', list(self._pz_checked))
         
-        # Assign exact database ID to title screen
         for p in puzzles:
             p['display_title'] = f"Puzzle #{p['id']}"
             
@@ -704,11 +745,9 @@ class MainWindow(QWidget):
         if total == 0:
             self.puzzle_status.setText("No puzzles loaded."); return
             
-        # Fetch IDs in chunks so we don't RAM-spike
         all_ids = self.db.get_ids_by_filter('puzzles')
         puzzles = self.db.get_items_by_ids('puzzles', all_ids)
         
-        # Assign exact database ID to title screen
         for p in puzzles:
             p['display_title'] = f"Puzzle #{p['id']}"
             
@@ -728,33 +767,6 @@ class MainWindow(QWidget):
 
     # ── Export: batch ─────────────────────────────────────────────────────────
 
-    def _export_selected_batch(self):
-        puzzles = []
-        for i in sorted(self._pz_checked):
-            if i < len(self.puzzle_data):
-                pz = self.puzzle_data[i]
-                pz_copy = dict(pz)
-                # Extract just "Puzzle #X" for the title screen
-                pz_copy['display_title'] = pz_copy['name'].split(' — ')[0] if ' — ' in pz_copy['name'] else pz_copy['name']
-                puzzles.append(pz_copy)
-                
-        if not puzzles:
-            self.puzzle_status.setText("No puzzles checked for batch export."); return
-        self._start_batch_export(puzzles)
-
-    def _export_all_batch(self):
-        if not self.puzzle_data:
-            self.puzzle_status.setText("No puzzles loaded."); return
-        
-        puzzles = []
-        for pz in self.puzzle_data:
-            pz_copy = dict(pz)
-            # Extract just "Puzzle #X" for the title screen
-            pz_copy['display_title'] = pz_copy['name'].split(' — ')[0] if ' — ' in pz_copy['name'] else pz_copy['name']
-            puzzles.append(pz_copy)
-            
-        self._start_batch_export(puzzles)
-
     def _start_batch_export(self, puzzles):
         out_dir = self._ensure_output_dir()
         cfg = self._build_export_config()
@@ -763,6 +775,11 @@ class MainWindow(QWidget):
         self._set_exporting(True, batch=True)
         self.puzzle_progress.setValue(0)
         self.puzzle_status.setText(f"Batch: 0 / {total}")
+        
+        if self.batch_worker and self.batch_worker.isRunning():
+            self.batch_worker.abort()
+            self.batch_worker.wait(3000)
+            
         self.batch_worker = BatchExportWorker(puzzles, out_dir, cfg)
         self.batch_worker.batch_progress.connect(self._on_batch_progress)
         self.batch_worker.puzzle_progress.connect(self._on_batch_puzzle_progress)
@@ -838,459 +855,6 @@ class MainWindow(QWidget):
         self.snd.play("start")
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  OPENINGS TAB
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _build_openings_tab(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        container = QWidget()
-        l = QVBoxLayout(container)
-        l.setSpacing(12)
-
-        # ── 1. Database ──────────────────────────────────────────────────
-        db_group = QGroupBox("📂 Openings Database")
-        db_layout = QHBoxLayout(db_group)
-        btn_load_db = QPushButton("Load Openings DB…")
-        btn_load_db.clicked.connect(self.load_openings_db)
-        db_layout.addWidget(btn_load_db)
-        self.opening_db_status = QLabel("No database loaded")
-        self.opening_db_status.setAlignment(Qt.AlignCenter)
-        db_layout.addWidget(self.opening_db_status, 1)
-        l.addWidget(db_group)
-
-        # ── 2. Filter & Selection ────────────────────────────────────────
-        filter_group = QGroupBox("🔍 Filter & Selection")
-        fl = QVBoxLayout(filter_group)
-        
-        filter_row = QHBoxLayout()
-        self.opening_filter = QLineEdit()
-        self.opening_filter.setPlaceholderText("Filter openings…")
-        filter_row.addWidget(self.opening_filter, 1)
-        fl.addLayout(filter_row)
-
-        self._op_filter_timer = QTimer()
-        self._op_filter_timer.setSingleShot(True)
-        self._op_filter_timer.setInterval(300)
-        self._op_filter_timer.timeout.connect(self._apply_opening_filter)
-        self.opening_filter.textChanged.connect(lambda: self._op_filter_timer.start())
-
-        sel_row = QHBoxLayout()
-        btn_all = QPushButton("All"); btn_all.setFixedWidth(55)
-        btn_all.clicked.connect(self._opening_select_all)
-        btn_none = QPushButton("None"); btn_none.setFixedWidth(55)
-        btn_none.clicked.connect(self._opening_select_none)
-        btn_inv = QPushButton("Invert"); btn_inv.setFixedWidth(60)
-        btn_inv.clicked.connect(self._opening_select_invert)
-        sel_row.addWidget(btn_all); sel_row.addWidget(btn_none); sel_row.addWidget(btn_inv)
-        sel_row.addStretch()
-        fl.addLayout(sel_row)
-
-        range_row = QHBoxLayout()
-        self.opening_range_from = QSpinBox()
-        self.opening_range_from.setRange(1, 999999); self.opening_range_from.setPrefix("#")
-        self.opening_range_to = QSpinBox()
-        self.opening_range_to.setRange(1, 999999); self.opening_range_to.setPrefix("#")
-        btn_range = QPushButton("Apply Range")
-        btn_range.clicked.connect(self._opening_select_range)
-        range_row.addWidget(QLabel("From:")); range_row.addWidget(self.opening_range_from)
-        range_row.addWidget(QLabel("To:")); range_row.addWidget(self.opening_range_to)
-        range_row.addWidget(btn_range)
-        fl.addLayout(range_row)
-        
-        self.opening_sel_label = QLabel("Selected: 0")
-        self.opening_sel_label.setAlignment(Qt.AlignRight)
-        fl.addWidget(self.opening_sel_label)
-        
-        l.addWidget(filter_group)
-
-        # ── 3. Openings List ─────────────────────────────────────────────
-        list_group = QGroupBox("📚 Openings List")
-        ll = QVBoxLayout(list_group)
-        
-        self.opening_list = CheckableListWidget()
-        self.opening_list.setMaximumHeight(130)
-        self.opening_list.currentRowChanged.connect(self.select_opening)
-        self.opening_list.itemChanged.connect(self._on_opening_item_changed)
-        ll.addWidget(self.opening_list)
-
-        nav = QHBoxLayout()
-        self.btn_op_prev = QPushButton("◀")
-        self.btn_op_prev.clicked.connect(self._op_prev_page)
-        self.op_page_lbl = QLabel("Page 0 / 0")
-        self.op_page_lbl.setAlignment(Qt.AlignCenter)
-        self.btn_op_next = QPushButton("▶")
-        self.btn_op_next.clicked.connect(self._op_next_page)
-        nav.addWidget(self.btn_op_prev); nav.addWidget(self.op_page_lbl, 1)
-        nav.addWidget(self.btn_op_next)
-        nav.addWidget(QLabel("Jump:"))
-        self.op_jump_spin = QSpinBox(); self.op_jump_spin.setRange(1, 999999); self.op_jump_spin.setFixedWidth(65)
-        btn_op_jump = QPushButton("Go"); btn_op_jump.setFixedWidth(35)
-        btn_op_jump.clicked.connect(self._op_jump_page)
-        nav.addWidget(self.op_jump_spin); nav.addWidget(btn_op_jump)
-        ll.addLayout(nav)
-        
-        l.addWidget(list_group)
-
-        # ── 4. Opening Detail ────────────────────────────────────────────
-        detail_group = QGroupBox("♟ Opening Detail")
-        dl = QVBoxLayout(detail_group)
-        
-        self.opening_img_lbl = QLabel("Opening Image")
-        self.opening_img_lbl.setFixedSize(220, 220)
-        self.opening_img_lbl.setAlignment(Qt.AlignCenter)
-        self.opening_img_lbl.setStyleSheet(
-            "background-color: #2b2b2b; border: 1px solid #555; border-radius: 4px;")
-        dl.addWidget(self.opening_img_lbl, alignment=Qt.AlignCenter)
-
-        step_layout = QHBoxLayout()
-        step_layout.addStretch()
-        btn_start = QPushButton("⏮"); btn_start.clicked.connect(self.opening_start)
-        btn_prev = QPushButton("◀ Prev"); btn_prev.clicked.connect(self.opening_prev)
-        btn_next = QPushButton("Next ▶"); btn_next.clicked.connect(self.opening_next)
-        btn_end = QPushButton("⏭"); btn_end.clicked.connect(self.opening_end)
-        step_layout.addWidget(btn_start); step_layout.addWidget(btn_prev)
-        step_layout.addWidget(btn_next); step_layout.addWidget(btn_end)
-        step_layout.addStretch()
-        dl.addLayout(step_layout)
-
-        self.opening_moves_te = QTextEdit(); self.opening_moves_te.setReadOnly(True)
-        self.opening_moves_te.setFont(QFont("Courier", 13))
-        self.opening_moves_te.setMaximumHeight(80)
-        dl.addWidget(self.opening_moves_te)
-        
-        l.addWidget(detail_group)
-
-        # ── 5. Export ────────────────────────────────────────────────────
-        export_group = QGroupBox("🎬 Export Openings")
-        el = QVBoxLayout(export_group)
-        
-        batch_row = QHBoxLayout()
-        btn_exp_sel = QPushButton("Export Selected")
-        btn_exp_sel.clicked.connect(self._export_openings_batch)
-        btn_exp_all = QPushButton("Export All")
-        btn_exp_all.clicked.connect(self._export_all_openings_batch)
-        batch_row.addWidget(btn_exp_sel); batch_row.addWidget(btn_exp_all)
-        el.addLayout(batch_row)
-
-        self.opening_progress = QProgressBar()
-        self.opening_progress.setRange(0, 100); self.opening_progress.setValue(0)
-        el.addWidget(self.opening_progress)
-
-        self.opening_status = QLabel("")
-        self.opening_status.setWordWrap(True)
-        el.addWidget(self.opening_status)
-        
-        l.addWidget(export_group)
-
-        l.addStretch()
-        scroll.setWidget(container)
-        self.tabs.addTab(scroll, "📚 Openings")
-
-    # ── Opening pagination helpers ────────────────────────────────────────
-
-    def _op_total_items(self):
-        return self.db.get_count('openings', self.opening_filter.text().strip())
-
-    def _op_page_count(self):
-        return max(1, math.ceil(self._op_total_items() / self._PAGE_SIZE))
-
-    def _populate_opening_page(self):
-        self.opening_list.blockSignals(True)
-        self.opening_list.clear()
-
-        filter_text = self.opening_filter.text().strip()
-        items = self.db.get_page('openings', self._op_page, self._PAGE_SIZE, filter_text)
-
-        for item in items:
-            di = item['id']
-            checked = di in self._op_checked
-            name = f"{item.get('eco', '')} - {item.get('name', '')}"
-            list_item = self.opening_list.add_checkable_item(name, data=item, checked=checked)
-            list_item.setData(Qt.UserRole + 1, di)
-
-        self.opening_list.blockSignals(False)
-        self._update_opening_nav()
-        self._update_opening_sel_label()
-
-    def _update_opening_nav(self):
-        total = self._op_total_items()
-        pc = max(1, math.ceil(total / self._PAGE_SIZE))
-        self.op_page_lbl.setText(f"Page {self._op_page + 1} / {pc}  ({total:,} items)")
-        self.btn_op_prev.setEnabled(self._op_page > 0)
-        self.btn_op_next.setEnabled(self._op_page < pc - 1)
-        self.op_jump_spin.setRange(1, pc)
-        self.op_jump_spin.setValue(self._op_page + 1)
-        count = self.db.get_count('openings')
-        self.opening_range_from.setRange(1, max(1, count))
-        self.opening_range_to.setRange(1, max(1, count))
-
-    def _update_opening_sel_label(self, _item=None):
-        cnt = len(self._op_checked)
-        total = self.db.get_count('openings')
-        self.opening_sel_label.setText(f"Selected: {cnt:,} / {total:,}")
-
-    def _apply_opening_filter(self):
-        self._op_page = 0
-        self._populate_opening_page()
-
-    def _opening_select_all(self):
-        filter_text = self.opening_filter.text().strip()
-        self._op_checked = set(self.db.get_ids_by_filter('openings', filter_text))
-        self._populate_opening_page()
-
-    def _opening_select_none(self):
-        self._op_checked.clear()
-        self._populate_opening_page()
-
-    def _opening_select_invert(self):
-        filter_text = self.opening_filter.text().strip()
-        all_ids = set(self.db.get_ids_by_filter('openings', filter_text))
-        self._op_checked = all_ids - self._op_checked
-        self._populate_opening_page()
-
-    def _opening_select_range(self):
-        start = self.opening_range_from.value()
-        end = self.opening_range_to.value()
-        if start > end: start, end = end, start
-        for i in range(start, end + 1): self._op_checked.add(i)
-        self._populate_opening_page()
-
-    # ── Opening selection helpers ─────────────────────────────────────────
-
-    def _update_opening_sel_label(self, _item=None):
-        cnt = len(self._op_checked)
-        total = len(self.opening_data)
-        self.opening_sel_label.setText(f"Selected: {cnt:,} / {total:,}")
-
-    def _opening_select_all(self):
-        if self._op_filtered is not None:
-            self._op_checked.update(self._op_filtered)
-        else:
-            self._op_checked = set(range(len(self.opening_data)))
-        self._populate_opening_page()
-
-    def _opening_select_none(self):
-        self._op_checked.clear()
-        self._populate_opening_page()
-
-    def _opening_select_invert(self):
-        if self._op_filtered is not None:
-            all_set = set(self._op_filtered)
-        else:
-            all_set = set(range(len(self.opening_data)))
-        self._op_checked = all_set - self._op_checked
-        self._populate_opening_page()
-
-    def _opening_select_range(self):
-        start = self.opening_range_from.value() - 1
-        end = self.opening_range_to.value() - 1
-        if start > end:
-            start, end = end, start
-        for i in range(start, end + 1):
-            self._op_checked.add(i)
-        self._populate_opening_page()
-
-    # ── Opening batch export ─────────────────────────────────────────────────
-
-    def _opening_to_puzzle(self, data):
-        name = f"{data.get('eco', '')} - {data.get('name', '')}"
-        return {
-            'name': name,
-            'display_title': data.get('display_title', name),
-            'fen': self._opening_fen(data),
-            'moves': data.get('uci_moves', []),
-            'desc': data.get('pgn', ''),
-        }
-
-    def _export_openings_batch(self):
-        if not self._op_checked:
-            self.opening_status.setText("No openings checked for export."); return
-        openings = self.db.get_items_by_ids('openings', list(self._op_checked))
-        puzzles = [self._opening_to_puzzle(o) for o in openings]
-        self._start_openings_batch_export(puzzles)
-
-    def _export_all_openings_batch(self):
-        total = self.db.get_count('openings')
-        if total == 0:
-            self.opening_status.setText("No openings loaded."); return
-        all_ids = self.db.get_ids_by_filter('openings')
-        openings = self.db.get_items_by_ids('openings', all_ids)
-        puzzles = [self._opening_to_puzzle(o) for o in openings]
-        self._start_openings_batch_export(puzzles)
-
-    def _start_openings_batch_export(self, puzzles):
-        out_dir = self._ensure_output_dir()
-        cfg = self._build_export_config()
-        total = len(puzzles)
-        log(f"Starting openings batch export: {total} -> {out_dir}", "EXPORT")
-        self.opening_progress.setValue(0)
-        self.opening_status.setText(f"Batch: 0 / {total}")
-
-        if self.batch_worker and self.batch_worker.isRunning():
-            self.batch_worker.abort()
-            self.batch_worker.wait(3000)
-
-        self.batch_worker = BatchExportWorker(puzzles, out_dir, cfg)
-        self.batch_worker.batch_progress.connect(self._on_opening_batch_progress)
-        self.batch_worker.puzzle_done.connect(self._on_opening_batch_done)
-        self.batch_worker.puzzle_error.connect(self._on_opening_batch_error)
-        self.batch_worker.all_done.connect(self._on_opening_batch_all_done)
-        self.batch_worker.start()
-
-    def _on_opening_batch_progress(self, idx, total, name):
-        pct = int(100 * (idx + 1) / total) if total > 0 else 0
-        self.opening_progress.setValue(pct)
-        self.opening_status.setText(f"Batch [{idx+1}/{total}]: {name}")
-
-    def _on_opening_batch_done(self, idx, filepath):
-        pass
-
-    def _on_opening_batch_error(self, idx, msg):
-        log(f"Opening export error: {msg}", "EXPORT")
-
-    def _on_opening_batch_all_done(self, exported, errors, out_dir):
-        self.opening_progress.setValue(100)
-        self.opening_status.setText(
-            f"Batch done: {exported} exported, {errors} errors → {out_dir}")
-        if self.batch_worker:
-            self.batch_worker.deleteLater()
-            self.batch_worker = None
-
-    def load_openings_db(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Openings Database", "",
-            "Supported (*.csv *.parquet *.duckdb *.db *.sqlite)")
-        if not path: return
-        self.opening_db_status.setText("Loading…")
-        self._start_data_load("openings", single_file=path)
-
-    # ── Opening display / navigation ─────────────────────────────────────────
-
-    def _opening_fen(self, data):
-        fen = data['epd']
-        if not fen:
-            fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -"
-        if len(fen.split()) < 6:
-            fen += " 0 1"
-        return fen
-
-    def select_opening(self, row):
-        if row < 0: return
-        item = self.opening_list.item(row)
-        if not item: return
-        di = item.data(Qt.UserRole + 1)
-        if di is None: return
-        
-        # Fetch single item from DB
-        items = self.db.get_items_by_ids('openings', [di])
-        if not items: return
-        data = items[0]
-        
-        self._current_opening_di = di
-        self.opening_step_idx = 0
-        self.engine.load_fen(self._opening_fen(data))
-        
-        # Parse image on demand from raw string
-        img_raw = data.get('img_raw', '')
-        img = parse_opening_image(img_raw) if img_raw else None
-        
-        if img and not img.isNull():
-            pixmap = QPixmap.fromImage(img)
-            self.opening_img_lbl.setPixmap(
-                pixmap.scaled(210, 210, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        else:
-            self.opening_img_lbl.setText("No Image")
-            
-        self.board_widget.selected = None
-        self.board_widget.legal_targets = []
-        self.board_widget.update()
-        self.update_opening_display()
-
-    def update_opening_display(self):
-        item = self.opening_list.currentItem()
-        if not item: return
-        di = item.data(Qt.UserRole + 1)
-        if di is None or di >= len(self.opening_data): return
-        data = self.opening_data[di]
-        text = ""
-        for i, uci in enumerate(data['uci_moves']):
-            marker = f"<b><u>{uci}</u></b>" if i == self.opening_step_idx else uci
-            text += marker + " "
-            if (i + 1) % 2 == 0: text += "  "
-        self.opening_moves_te.setHtml(text)
-
-    def _get_current_opening_data(self):
-        item = self.opening_list.currentItem()
-        if not item: return None
-        di = item.data(Qt.UserRole + 1)
-        if di is None or di >= len(self.opening_data): return None
-        return self.opening_data[di]
-
-    def opening_start(self):
-        self.opening_step_idx = 0
-        data = self._get_current_opening_data()
-        if not data: return
-        self.engine.load_fen(self._opening_fen(data))
-        self.board_widget.selected = None
-        self.board_widget.legal_targets = []
-        self.board_widget.update()
-        self.update_opening_display()
-        self.snd.play("move")
-
-    def opening_prev(self):
-        if self.opening_step_idx > 0:
-            self.opening_step_idx -= 1
-            data = self._get_current_opening_data()
-            if not data: return
-            self.engine.load_fen(self._opening_fen(data))
-            for i in range(self.opening_step_idx):
-                self.engine.make_move_uci(data['uci_moves'][i])
-            self.board_widget.selected = None
-            self.board_widget.legal_targets = []
-            self.board_widget.update()
-            self.update_opening_display()
-            self.snd.play("move")
-
-    def opening_next(self):
-        if self.board_widget.animating: return
-        data = self._get_current_opening_data()
-        if not data: return
-        if self.opening_step_idx < len(data['uci_moves']):
-            uci = data['uci_moves'][self.opening_step_idx]
-            info = self.engine.make_move_uci(uci)
-            if info:
-                sfx = ("capture" if info['captured'] != '.'
-                       else "castle" if info['castle'] else "move")
-                if info['mate']: sfx = "checkmate"
-                elif info['check']: sfx = "check"
-                self.snd.play(sfx)
-                if self.board_widget.anim_speed > 0:
-                    self.board_widget.start_animation(
-                        info['from'][0], info['from'][1],
-                        info['to'][0], info['to'][1],
-                        info['piece_obj'], info['captured'], '')
-                self.opening_step_idx += 1
-            self.board_widget.selected = None
-            self.board_widget.legal_targets = []
-            self.update_opening_display()
-            self.board_widget.update()
-
-    def opening_end(self):
-        data = self._get_current_opening_data()
-        if not data: return
-        self.engine.load_fen(self._opening_fen(data))
-        for uci in data['uci_moves']:
-            self.engine.make_move_uci(uci)
-        self.opening_step_idx = len(data['uci_moves'])
-        self.board_widget.selected = None
-        self.board_widget.legal_targets = []
-        self.board_widget.update()
-        self.update_opening_display()
-        self.snd.play("move")
-
-    # ══════════════════════════════════════════════════════════════════════════
     #  SETTINGS TAB
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -1300,122 +864,41 @@ class MainWindow(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         container = QWidget()
         l = QVBoxLayout(container)
-        l.setSpacing(15)
+        l.setSpacing(12)
 
-        # ── 1. Appearance & Animation ────────────────────────────────────
-        appear_group = QGroupBox("🎨 Appearance & Animation")
-        a_form = QFormLayout(appear_group)
-        
+        # ── Appearance ──────────────────────────────────────────────────
+        appear_group = QGroupBox("🎨 Appearance")
+        aform = QFormLayout(appear_group)
+
         self.settings_theme_cb = QComboBox()
         self.settings_theme_cb.addItems(THEMES.keys())
-        self.settings_theme_cb.setCurrentText(self.theme_cb.currentText())
         self.settings_theme_cb.currentTextChanged.connect(self._change_theme)
-        a_form.addRow("Board Theme:", self.settings_theme_cb)
+        aform.addRow("Theme:", self.settings_theme_cb)
 
-        speed_row = QHBoxLayout()
+        row_anim = QHBoxLayout()
         self.settings_anim_slider = QSlider(Qt.Horizontal)
         self.settings_anim_slider.setRange(0, 600)
         self.settings_anim_slider.setValue(600 - ANIM_SPEED_DEFAULT)
         self.settings_anim_slider.setInvertedAppearance(True)
         self.settings_anim_lbl = QLabel(self._fmt_anim(ANIM_SPEED_DEFAULT))
         self.settings_anim_slider.valueChanged.connect(self._update_anim_speed)
-        speed_row.addWidget(self.settings_anim_slider, 1)
-        speed_row.addWidget(self.settings_anim_lbl)
-        a_form.addRow("Anim Speed:", speed_row)
-        
+        row_anim.addWidget(self.settings_anim_slider, 1)
+        row_anim.addWidget(self.settings_anim_lbl)
+        aform.addRow("Anim Speed:", row_anim)
+
         l.addWidget(appear_group)
 
-        # ── 2. Sound ────────────────────────────────────────────────────
-        sound_group = QGroupBox("🔊 Sound Settings")
-        s_form = QFormLayout(sound_group)
-        
-        vol_row = QHBoxLayout()
-        self.settings_volume_slider = QSlider(Qt.Horizontal)
-        self.settings_volume_slider.setRange(0, 100)
-        self.settings_volume_slider.setValue(int(self.snd._volume * 100))
-        self.settings_volume_lbl = QLabel(f"{int(self.snd._volume * 100)}%")
-        self.settings_volume_slider.valueChanged.connect(self._update_volume)
-        vol_row.addWidget(self.settings_volume_slider, 1)
-        vol_row.addWidget(self.settings_volume_lbl)
-        s_form.addRow("Volume:", vol_row)
-
-        self.settings_mute_cb = QCheckBox("Mute all sounds")
-        self.settings_mute_cb.toggled.connect(self._toggle_mute)
-        s_form.addRow(self.settings_mute_cb)
-        
-        l.addWidget(sound_group)
-
-        # ── 3. Defaults ─────────────────────────────────────────────────
-        default_group = QGroupBox("⚙️ Export Defaults")
-        d_form = QFormLayout(default_group)
-        
-        row_out = QHBoxLayout()
-        self.settings_outdir = QLineEdit()
-        self.settings_outdir.setPlaceholderText("Default output directory…")
+        # ── Export Default Path ──────────────────────────────────────────
+        path_group = QGroupBox("📁 Default Export Path")
+        pl = QHBoxLayout(path_group)
+        self.settings_outdir = QLineEdit(str(Path(DATA_DIR) / "exports"))
         btn_browse = QPushButton("📁"); btn_browse.setFixedWidth(32)
-        btn_browse.clicked.connect(self._browse_settings_export_dir)
-        row_out.addWidget(self.settings_outdir, 1); row_out.addWidget(btn_browse)
-        d_form.addRow("Output Dir:", row_out)
-
-        l.addWidget(default_group)
+        btn_browse.clicked.connect(lambda: self.settings_outdir.setText(
+            QFileDialog.getExistingDirectory(self, "Select Default Export Directory") or self.settings_outdir.text()))
+        pl.addWidget(self.settings_outdir, 1)
+        pl.addWidget(btn_browse)
+        l.addWidget(path_group)
 
         l.addStretch()
         scroll.setWidget(container)
         self.tabs.addTab(scroll, "⚙️ Settings")
-
-    def _update_volume(self, val):
-        self.snd.set_volume(val / 100.0)
-        self.settings_volume_lbl.setText(f"{val}%")
-
-    def _toggle_mute(self, checked):
-        self.snd.set_enabled(not checked)
-
-    def _browse_settings_export_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Default Output Directory")
-        if d:
-            self.settings_outdir.setText(d)
-            self.exp_outdir.setText(d)
-
-    # ── Move callback ────────────────────────────────────────────────────────
-
-    def on_move(self, notation):
-        if self.engine.game_over:
-            log(f"Game over: {self.engine.result}", "GAME")
-
-    # ── Cleanup on close ─────────────────────────────────────────────────────
-
-    def closeEvent(self, event):
-        # Collect all running workers
-        running = []
-        for worker in self._active_workers:
-            if worker.isRunning():
-                worker.abort()
-                running.append(worker)
-        if self.export_worker and self.export_worker.isRunning():
-            self.export_worker.abort()
-            running.append(self.export_worker)
-        if self.batch_worker and self.batch_worker.isRunning():
-            self.batch_worker.abort()
-            running.append(self.batch_worker)
-
-        if not running:
-            event.accept()
-            return
-
-        # Wait up to 10 seconds total for all threads to finish gracefully
-        from datetime import datetime, timedelta
-        deadline = datetime.now() + timedelta(seconds=10)
-
-        for worker in running:
-            remaining_ms = max(0, int((deadline - datetime.now()).total_seconds() * 1000))
-            if remaining_ms == 0:
-                break
-            worker.wait(remaining_ms)
-
-        # Check if any are STILL running after the deadline
-        still_running = [w for w in running if w.isRunning()]
-        if still_running:
-            log(f"Warning: {len(still_running)} threads still running at close — "
-                "forcing accept (may produce QThread warnings)", "APP")
-
-        event.accept()

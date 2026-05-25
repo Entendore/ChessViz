@@ -94,7 +94,6 @@ class ChessBoardWidget(QWidget):
         check_set = set(check_squares or []); skip_sq = set()
         if anim_state: skip_sq.add(anim_state['from']); skip_sq.add(anim_state['to'])
 
-        # ── Square fills & highlights ──────────────────────────────────────
         for sq in chess.SQUARES:
             r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
             x, y = c * sz, r * sz
@@ -128,14 +127,12 @@ class ChessBoardWidget(QWidget):
                     p.drawEllipse(cx - sz // 6, cy - sz // 6,
                                   sz // 3, sz // 3)
 
-        # ── Last-move arrow ────────────────────────────────────────────────
         if show_arrow and last_move:
             (fr, fc), (tr, tc) = last_move
             ChessBoardWidget._draw_arrow(
                 p, fc * sz + sz // 2, fr * sz + sz // 2,
                 tc * sz + sz // 2, tr * sz + sz // 2, theme.arrow_clr, sz)
 
-        # ── Pieces (skip animated squares) ─────────────────────────────────
         for sq in chess.SQUARES:
             r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
             if (r, c) in skip_sq: continue
@@ -143,7 +140,6 @@ class ChessBoardWidget(QWidget):
             if piece:
                 ChessBoardWidget._draw_piece(p, piece, r, c, sz, font_piece)
 
-        # ── Animated piece ─────────────────────────────────────────────────
         if anim_state:
             fr, fc_ = anim_state['from']; tr, tc_ = anim_state['to']
             t = anim_state['progress']
@@ -166,7 +162,6 @@ class ChessBoardWidget(QWidget):
                 ChessBoardWidget._draw_piece_at(
                     p, anim_piece_obj, y_lift / sz, ic, sz, w, h, font_piece)
 
-        # ── Coordinate labels ──────────────────────────────────────────────
         p.setFont(font_coord)
         coord_margin = max(3, int(sz * 0.04))
         coord_sz = max(12, sz // 5)
@@ -186,7 +181,6 @@ class ChessBoardWidget(QWidget):
                              coord_sz, coord_sz),
                        Qt.AlignCenter, RANKS_STR[r])
 
-        # ── Text overlay (e.g. puzzle instructions) ───────────────────────
         if text_overlay:
             p.fillRect(0, sz * 4 - 28, sz * 8, 56, QColor(0, 0, 0, 200))
             p.setPen(Qt.white)
@@ -222,45 +216,29 @@ class ChessBoardWidget(QWidget):
 
     @staticmethod
     def _draw_piece_at(p, piece_obj, row_f, col_f, sz, w, h, font):
-        """Draw a chess piece glyph scaled to fit within the target rect (w × h).
-        
-        The glyph path is created from the font, measured, then uniformly
-        scaled so its bounding box occupies at most ``FIT_FRAC`` of the
-        target width/height — so it always sits neatly inside the square.
-        """
-        FIT_FRAC = 0.85          # piece fills 85 % of the square
-
+        FIT_FRAC = 0.85
         is_w = piece_obj.color == chess.WHITE
         glyph = PIECE_SYM[(piece_obj.piece_type, piece_obj.color)]
         px = col_f * sz; py = row_f * sz
         rect = QRectF(px + (sz - w) / 2, py + (sz - h) / 2, w, h)
         center = rect.center()
-
         p.setFont(font)
-
-        # ── Build glyph path at font size, centre at origin ────────────
         path = QPainterPath()
         path.addText(QPointF(0, 0), font, glyph)
         br = path.boundingRect()
         path.translate(-br.center().x(), -br.center().y())
-
-        # ── Scale to fit inside FIT_FRAC of the target box ─────────────
         if br.width() > 0 and br.height() > 0:
             sx = (w * FIT_FRAC) / br.width()
             sy = (h * FIT_FRAC) / br.height()
             s = min(sx, sy)
             path = QTransform.fromScale(s, s).map(path)
-
         path.translate(center.x(), center.y())
-
-        # ── Shadow + outline + fill ────────────────────────────────────
         if is_w:
             shadow = QPainterPath(path)
             shadow.translate(1.5, 2.0)
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 50))
             p.drawPath(shadow)
-
             olw = max(1.2, sz * 0.028)
             p.setPen(QPen(QColor(30, 30, 30), olw,
                           Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
@@ -272,7 +250,6 @@ class ChessBoardWidget(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 60))
             p.drawPath(shadow)
-
             olw = max(0.8, sz * 0.018)
             p.setPen(QPen(QColor(10, 10, 10), olw,
                           Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
@@ -300,8 +277,6 @@ class ChessBoardWidget(QWidget):
     def qimage_to_np(img):
         img2 = img.convertToFormat(QImage.Format_RGB888)
         ptr = img2.constBits()
-        # Older PySide6 returns sip.voidptr (needs setsize);
-        # newer returns memoryview (already sized correctly).
         if hasattr(ptr, 'setsize'):
             ptr.setsize(img2.sizeInBytes())
         w = img2.width(); h = img2.height(); bpl = img2.bytesPerLine()

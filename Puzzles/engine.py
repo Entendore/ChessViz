@@ -66,9 +66,8 @@ class ChessEngine:
         is_castle = self.board.is_castling(move)
         is_ep = self.board.is_en_passant(move)
 
-        notation = self.board.san(move)  # Get SAN before pushing
+        notation = self.board.san(move)
 
-        # Store piece_obj BEFORE pushing so animation can draw it
         piece_obj = chess.Piece(piece.piece_type, piece.color)
 
         self.board.push(move)
@@ -79,8 +78,8 @@ class ChessEngine:
 
         info = {
             'from': (fr, fc), 'to': (tr, tc),
-            'piece': piece.symbol(),        # string symbol for display
-            'piece_obj': piece_obj,          # chess.Piece object for animation
+            'piece': piece.symbol(),
+            'piece_obj': piece_obj,
             'captured': captured,
             'castle': is_castle, 'ep': is_ep, 'promo': promo,
             'check': self.board.is_check(), 'mate': self.board.is_checkmate(),
@@ -102,7 +101,6 @@ class ChessEngine:
             self.board.pop()
             self.game_over = self.board.is_game_over()
             self.result = self.board.result() if self.game_over else ""
-            # FIX: properly handle empty move stack after pop
             if self.board.move_stack:
                 last = self.board.peek()
                 self.last_move = (self.sq_to_rc(last.from_square), self.sq_to_rc(last.to_square))
