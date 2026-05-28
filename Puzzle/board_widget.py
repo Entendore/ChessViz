@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chess board widget — rendering, animation, mouse interaction."""
+"""Chess board widget — rendering, animation, mouse interaction, move list."""
 
 import math
 import time
@@ -16,7 +16,8 @@ from PySide6.QtGui import (
 
 from config import (
     SQ_SIZE, BOARD_PX, PIECE_SYM, FILES_STR, RANKS_STR,
-    ANIM_SPEED_DEFAULT, ANIM_FPS, THEMES,
+    ANIM_SPEED_DEFAULT, ANIM_FPS, THEMES, MOVE_LIST_COLORS,
+    LayoutMode,
 )
 from utils import get_render_assets, ease_out_cubic, log
 
@@ -85,7 +86,8 @@ class ChessBoardWidget(QWidget):
         self._anim_timer.setInterval(1000 // ANIM_FPS)
         self._anim_timer.timeout.connect(self._anim_tick)
 
-        self.current_theme = THEMES["Classic"]
+        self.current_theme = THEMES["Midnight"]
+        self.show_arrow = True
 
     # ── Animation ───────────────────────────────────────────────────────
 
@@ -129,7 +131,7 @@ class ChessBoardWidget(QWidget):
             self.engine.board, self.engine.last_move,
             self.selected, self.legal_targets,
             check_squares=chk, anim_state=self._get_anim_state(),
-            theme=self.current_theme)
+            theme=self.current_theme, show_arrow=self.show_arrow)
         pix = QPixmap.fromImage(img)
         painter = QPainter(self)
         painter.drawPixmap(0, 0, pix)
@@ -140,9 +142,10 @@ class ChessBoardWidget(QWidget):
     @staticmethod
     def render_frame(board, last_move=None, selected=None, legal_targets=None,
                      text_overlay="", check_squares=None, anim_state=None,
-                     sq_size=SQ_SIZE, show_arrow=True, theme=None):
+                     sq_size=SQ_SIZE, show_arrow=True, theme=None,
+                     highlight_last_move=True, show_coords=True):
         if theme is None:
-            theme = THEMES["Classic"]
+            theme = THEMES["Midnight"]
         sz = sq_size
         img = QImage(sz * 8, sz * 8, QImage.Format_ARGB32_Premultiplied)
         img.fill(Qt.transparent)
@@ -165,7 +168,7 @@ class ChessBoardWidget(QWidget):
             is_light = (r + c) % 2 == 0
             color = theme.light_sq if is_light else theme.dark_sq
             p.fillRect(x, y, sz, sz, color)
-            if last_move and (r, c) in last_move:
+            if highlight_last_move and last_move and (r, c) in last_move:
                 p.fillRect(x, y, sz, sz, theme.last_move)
             if selected and (r, c) == selected:
                 p.fillRect(x, y, sz, sz, theme.highlight)
@@ -241,22 +244,23 @@ class ChessBoardWidget(QWidget):
                 ChessBoardWidget._draw_piece_at(
                     p, anim_piece_obj, y_lift / sz, ic, sz, w, h, font_piece)
 
-        p.setFont(font_coord)
-        coord_margin = max(3, int(sz * 0.04))
-        coord_sz = max(12, sz // 5)
-        for c in range(8):
-            is_light = (7 + c) % 2 == 0
-            col = theme.dark_sq if is_light else theme.light_sq
-            p.setPen(col)
-            p.drawText(QRect(c * sz + sz - coord_sz - coord_margin,
-                             7 * sz + coord_margin, coord_sz, coord_sz),
-                       Qt.AlignCenter, FILES_STR[c])
-        for r in range(8):
-            is_light = r % 2 == 0
-            col = theme.dark_sq if is_light else theme.light_sq
-            p.setPen(col)
-            p.drawText(QRect(coord_margin, r * sz + coord_margin,
-                             coord_sz, coord_sz), Qt.AlignCenter, RANKS_STR[r])
+        if show_coords:
+            p.setFont(font_coord)
+            coord_margin = max(3, int(sz * 0.04))
+            coord_sz = max(12, sz // 5)
+            for c in range(8):
+                is_light = (7 + c) % 2 == 0
+                col = theme.dark_sq if is_light else theme.light_sq
+                p.setPen(col)
+                p.drawText(QRect(c * sz + sz - coord_sz - coord_margin,
+                                 7 * sz + coord_margin, coord_sz, coord_sz),
+                           Qt.AlignCenter, FILES_STR[c])
+            for r in range(8):
+                is_light = r % 2 == 0
+                col = theme.dark_sq if is_light else theme.light_sq
+                p.setPen(col)
+                p.drawText(QRect(coord_margin, r * sz + coord_margin,
+                                 coord_sz, coord_sz), Qt.AlignCenter, RANKS_STR[r])
 
         if text_overlay:
             p.fillRect(0, sz * 4 - 28, sz * 8, 56, QColor(0, 0, 0, 200))
@@ -267,20 +271,194 @@ class ChessBoardWidget(QWidget):
         p.end()
         return img
 
+    # ── Move List Panel Rendering ───────────────────────────────────────
+
+    @staticmethod
+    def render_move_list(moves_san, current_idx=-1, width=240, height=544,
+                         puzzle_info=None, colors=None, status_text=""):
+        if colors is None:
+            colors = MOVE_LIST_COLORS
+
+        img = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+        bg = QColor(*colors['bg'][:3])
+        img.fill(bg)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+
+        margin = max(8, width // 24)
+        line_h = max(18, min(26, height // 22))
+        header_h = max(32, height // 14)
+
+        # ── Header ──
+        p.setFont(QFont("Sans", max(10, line_h - 4), QFont.Bold))
+        p.setPen(QColor(*colors['accent'][:3]))
+        header_text = "Puzzle"
+        if puzzle_info and puzzle_info.get('name'):
+            header_text = puzzle_info['name'][:30]
+        p.drawText(QRect(margin, 4, width - 2 * margin, header_h - 4),
+                   Qt.AlignVCenter | Qt.AlignLeft, header_text)
+
+        sep_y = header_h
+        p.setPen(QPen(QColor(*colors['border'][:3]), 1))
+        p.drawLine(margin, sep_y, width - margin, sep_y)
+
+        # ── Attributes ──
+        info_y = sep_y + 4
+        if puzzle_info:
+            info_parts = []
+            rating = puzzle_info.get('rating', 0)
+            if rating:
+                try:
+                    r_val = int(float(rating))
+                    stars = "★" * min(5, max(1, r_val // 500))
+                    info_parts.append(f"Difficulty: {stars}")
+                except (ValueError, TypeError):
+                    pass
+            themes = puzzle_info.get('themes', '')
+            if themes:
+                theme_tags = themes.split()[:2]
+                info_parts.append(' '.join(theme_tags))
+            if info_parts:
+                p.setFont(QFont("Sans", max(8, line_h - 8)))
+                p.setPen(QColor(*colors['dim'][:3]))
+                p.drawText(QRect(margin, info_y, width - 2 * margin, line_h - 2),
+                           Qt.AlignLeft, '  ·  '.join(info_parts))
+                info_y += line_h
+
+        # ── Moves ──
+        y = info_y + 4
+        p.setFont(QFont("Monospace", max(9, line_h - 6)))
+
+        half_w = (width - 2 * margin - 36) // 2
+        num_w = 32
+
+        for i in range(0, max(len(moves_san), 1), 2):
+            if y + line_h > height - (line_h * 2) - margin:
+                if i < len(moves_san):
+                    p.setPen(QColor(*colors['dim'][:3]))
+                    p.drawText(QRect(margin, y, width - 2 * margin, line_h),
+                               Qt.AlignLeft, "…")
+                break
+
+            move_num = i // 2 + 1
+            white_move = moves_san[i] if i < len(moves_san) else ""
+            black_move = moves_san[i + 1] if i + 1 < len(moves_san) else ""
+
+            p.setPen(QColor(*colors['dim'][:3]))
+            p.drawText(QRect(margin, y, num_w, line_h),
+                       Qt.AlignRight | Qt.AlignVCenter, f"{move_num}.")
+
+            if i == current_idx:
+                p.fillRect(QRect(margin + num_w + 2, y, half_w, line_h),
+                           QColor(colors['accent'][0], colors['accent'][1],
+                                  colors['accent'][2], 35))
+                p.setPen(QColor(*colors['accent'][:3]))
+            else:
+                p.setPen(QColor(*colors['text'][:3]))
+            p.drawText(QRect(margin + num_w + 4, y, half_w, line_h),
+                       Qt.AlignLeft | Qt.AlignVCenter, white_move)
+
+            x_black = margin + num_w + half_w + 6
+            if i + 1 == current_idx:
+                p.fillRect(QRect(x_black - 2, y, half_w, line_h),
+                           QColor(colors['accent'][0], colors['accent'][1],
+                                  colors['accent'][2], 35))
+                p.setPen(QColor(*colors['accent'][:3]))
+            else:
+                p.setPen(QColor(*colors['text'][:3]))
+            p.drawText(QRect(x_black, y, half_w, line_h),
+                       Qt.AlignLeft | Qt.AlignVCenter, black_move)
+
+            y += line_h
+
+        # ── Status Indicator ──
+        if status_text:
+            p.setPen(QPen(QColor(*colors['border'][:3]), 1))
+            p.drawLine(margin, height - line_h - 12, width - margin, height - line_h - 12)
+            p.setFont(QFont("Sans", max(9, line_h - 6), QFont.Bold))
+            p.setPen(QColor(*colors['accent'][:3]))
+            p.drawText(QRect(margin, height - line_h - 8, width - 2 * margin, line_h),
+                       Qt.AlignLeft, f"▶ {status_text}")
+
+        p.end()
+        return img
+
+    # ── Layout compositing ──────────────────────────────────────────────
+
+    @staticmethod
+    def render_layout(board_img, moves_san, current_move_idx,
+                      layout_mode, target_w, target_h, bg_color,
+                      sq_size, puzzle_info=None, status_text="",
+                      move_list_visible=True):
+        if not move_list_visible or layout_mode == LayoutMode.BOARD_ONLY:
+            return board_img
+
+        colors = MOVE_LIST_COLORS
+
+        if layout_mode == LayoutMode.BOARD_MOVES_RIGHT:
+            bw, bh = sq_size * 8, sq_size * 8
+            panel_w = target_w - bw
+            if panel_w < 80:
+                return board_img
+
+            panel_img = ChessBoardWidget.render_move_list(
+                moves_san, current_move_idx, panel_w, bh, puzzle_info, colors, status_text)
+
+            result = QImage(target_w, target_h, QImage.Format_ARGB32_Premultiplied)
+            result.fill(QColor(*bg_color[:3]))
+            rp = QPainter(result)
+            rp.setRenderHint(QPainter.Antialiasing)
+
+            by = (target_h - bh) // 2
+            rp.drawImage(0, by, board_img)
+            rp.drawImage(bw, by, panel_img)
+
+            rp.setPen(QPen(QColor(*colors['border'][:3]), 1))
+            rp.drawLine(bw, by, bw, by + bh)
+            rp.end()
+            return result
+
+        elif layout_mode == LayoutMode.BOARD_MOVES_BOTTOM:
+            bw, bh = sq_size * 8, sq_size * 8
+            panel_h = target_h - bh
+            if panel_h < 60:
+                return board_img
+
+            panel_img = ChessBoardWidget.render_move_list(
+                moves_san, current_move_idx, target_w, panel_h, puzzle_info, colors, status_text)
+
+            result = QImage(target_w, target_h, QImage.Format_ARGB32_Premultiplied)
+            result.fill(QColor(*bg_color[:3]))
+            rp = QPainter(result)
+            rp.setRenderHint(QPainter.Antialiasing)
+
+            bx = (target_w - bw) // 2
+            rp.drawImage(bx, 0, board_img)
+            rp.drawImage(0, bh, panel_img)
+
+            rp.setPen(QPen(QColor(*colors['border'][:3]), 1))
+            rp.drawLine(0, bh, target_w, bh)
+            rp.end()
+            return result
+
+        return board_img
+
     # ── Card rendering (title / end) ────────────────────────────────────
 
     @staticmethod
-    def render_card(text, bg="#1a1a2e", fg="#e0e0e0", w=544, h=544,
+    def render_card(text, bg="#1a1b26", fg="#c0caf5", w=544, h=544,
                     width=None, height=None, font_size=36, sub_text="",
                     bg_color=None, fg_color=None):
-        bg_val = bg if bg != "#1a1a2e" else (bg_color or bg)
-        fg_val = fg if fg != "#e0e0e0" else (fg_color or fg)
+        bg_val = bg_color or bg
+        fg_val = fg_color or fg
         w_val = width if width is not None else w
         h_val = height if height is not None else h
         img = QImage(w_val, h_val, QImage.Format_ARGB32_Premultiplied)
         img.fill(QColor(bg_val))
         p = QPainter(img)
         p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
         p.setPen(QColor(fg_val))
         p.setFont(QFont("Sans", font_size, QFont.Bold))
         p.drawText(QRect(0, 0, w_val, h_val), Qt.AlignCenter, text)
@@ -320,52 +498,33 @@ class ChessBoardWidget(QWidget):
             path = QTransform.fromScale(s, s).map(path)
         path.translate(center.x(), center.y())
         if is_w:
-            shadow = QPainterPath(path)
-            shadow.translate(1.5, 2.0)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(0, 0, 0, 50))
-            p.drawPath(shadow)
+            shadow = QPainterPath(path); shadow.translate(1.5, 2.0)
+            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 50)); p.drawPath(shadow)
             olw = max(1.2, sz * 0.028)
-            p.setPen(QPen(QColor(30, 30, 30), olw, Qt.SolidLine,
-                          Qt.RoundCap, Qt.RoundJoin))
-            p.setBrush(QColor(255, 255, 255))
-            p.drawPath(path)
+            p.setPen(QPen(QColor(30, 30, 30), olw, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setBrush(QColor(255, 255, 255)); p.drawPath(path)
         else:
-            shadow = QPainterPath(path)
-            shadow.translate(1.5, 2.0)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(0, 0, 0, 60))
-            p.drawPath(shadow)
+            shadow = QPainterPath(path); shadow.translate(1.5, 2.0)
+            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 60)); p.drawPath(shadow)
             olw = max(0.8, sz * 0.018)
-            p.setPen(QPen(QColor(10, 10, 10), olw, Qt.SolidLine,
-                          Qt.RoundCap, Qt.RoundJoin))
-            p.setBrush(QColor(40, 40, 40))
-            p.drawPath(path)
+            p.setPen(QPen(QColor(10, 10, 10), olw, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setBrush(QColor(40, 40, 40)); p.drawPath(path)
 
     # ── Arrow drawing ───────────────────────────────────────────────────
 
     @staticmethod
     def _draw_arrow(painter, fx, fy, tx, ty, color, sz):
-        dx = tx - fx
-        dy = ty - fy
-        dist = max(1, math.hypot(dx, dy))
-        margin = sz * 0.22
-        fx2 = fx + dx * margin / dist
-        fy2 = fy + dy * margin / dist
-        tx2 = tx - dx * margin / dist
-        ty2 = ty - dy * margin / dist
+        dx = tx - fx; dy = ty - fy
+        dist = max(1, math.hypot(dx, dy)); margin = sz * 0.22
+        fx2 = fx + dx * margin / dist; fy2 = fy + dy * margin / dist
+        tx2 = tx - dx * margin / dist; ty2 = ty - dy * margin / dist
         painter.setPen(QPen(color, max(2, sz // 20), Qt.SolidLine, Qt.RoundCap))
         painter.drawLine(int(fx2), int(fy2), int(tx2), int(ty2))
-        angle = math.atan2(dy, dx)
-        a_sz = sz * 0.22
-        p1x = tx2 - a_sz * math.cos(angle - 0.45)
-        p1y = ty2 - a_sz * math.sin(angle - 0.45)
-        p2x = tx2 - a_sz * math.cos(angle + 0.45)
-        p2y = ty2 - a_sz * math.sin(angle + 0.45)
+        angle = math.atan2(dy, dx); a_sz = sz * 0.22
+        p1x = tx2 - a_sz * math.cos(angle - 0.45); p1y = ty2 - a_sz * math.sin(angle - 0.45)
+        p2x = tx2 - a_sz * math.cos(angle + 0.45); p2y = ty2 - a_sz * math.sin(angle + 0.45)
         tri = QPolygonF([QPointF(tx2, ty2), QPointF(p1x, p1y), QPointF(p2x, p2y)])
-        painter.setBrush(color)
-        painter.setPen(Qt.NoPen)
-        painter.drawPolygon(tri)
+        painter.setBrush(color); painter.setPen(Qt.NoPen); painter.drawPolygon(tri)
 
     # ── QImage ↔ NumPy ─────────────────────────────────────────────────
 
@@ -373,36 +532,28 @@ class ChessBoardWidget(QWidget):
     def qimage_to_np(img):
         img2 = img.convertToFormat(QImage.Format_RGB888)
         ptr = img2.constBits()
-        if hasattr(ptr, 'setsize'):
-            ptr.setsize(img2.sizeInBytes())
-        w = img2.width()
-        h = img2.height()
-        bpl = img2.bytesPerLine()
+        if hasattr(ptr, 'setsize'): ptr.setsize(img2.sizeInBytes())
+        w = img2.width(); h = img2.height(); bpl = img2.bytesPerLine()
         raw = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl)).copy()
-        if bpl == w * 3:
-            return raw.reshape((h, w, 3))
+        if bpl == w * 3: return raw.reshape((h, w, 3))
         return _fix_stride_nb(raw, w, h, bpl)
 
     @staticmethod
     def qimage_to_np_batch(images, use_gpu=False):
-        if not images:
-            return np.empty((0, 0, 0, 3), dtype=np.uint8)
+        if not images: return np.empty((0, 0, 0, 3), dtype=np.uint8)
         arrays = [ChessBoardWidget.qimage_to_np(im) for im in images]
         stack = np.stack(arrays)
         if use_gpu and HAS_CUPY:
-            import cupy as _cp
-            return _cp.asarray(stack)
+            import cupy as _cp; return _cp.asarray(stack)
         return stack
 
     # ── Mouse ───────────────────────────────────────────────────────────
 
     def mousePressEvent(self, e):
-        if self.animating or self.engine.game_over:
-            return
+        if self.animating or self.engine.game_over: return
         c = int(e.position().x()) // SQ_SIZE
         r = int(e.position().y()) // SQ_SIZE
-        if not (0 <= r < 8 and 0 <= c < 8):
-            return
+        if not (0 <= r < 8 and 0 <= c < 8): return
         sq = self.engine.rc_to_sq(r, c)
         piece = self.engine.board.piece_at(sq)
 
@@ -412,25 +563,20 @@ class ChessBoardWidget(QWidget):
                 info = self.engine.make_move(sr, sc, r, c)
                 if info:
                     is_capture = info['captured'] != '.'
-                    sfx = ("capture" if is_capture
-                           else "castle" if info['castle'] else "move")
-                    if info['mate']:
-                        sfx = "checkmate"
-                    elif info['check']:
-                        sfx = "check"
+                    sfx = ("capture" if is_capture else "castle" if info['castle'] else "move")
+                    if info['mate']: sfx = "checkmate"
+                    elif info['check']: sfx = "check"
                     self.snd.play(sfx)
                     if self.anim_speed > 0:
                         self.start_animation(sr, sc, r, c, info['piece_obj'],
                                              info['captured'], info['notation'])
                     else:
                         self.move_made.emit(info['notation'])
-            self.selected = None
-            self.legal_targets = []
+            self.selected = None; self.legal_targets = []
         else:
             if piece and piece.color == self.engine.board.turn:
                 self.selected = (r, c)
                 self.legal_targets = self.engine.legal_moves(r, c)
                 if not self.legal_targets:
-                    self.snd.play("error")
-                    self.selected = None
+                    self.snd.play("error"); self.selected = None
         self.update()

@@ -2,8 +2,8 @@
 """
 Chess Puzzle Studio — Entry Point
 
-Install:  pip install PySide6 numpy chess
-Optional: pip install pandas pyarrow duckdb numba cupy-cuda121
+Install:  pip install PySide6 numpy chess duckdb
+Optional: pip install pandas pyarrow numba cupy-cuda121
 GPU/Accel: Ensure FFmpeg is installed and in system PATH.
 """
 
@@ -15,6 +15,10 @@ from main_window import MainWindow
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Chess Puzzle Studio")
+    
+    # High DPI scaling is enabled by default in PySide6 >= 6.4
+    # but we can enforce it if needed
+    app.setStyle("Fusion")
 
     window = MainWindow()
     window.show()

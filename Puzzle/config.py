@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
+LICHESS_PARQUET_NAME = "lichess_db_puzzle.parquet"
 
 # ── Board / Rendering Constants ─────────────────────────────────────────────
 
@@ -32,6 +33,37 @@ ANIM_SPEED_DEFAULT = 250
 ANIM_SPEED_FAST    = 100
 ANIM_FPS           = 60
 
+# ── Layout Modes ────────────────────────────────────────────────────────────
+
+class LayoutMode:
+    BOARD_ONLY          = "board_only"
+    BOARD_MOVES_RIGHT   = "board_moves_right"
+    BOARD_MOVES_BOTTOM  = "board_moves_bottom"
+
+LAYOUT_MODES = {
+    LayoutMode.BOARD_ONLY:         "Board Only",
+    LayoutMode.BOARD_MOVES_RIGHT:  "Board + Moves (Right)",
+    LayoutMode.BOARD_MOVES_BOTTOM: "Board + Moves (Bottom)",
+}
+
+# ── Minimalist Color Palette (Tokyo Night inspired) ────────────────────────
+
+class MiniColors:
+    bg           = "#1a1b26"
+    surface      = "#24283b"
+    surface2     = "#2f3349"
+    border       = "#3b4261"
+    border_subtle= "#292e42"
+    text         = "#c0caf5"
+    text_dim     = "#565f89"
+    text_subtle  = "#a9b1d6"
+    accent       = "#7aa2f7"
+    accent_dim   = "#3d59a1"
+    green        = "#9ece6a"
+    red          = "#f7768e"
+    yellow       = "#e0af68"
+    cyan         = "#7dcfff"
+    purple       = "#bb9af7"
 
 # ── Board Themes ────────────────────────────────────────────────────────────
 
@@ -58,14 +90,53 @@ THEMES = {
     "Brown":   BoardTheme("Brown", (222, 197, 165), (170, 120, 70), (60, 35, 15)),
     "Purple":  BoardTheme("Purple", (220, 210, 230), (150, 130, 170), (50, 40, 60)),
     "Ice":     BoardTheme("Ice", (230, 240, 250), (160, 190, 220), (50, 60, 80)),
+    "Midnight": BoardTheme("Midnight", (35, 40, 58), (22, 27, 44), (15, 18, 30),
+                           highlight=(122, 162, 247, 80), last_move=(158, 206, 106, 80),
+                           arrow=(122, 162, 247, 200)),
 }
 
+# ── Move List Panel Colors ─────────────────────────────────────────────────
 
-# ── Export Presets ───────────────────────────────────────────────────────────
+MOVE_LIST_COLORS = {
+    'bg':           (26, 27, 46),
+    'text':         (192, 202, 245),
+    'dim':          (86, 95, 137),
+    'accent':       (122, 162, 247),
+    'highlight_bg': (122, 162, 247, 30),
+    'border':       (59, 66, 97),
+}
+
+# ── Pagination ──────────────────────────────────────────────────────────────
+
+PUZZLES_PER_PAGE = 200
+
+# ── Lichess Database Exact Mapping ─────────────────────────────────────────
+
+LICHESS_COLUMNS = {
+    'id': 'PuzzleId',
+    'fen': 'FEN',
+    'moves': 'Moves',
+    'rating': 'Rating',
+    'rating_deviation': 'RatingDeviation',
+    'popularity': 'Popularity',
+    'nb_plays': 'NbPlays',
+    'themes': 'Themes',
+    'game_url': 'GameUrl',
+    'opening': 'OpeningTags'
+}
+
+# ── Export Presets & Bitrate Targets ────────────────────────────────────────
+
+RESOLUTION_BITRATES = {
+    (3840, 2160): 56000, (2160, 3840): 56000,
+    (2560, 1440): 20000, (1440, 2560): 20000,
+    (1920, 1080): 10000, (1080, 1920): 10000,
+    (1280, 720):  6000,  (720, 1280):  6000,
+}
 
 class ExportPreset:
     def __init__(self, name, width, height, fps=30, board_frac=0.82,
-                 bg=(26, 26, 46), description=""):
+                 bg=(26, 27, 46), description="", layout=LayoutMode.BOARD_ONLY):
         self.name = name
         self.width = width
         self.height = height
@@ -73,6 +144,11 @@ class ExportPreset:
         self.board_frac = board_frac
         self.bg = bg
         self.description = description
+        self.layout = layout
+
+    @property
+    def bitrate(self):
+        return RESOLUTION_BITRATES.get((self.width, self.height), 8000)
 
     @property
     def aspect_ratio(self):
@@ -89,33 +165,74 @@ class ExportPreset:
         return self.width == self.height
 
     def calc_sq_size(self):
-        shorter = min(self.width, self.height)
-        board_px = int(shorter * self.board_frac)
+        if self.layout == LayoutMode.BOARD_MOVES_RIGHT:
+            shorter = self.height
+            board_px = int(shorter * self.board_frac)
+        elif self.layout == LayoutMode.BOARD_MOVES_BOTTOM:
+            board_frac = min(self.board_frac, 0.70)
+            shorter = self.width
+            board_px = int(shorter * board_frac)
+        else:
+            shorter = min(self.width, self.height)
+            board_px = int(shorter * self.board_frac)
         board_px = (board_px // 8) * 8
         return max(8, board_px // 8)
 
-    def calc_board_rect(self):
-        sq = self.calc_sq_size()
-        bw = sq * 8
-        bh = sq * 8
-        x = (self.width - bw) // 2
-        y = (self.height - bh) // 2
-        return x, y, bw, bh
-
 
 EXPORT_PRESETS = {
-    "Board Only (544×544)": ExportPreset("Board Only", 544, 544, 30, 1.0, (26, 26, 46), "Square board-only"),
-    "YouTube 720p (1280×720)": ExportPreset("YouTube 720p", 1280, 720, 30, 0.82, (18, 18, 32), "16:9 HD"),
-    "YouTube 1080p (1920×1080)": ExportPreset("YouTube 1080p", 1920, 1080, 30, 0.78, (18, 18, 32), "16:9 Full HD"),
-    "YouTube 4K (3840×2160)": ExportPreset("YouTube 4K", 3840, 2160, 30, 0.75, (18, 18, 32), "16:9 4K"),
-    "YouTube Shorts (1080×1920)": ExportPreset("YouTube Shorts", 1080, 1920, 30, 0.50, (18, 18, 32), "9:16 vertical"),
-    "TikTok (1080×1920)": ExportPreset("TikTok", 1080, 1920, 30, 0.50, (18, 18, 32), "9:16 vertical"),
-    "Instagram Reels (1080×1920)": ExportPreset("Instagram Reels", 1080, 1920, 30, 0.50, (18, 18, 32), "9:16 vertical"),
-    "Instagram Square (1080×1080)": ExportPreset("Instagram Square", 1080, 1080, 30, 0.82, (18, 18, 32), "1:1 square"),
-    "Twitter/X (1280×720)": ExportPreset("Twitter/X", 1280, 720, 30, 0.80, (18, 18, 32), "16:9"),
-    "Custom": ExportPreset("Custom", 544, 544, 30, 0.82, (26, 26, 46), "User-defined"),
+    "YouTube 4K (3840×2160)": ExportPreset("YouTube 4K", 3840, 2160, 30, 0.70, (26, 27, 46), "16:9 4K", LayoutMode.BOARD_MOVES_RIGHT),
+    "YouTube 1440p (2560×1440)": ExportPreset("YouTube 1440p", 2560, 1440, 30, 0.72, (26, 27, 46), "16:9 1440p", LayoutMode.BOARD_MOVES_RIGHT),
+    "YouTube 1080p (1920×1080)": ExportPreset("YouTube 1080p", 1920, 1080, 30, 0.75, (26, 27, 46), "16:9 Full HD", LayoutMode.BOARD_MOVES_RIGHT),
+    "YouTube 720p (1280×720)": ExportPreset("YouTube 720p", 1280, 720, 30, 0.78, (26, 27, 46), "16:9 HD", LayoutMode.BOARD_MOVES_RIGHT),
+    "Shorts 4K (2160×3840)": ExportPreset("Shorts 4K", 2160, 3840, 30, 0.48, (26, 27, 46), "9:16 4K", LayoutMode.BOARD_MOVES_BOTTOM),
+    "Shorts 1440p (1440×2560)": ExportPreset("Shorts 1440p", 1440, 2560, 30, 0.48, (26, 27, 46), "9:16 1440p", LayoutMode.BOARD_MOVES_BOTTOM),
+    "Shorts 1080p (1080×1920)": ExportPreset("Shorts 1080p", 1080, 1920, 30, 0.48, (26, 27, 46), "9:16 vertical", LayoutMode.BOARD_MOVES_BOTTOM),
+    "Shorts 720p (720×1280)": ExportPreset("Shorts 720p", 720, 1280, 30, 0.48, (26, 27, 46), "9:16 vertical", LayoutMode.BOARD_MOVES_BOTTOM),
+    "Board Only (544×544)": ExportPreset("Board Only", 544, 544, 30, 1.0, (26, 27, 46), "Square board-only"),
+    "Custom": ExportPreset("Custom", 544, 544, 30, 0.82, (26, 27, 46), "User-defined"),
 }
 
+# ── Sound Design Presets ────────────────────────────────────────────────────
+
+SOUND_PRESETS = {
+    "None": {
+        "name": "None",
+        "description": "No background audio",
+    },
+    "Soft Ambient": {
+        "name": "Soft Ambient",
+        "description": "Gentle layered sine pads",
+        "base_freq": 174,
+        "harmonics": [1.0, 0.5, 0.25, 0.125],
+        "beat_period": 2.5,
+        "volume": 0.15,
+    },
+    "Cinematic": {
+        "name": "Cinematic",
+        "description": "Deep dramatic atmosphere",
+        "base_freq": 110,
+        "harmonics": [1.0, 0.6, 0.3],
+        "beat_period": 3.0,
+        "volume": 0.2,
+    },
+    "Retro 8-bit": {
+        "name": "Retro 8-bit",
+        "description": "Chip-tune square-wave melody",
+        "base_freq": 330,
+        "harmonics": [1.0],
+        "beat_period": 0.4,
+        "volume": 0.12,
+        "square_wave": True,
+    },
+    "Focus": {
+        "name": "Focus",
+        "description": "Minimal concentration drone",
+        "base_freq": 136,
+        "harmonics": [1.0, 0.3],
+        "beat_period": 4.0,
+        "volume": 0.1,
+    },
+}
 
 # ── Export Configuration ─────────────────────────────────────────────────────
 
@@ -125,42 +242,59 @@ class ExportConfig:
         self.title_enabled = True
         self.title_text = ""
         self.title_duration = 3.0
-        self.title_bg = "#1a1a2e"
-        self.title_fg = "#e0e0e0"
+        self.title_bg = "#1a1b26"
+        self.title_fg = "#c0caf5"
         self.title_font_size = 36
+
+        self.position_hold_enabled = True
+        self.position_hold_duration = 3.0
+        self.position_overlay_text = "White to play"
+
         self.end_enabled = True
         self.end_text = "Solved!"
         self.end_duration = 3.0
-        self.end_bg = "#1a1a2e"
-        self.end_fg = "#e0e0e0"
+        self.end_bg = "#1a1b26"
+        self.end_fg = "#c0caf5"
         self.end_font_size = 42
-        self.move_anim_duration = 0.4
-        self.pause_after_move = 1.0
-        self.highlight_duration = 0.3
+
+        self.move_speed = 1.0
+        self.pause_after_move = 0.5
+        self.pause_on_key_moves = True
+        self.key_move_pause_multiplier = 2.0
+        self.highlight_last_move = True
+        self.highlight_key_squares = False
+
+        self.loop_count = 1
+        self.easing_curve = "ease_out"
+
         self.max_workers = 4
         self.sq_size = SQ_SIZE
-        self.theme_name = "Classic"
+        self.theme_name = "Midnight"
         self.gpu_post_process = True
         self.gpu_vignette = 0.25
         self.gpu_contrast = 1.02
         self.gpu_saturation = 1.05
+
         self.output_dir = ""
         self.batch_combine = False
-        self.preset_name = "Board Only (544×544)"
-        self.target_width = 544
-        self.target_height = 544
-        self.background_color = (26, 26, 46)
-        self.board_frac = 0.82
+        self.preset_name = "YouTube 1080p (1920×1080)"
+        self.target_width = 1920
+        self.target_height = 1080
+        self.background_color = (26, 27, 46)
+        self.board_frac = 0.75
         self.audio_path = ""
         self.audio_volume = 0.25
         self.export_gif = False
         self.gif_fps = 12
-        self.show_title_overlay = True
-        self.title_overlay_text = ""
-        self.subtitle_text = ""
-        self.use_ffmpeg = True
         self.ffmpeg_crf = 20
         self.ffmpeg_preset = "medium"
+        self.layout_mode = LayoutMode.BOARD_MOVES_RIGHT
+
+        self.move_list_visible = True
+        self.coordinate_visible = True
+        self.batch_size = 16
+        self.show_arrow = True
+        self.sound_preset = "None"
 
     def apply_preset(self, preset_name):
         if preset_name in EXPORT_PRESETS:
@@ -171,6 +305,7 @@ class ExportConfig:
             self.fps = p.fps
             self.background_color = p.bg
             self.board_frac = p.board_frac
+            self.layout_mode = p.layout
             if preset_name != "Custom":
                 self.sq_size = p.calc_sq_size()
 
@@ -185,3 +320,40 @@ class ExportConfig:
     @property
     def is_vertical(self):
         return self.target_height > self.target_width
+
+    @property
+    def effective_bitrate(self):
+        p = EXPORT_PRESETS.get(self.preset_name)
+        if p: return p.bitrate
+        return RESOLUTION_BITRATES.get((self.target_width, self.target_height), 8000)
+
+    @property
+    def move_anim_duration(self):
+        return self.move_speed
+
+    @property
+    def move_panel_width(self):
+        if self.layout_mode == LayoutMode.BOARD_MOVES_RIGHT:
+            sq = self.effective_sq_size
+            return self.target_width - sq * 8
+        return 0
+
+    @property
+    def move_panel_height(self):
+        if self.layout_mode == LayoutMode.BOARD_MOVES_BOTTOM:
+            sq = self.effective_sq_size
+            return self.target_height - sq * 8
+        return 0
+
+    def estimate_duration(self, n_moves):
+        """Estimate total video duration in seconds for audio generation."""
+        total = 0.0
+        if self.title_enabled and self.title_text:
+            total += self.title_duration
+        if self.position_hold_enabled:
+            total += self.position_hold_duration
+        loops = max(1, self.loop_count)
+        total += loops * n_moves * (self.move_anim_duration + self.pause_after_move)
+        if self.end_enabled and self.end_text:
+            total += self.end_duration
+        return max(1.0, total)

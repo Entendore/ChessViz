@@ -39,6 +39,36 @@ _UCI_RE = re.compile(r'^[a-h][1-8][a-h][1-8][qrbn]?$')
 _MVNUM_RE = re.compile(r'^\d+\.+$')
 _RESULT_RE = frozenset({'1-0', '0-1', '1/2-1/2', '*'})
 
+# ── Lichess column mappings ────────────────────────────────────────────────
+
+LICHESS_COL_MAP = {
+    'puzzleid': 'id',
+    'fen': 'fen',
+    'moves': 'moves',
+    'rating': 'rating',
+    'ratingdeviation': 'rating_deviation',
+    'popularity': 'popularity',
+    'nbplays': 'nb_plays',
+    'themes': 'themes',
+    'gameurl': 'game_url',
+    'openingtags': 'opening',
+}
+
+LICHESS_THEME_LIST = sorted({
+    'advancedPawn', 'advantage', 'anastasiaMate', 'arabianMate', 'attackingF2F7',
+    'attraction', 'backRankMate', 'bishopEndgame', 'bodenMate', 'castling',
+    'capture', 'clearance', 'coercion', 'cooksMate', 'crushing', 'defensiveMove',
+    'deflection', 'discoveredAttack', 'doubleAttack', 'doubleCheck', 'dovetailMate',
+    'endgame', 'enPassant', 'equality', 'exposedKing', 'fork', 'hangingPiece',
+    'hookMate', 'interference', 'intermezzo', 'knightEndgame', 'kingsideAttack',
+    'long', 'legalMate', 'master', 'masterVsMaster', 'mate', 'mateIn1', 'mateIn2',
+    'mateIn3', 'mateIn4', 'mateIn5', 'middlegame', 'miniature', 'oneMove',
+    'opening', 'pawnEndgame', 'pin', 'promotion', 'queenEndgame', 'queenRookEndgame',
+    'quietMove', 'rookEndgame', 'sacrifice', 'scholarMate', 'short', 'skewer',
+    'smotheredMate', 'superGM', 'trappedPiece', 'underPromotion', 'veryLong',
+    'xRayAttack', 'zugzwang',
+})
+
 
 # ── Move helpers ────────────────────────────────────────────────────────────
 
@@ -56,11 +86,16 @@ def _clean_move_tokens(tokens):
 
 
 def _detect_move_format(tokens):
+    checked = 0
     for t in tokens:
         if _UCI_RE.match(t):
             return 'uci'
-        return 'san'
-    return 'uci'
+        if re.match(r'^[A-Z]', t) or 'x' in t or t.endswith('#') or t.endswith('+'):
+            return 'san'
+        checked += 1
+        if checked >= 3:
+            break
+    return 'san' if tokens else 'uci'
 
 
 def _san_to_uci(tokens, fen=''):
@@ -123,13 +158,63 @@ def _extract_uci_moves(row):
     return tokens
 
 
+def _is_lichess_format(columns):
+    """Detect if column names match lichess puzzle DB format."""
+    lower_cols = {c.lower() for c in columns}
+    lichess_signatures = {'puzzleid', 'fen', 'moves', 'rating', 'themes'}
+    return len(lichess_signatures & lower_cols) >= 4
+
+
+def _normalize_lichess_row(row, idx):
+    """Normalize a lichess-format row, handling first-move convention."""
+    normalized = {}
+    for k, v in row.items():
+        kl = k.lower()
+        mapped = LICHESS_COL_MAP.get(kl, kl)
+        normalized[mapped] = v
+
+    # Extract UCI moves
+    raw_moves = str(normalized.get('moves', '')).strip()
+    uci_moves = raw_moves.split() if raw_moves else []
+
+    # Lichess convention: first move is opponent's setup move
+    setup_count = 0
+    if uci_moves and _is_lichess_format(row.keys()):
+        setup_count = 1
+
+    # Generate name
+    name = _generate_name(normalized, uci_moves, idx)
+
+    # Difficulty
+    difficulty = _compute_iterative_difficulty(normalized, uci_moves)
+
+    return {
+        'name': name,
+        'fen': str(normalized.get('fen', '')),
+        'moves': uci_moves,
+        'desc': str(normalized.get('themes', normalized.get('desc', ''))),
+        'difficulty': difficulty,
+        'setup_count': setup_count,
+        'id': str(normalized.get('id', '')),
+        'rating': normalized.get('rating', 0),
+        'themes': str(normalized.get('themes', '')),
+        'opening': str(normalized.get('opening', '')),
+        'popularity': normalized.get('popularity', 0),
+        'nb_plays': normalized.get('nb_plays', 0),
+    }
+
+
 # ── Rating / naming helpers ─────────────────────────────────────────────────
 
 def _rating_category(rating):
-    if rating < 800:  return "Beginner"
-    if rating < 1200: return "Easy"
-    if rating < 1600: return "Medium"
-    if rating < 2000: return "Hard"
+    try:
+        r = float(rating)
+    except (ValueError, TypeError):
+        return "Unknown"
+    if r < 800:  return "Beginner"
+    if r < 1200: return "Easy"
+    if r < 1600: return "Medium"
+    if r < 2000: return "Hard"
     return "Expert"
 
 
@@ -139,13 +224,17 @@ def _generate_name(row, uci_moves, idx):
     name = str(row.get('name', '')).strip()
     if name and name.lower() not in ('nan', 'none', ''):
         attrs.append(name)
-    themes = str(row.get('themes', row.get('theme', ''))).strip()
-    if themes and themes.lower() not in ('nan', 'none', ''):
-        attrs.append(themes)
+
     opening = str(row.get('opening', row.get('opening_tags',
                   row.get('openingtags', '')))).strip()
     if opening and opening.lower() not in ('nan', 'none', ''):
         attrs.append(opening)
+
+    themes = str(row.get('themes', row.get('theme', ''))).strip()
+    if themes and themes.lower() not in ('nan', 'none', ''):
+        theme_list = themes.split()
+        attrs.append(' '.join(theme_list[:2]))
+
     for rkey in ('rating', 'elo', 'difficulty', 'score'):
         rval = str(row.get(rkey, '')).strip()
         if rval and rval.lower() not in ('nan', 'none', ''):
@@ -178,7 +267,9 @@ def _generate_name_fallback(row, uci_moves, idx):
         'fen', 'moves', 'uci', 'pgn', 'id', 'name', 'img',
         'desc', 'description', 'white', 'black', 'event',
         'rating', 'difficulty', 'score', 'elo', 'themes',
-        'theme', 'opening', 'opening_tags', 'openingtags', 'eco'})
+        'theme', 'opening', 'opening_tags', 'openingtags', 'eco',
+        'rating_deviation', 'popularity', 'nb_plays', 'game_url',
+        'opening_variation', 'setup_count'})
     parts = []
     for k, v in row.items():
         val = str(v).strip() if v is not None else ''
@@ -202,7 +293,7 @@ if HAS_NUMBA:
     def _count_moves_nb(data, offsets, lengths):
         n = len(offsets)
         out = np.empty(n, dtype=np.int64)
-        comma = np.uint8(44)
+        space = np.uint8(32)
         for i in range(n):
             ln = lengths[i]
             if ln == 0:
@@ -212,7 +303,7 @@ if HAS_NUMBA:
             s = offsets[i]
             e = s + ln
             for j in range(s, e):
-                if data[j] == comma:
+                if data[j] == space:
                     c += 1
             out[i] = c
         return out
@@ -253,18 +344,16 @@ else:
     def _count_moves_nb(data, offsets, lengths):
         out = np.empty(len(offsets), dtype=np.int64)
         for i in range(len(offsets)):
-            if lengths[i] == 0:
-                out[i] = 0
+            if lengths[i] == 0: out[i] = 0
             else:
                 seg = data[offsets[i]:offsets[i] + lengths[i]].tobytes()
-                out[i] = seg.count(b',') + 1
+                out[i] = seg.count(32) + 1 # Space separated
         return out
 
     def _validate_uci_first_nb(data, offsets, lengths):
         valid = np.ones(len(offsets), dtype=np.bool_)
         for i in range(len(offsets)):
-            if lengths[i] < 4:
-                valid[i] = lengths[i] > 0
+            if lengths[i] < 4: valid[i] = lengths[i] > 0
         return valid
 
     def _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals):
@@ -273,8 +362,7 @@ else:
         for i in range(n):
             base = min(1.0, max(0.0, float(move_counts[i]) / 8.0))
             fen_b = 0.15 if has_fen[i] else 0.0
-            rating = (min(1.0, max(0.0, rating_vals[i] / 3000.0))
-                      if has_rating[i] else 0.5)
+            rating = (min(1.0, max(0.0, rating_vals[i] / 3000.0)) if has_rating[i] else 0.5)
             out[i] = 0.4 * base + 0.2 * fen_b + 0.4 * rating
         return out
 
@@ -288,21 +376,17 @@ def _pack_strings(strings):
         offsets[i] = total
         total += lengths[i]
     buf = b''.join(encoded)
-    data = (np.frombuffer(buf, dtype=np.uint8).copy()
-            if buf else np.empty(0, dtype=np.uint8))
+    data = (np.frombuffer(buf, dtype=np.uint8).copy() if buf else np.empty(0, dtype=np.uint8))
     return data, offsets, lengths
 
 
 def batch_count_moves(move_strings):
-    if not move_strings:
-        return np.array([], dtype=np.int64)
+    if not move_strings: return np.array([], dtype=np.int64)
     data, offsets, lengths = _pack_strings(move_strings)
     return _count_moves_nb(data, offsets, lengths)
 
-
 def batch_validate_uci(move_strings):
-    if not move_strings:
-        return np.array([], dtype=np.bool_)
+    if not move_strings: return np.array([], dtype=np.bool_)
     data, offsets, lengths = _pack_strings(move_strings)
     return _validate_uci_first_nb(data, offsets, lengths)
 
@@ -317,8 +401,7 @@ if HAS_CUPY:
         rv_gpu = _cp_gpu.asarray(rating_vals.astype(np.float64))
         base = _cp_gpu.clip(mc_gpu / 8.0, 0.0, 1.0)
         fen_b = 0.15 * hf_gpu
-        rating = _cp_gpu.where(hr_gpu > 0,
-                               _cp_gpu.clip(rv_gpu / 3000.0, 0.0, 1.0), 0.5)
+        rating = _cp_gpu.where(hr_gpu > 0, _cp_gpu.clip(rv_gpu / 3000.0, 0.0, 1.0), 0.5)
         return _cp_gpu.asnumpy(0.4 * base + 0.2 * fen_b + 0.4 * rating)
     log("CuPy GPU puzzle helpers ready", "PUZZLE")
 else:

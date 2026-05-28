@@ -1,33 +1,4 @@
 ============================================================
-FILE: lichess_db_puzzle.parquet
-============================================================
-
-Columns:
-- PuzzleId
-- FEN
-- Moves
-- Rating
-- RatingDeviation
-- Popularity
-- NbPlays
-- Themes
-- GameUrl
-- OpeningTags
-
-Random Row:
-PuzzleId: 9kPtz
-FEN: 2r2rk1/ppq1ppbp/6p1/3p1b2/PP1PnP2/BQ1BP3/6PP/RN3RK1 w - - 3 15
-Moves: f1c1 c7c1 a3c1 c8c1
-Rating: 1010
-RatingDeviation: 83
-Popularity: 69
-NbPlays: 45
-Themes: crushing middlegame short
-GameUrl: https://lichess.org/wT7Ps0f8#29
-OpeningTags: Bird_Opening Bird_Opening_Dutch_Variation
-
-
-============================================================
 FILE: lichess_db_openings.parquet
 ============================================================
 

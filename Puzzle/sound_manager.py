@@ -203,6 +203,73 @@ class SoundManager:
             s.stop()
             s.play()
 
+    # ── Background Audio Generation for Export ──────────────────────────
+
+    def generate_background_audio(self, preset_name, duration_s, output_path):
+        """Generate a procedural background audio track based on a sound design preset.
+        Returns output_path on success, None on failure."""
+        from config import SOUND_PRESETS
+        if preset_name not in SOUND_PRESETS or preset_name == "None":
+            return None
+
+        preset = SOUND_PRESETS[preset_name]
+        sr = 44100
+        n_samples = max(1, int(sr * duration_s))
+
+        base_freq = preset.get('base_freq', 220)
+        harmonics = preset.get('harmonics', [1.0])
+        beat_period = preset.get('beat_period', 2.0)
+        vol = preset.get('volume', 0.15)
+        use_square = preset.get('square_wave', False)
+
+        t = np.arange(n_samples, dtype=np.float64)
+        samples = np.zeros(n_samples, dtype=np.float64)
+
+        for h_idx, h_amp in enumerate(harmonics):
+            freq = base_freq * (h_idx + 1)
+            if use_square:
+                # Square wave via sign of sine
+                wave = np.sign(np.sin(2.0 * np.pi * freq * t / sr)) * h_amp
+            else:
+                wave = h_amp * np.sin(2.0 * np.pi * freq * t / sr)
+
+            # Gentle amplitude modulation for movement / breathing
+            mod_freq = 0.08 + h_idx * 0.04
+            mod = 0.6 + 0.4 * np.sin(2.0 * np.pi * mod_freq * t / sr)
+            wave *= mod
+
+            # Subtle beat pulse
+            if beat_period > 0:
+                beat_env = 0.85 + 0.15 * np.sin(2.0 * np.pi / beat_period * t / sr)
+                wave *= beat_env
+
+            samples += wave
+
+        # Normalize to target volume
+        peak = np.max(np.abs(samples))
+        if peak > 0:
+            samples = samples / peak * (32767.0 * vol)
+
+        # Fade in / fade out (1 second each, or shorter for short clips)
+        fade_len = min(int(sr * 1.0), n_samples // 4)
+        if fade_len > 1:
+            samples[:fade_len] *= np.linspace(0, 1, fade_len)
+            samples[-fade_len:] *= np.linspace(1, 0, fade_len)
+
+        # Write WAV
+        try:
+            int_samples = _to_i16(samples)
+            with wave.open(output_path, 'w') as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                w.writeframes(int_samples.tobytes())
+            log(f"Generated background audio: {preset_name} ({duration_s:.1f}s)", "SOUND")
+            return output_path
+        except Exception as e:
+            log(f"Audio generation failed: {e}", "SOUND")
+            return None
+
     def cleanup(self):
         try:
             shutil.rmtree(self.tmpdir, ignore_errors=True)

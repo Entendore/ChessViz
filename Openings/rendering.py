@@ -13,7 +13,8 @@ from PySide6.QtGui import (
 from PySide6.QtCore import Qt, QRect, QRectF, QPointF
 
 from config import (
-    SQ_SIZE, PIECE_SYM, FILES_STR, RANKS_STR, THEMES, HAS_NUMBA, log
+    SQ_SIZE, PIECE_SYM, FILES_STR, RANKS_STR, THEMES,
+    HAS_NUMBA, HAS_CUPY, log          # BUG-FIX: HAS_CUPY was missing
 )
 from helpers import _ease_out_cubic
 
@@ -111,12 +112,32 @@ def _draw_arrow(painter, fx, fy, tx, ty, color, sz):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  CAPTURED-PIECE RECONSTRUCTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_PIECE_TYPE_MAP = {
+    'K': chess.KING, 'Q': chess.QUEEN, 'R': chess.ROOK,
+    'B': chess.BISHOP, 'N': chess.KNIGHT, 'P': chess.PAWN,
+    'k': chess.KING, 'q': chess.QUEEN, 'r': chess.ROOK,
+    'b': chess.BISHOP, 'n': chess.KNIGHT, 'p': chess.PAWN,
+}
+
+def _reconstruct_piece(symbol):
+    """Reconstruct a chess.Piece from its FEN symbol (e.g. 'P', 'p')."""
+    pt = _PIECE_TYPE_MAP.get(symbol)
+    if pt is None:
+        return None
+    color = chess.WHITE if symbol.isupper() else chess.BLACK
+    return chess.Piece(pt, color)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  BOARD FRAME RENDERING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render_frame(board, last_move=None, selected=None, legal_targets=None,
                  text_overlay="", check_squares=None, anim_state=None,
-                 sq_size=SQ_SIZE, show_arrow=True, theme=None):
+                 sq_size=SQ_SIZE, show_arrow=True, theme=None, flipped=False):
     if theme is None: theme = THEMES["Classic"]
     sz = sq_size
     img = QImage(sz * 8, sz * 8, QImage.Format_ARGB32_Premultiplied)
@@ -130,24 +151,30 @@ def render_frame(board, last_move=None, selected=None, legal_targets=None,
     if anim_state:
         skip_sq.add(anim_state['from']); skip_sq.add(anim_state['to'])
 
+    # helper: board coords → screen coords
+    def b2s(br, bc):
+        return (7 - br, 7 - bc) if flipped else (br, bc)
+
     # --- Squares ---
     for sq in chess.SQUARES:
-        r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
-        x, y = c * sz, r * sz
-        is_light = (r + c) % 2 == 0
+        br, bc = 7 - chess.square_rank(sq), chess.square_file(sq)
+        sr, sc = b2s(br, bc)
+        x, y = sc * sz, sr * sz
+        is_light = (br + bc) % 2 == 0
         color = theme.light_sq if is_light else theme.dark_sq
         p.fillRect(x, y, sz, sz, color)
-        if last_move and (r, c) in last_move:
+
+        if last_move and (br, bc) in last_move:
             p.fillRect(x, y, sz, sz, theme.last_move)
-        if selected and (r, c) == selected:
+        if selected and (br, bc) == selected:
             p.fillRect(x, y, sz, sz, theme.highlight)
-        if (r, c) in check_set:
+        if (br, bc) in check_set:
             grad = QRadialGradient(x + sz / 2, y + sz / 2, sz * 0.7)
             grad.setColorAt(0, QColor(255, 30, 30, 180))
             grad.setColorAt(1, QColor(255, 0, 0, 0))
             p.setBrush(QBrush(grad)); p.setPen(Qt.NoPen)
             p.drawRect(x, y, sz, sz)
-        if legal_targets and (r, c) in legal_targets:
+        if legal_targets and (br, bc) in legal_targets:
             cx, cy = x + sz // 2, y + sz // 2
             if board.piece_at(sq) is not None:
                 p.setPen(QPen(QColor(0, 0, 0, 90), max(3, sz // 14)))
@@ -160,66 +187,73 @@ def render_frame(board, last_move=None, selected=None, legal_targets=None,
 
     # --- Arrow ---
     if show_arrow and last_move:
-        (fr, fc), (tr, tc) = last_move
-        _draw_arrow(p, fc * sz + sz // 2, fr * sz + sz // 2,
-                    tc * sz + sz // 2, tr * sz + sz // 2,
+        (bfr, bfc), (btr, btc) = last_move
+        sfr, sfc = b2s(bfr, bfc); str_, stc = b2s(btr, btc)
+        _draw_arrow(p, sfc * sz + sz // 2, sfr * sz + sz // 2,
+                    stc * sz + sz // 2, str_ * sz + sz // 2,
                     theme.arrow_clr, sz)
 
     # --- Pieces (static) ---
     for sq in chess.SQUARES:
-        r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
-        if (r, c) in skip_sq: continue
+        br, bc = 7 - chess.square_rank(sq), chess.square_file(sq)
+        if (br, bc) in skip_sq: continue
         piece = board.piece_at(sq)
-        if piece: _draw_piece(p, piece, r, c, sz, font_piece)
+        if piece:
+            sr, sc = b2s(br, bc)
+            _draw_piece(p, piece, sr, sc, sz, font_piece)
 
     # --- Captured piece fade (animation) ---
+    # BUG-FIX: always reconstruct from the symbol — the board already has the
+    # moving piece at the destination square, so board.piece_at() would return
+    # the mover, not None, and the old reconstruction path was unreachable.
     if anim_state and anim_state.get('captured', '.') != '.':
-        fr, fc_ = anim_state['from']; tr, tc_ = anim_state['to']
-        cap_piece = board.piece_at(chess.square(tc_, 7 - tr))
-        if cap_piece is None:
-            sym = anim_state['captured']; is_w = sym.isupper()
-            pt_map = {'K': chess.KING, 'Q': chess.QUEEN, 'R': chess.ROOK,
-                      'B': chess.BISHOP, 'N': chess.KNIGHT, 'P': chess.PAWN}
-            pt = pt_map.get(sym.upper())
-            if pt:
-                cap_piece = chess.Piece(pt, chess.WHITE if is_w else chess.BLACK)
-                fade = max(0, int(200 * (1.0 - anim_state['progress'])))
-                p.setOpacity(fade / 255.0)
-                _draw_piece(p, cap_piece, tr, tc_, sz, font_piece)
-                p.setOpacity(1.0)
+        bfr, bfc_ = anim_state['from']; btr, btc_ = anim_state['to']
+        cap_piece = _reconstruct_piece(anim_state['captured'])
+        if cap_piece is not None:
+            fade = max(0, int(200 * (1.0 - anim_state['progress'])))
+            p.setOpacity(fade / 255.0)
+            sr, sc = b2s(btr, btc_)
+            _draw_piece(p, cap_piece, sr, sc, sz, font_piece)
+            p.setOpacity(1.0)
 
     # --- Animating piece ---
     if anim_state:
-        fr, fc_ = anim_state['from']; tr, tc_ = anim_state['to']
+        bfr, bfc_ = anim_state['from']; btr, btc_ = anim_state['to']
         t = anim_state['progress']
         anim_piece_obj = anim_state.get('piece_obj')
         if anim_piece_obj:
             lift = 4.0 * t * (1.0 - t) * 0.15
             scale = 1.0 + 4.0 * t * (1.0 - t) * 0.08
-            ir = fr + (tr - fr) * t; ic = fc_ + (tc_ - fc_) * t
+            # interpolate in board coords, then convert to screen
+            ir = bfr + (btr - bfr) * t; ic = bfc_ + (btc_ - bfc_) * t
+            sir, sic = b2s(ir, ic)
+
             shadow_alpha = 30 + int(70 * (lift / 0.15))
             p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, shadow_alpha))
-            sy = ir * sz + sz * 0.82
-            p.drawEllipse(QRectF(ic * sz + (sz * scale - sz * 0.65) / 2, sy,
+            sy = sir * sz + sz * 0.82
+            p.drawEllipse(QRectF(sic * sz + (sz * scale - sz * 0.65) / 2, sy,
                                  sz * 0.65, sz * 0.12))
             w, h = sz * scale, sz * scale
-            y_lift = ir * sz - (sz * lift)
-            _draw_piece_at(p, anim_piece_obj, y_lift / sz, ic, sz, w, h, font_piece)
+            y_lift = sir * sz - (sz * lift)
+            _draw_piece_at(p, anim_piece_obj, y_lift / sz, sic, sz, w, h, font_piece)
 
     # --- Coordinates ---
     p.setFont(font_coord)
     coord_margin = max(3, int(sz * 0.04)); coord_sz = max(12, sz // 5)
     for c in range(8):
-        is_light = (7 + c) % 2 == 0
+        is_light = (7 + c) % 2 == 0  # parity is flip-invariant
         col = theme.dark_sq if is_light else theme.light_sq; p.setPen(col)
+        file_idx = 7 - c if flipped else c
         p.drawText(QRect(c * sz + sz - coord_sz - coord_margin,
                          7 * sz + coord_margin, coord_sz, coord_sz),
-                   Qt.AlignCenter, FILES_STR[c])
+                   Qt.AlignCenter, FILES_STR[file_idx])
     for r in range(8):
-        is_light = r % 2 == 0
+        is_light = r % 2 == 0  # parity is flip-invariant
         col = theme.dark_sq if is_light else theme.light_sq; p.setPen(col)
+        rank_idx = 7 - r if flipped else r
         p.drawText(QRect(coord_margin, r * sz + coord_margin,
-                         coord_sz, coord_sz), Qt.AlignCenter, RANKS_STR[r])
+                         coord_sz, coord_sz),
+                   Qt.AlignCenter, RANKS_STR[rank_idx])
 
     # --- Text overlay ---
     if text_overlay:

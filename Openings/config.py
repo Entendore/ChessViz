@@ -2,7 +2,7 @@
 config.py — Constants, optional-dependency flags, logging, themes, presets, export config.
 """
 
-import os, math, re, shutil
+import os, math, shutil
 import numpy as np
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -29,7 +29,7 @@ HAS_NUMBA = False
 try:
     import numba; HAS_NUMBA = True
 except ImportError: pass
-HAS_CUPY = False; _cp = None
+HAS_CUPY = False
 try:
     import cupy as cp; HAS_CUPY = True
 except Exception: pass
@@ -55,6 +55,7 @@ def log(msg, level="INFO"):
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
 DB_OPENINGS_PATH = os.path.join(DATA_DIR, "cache_openings.parquet")
+LICHESS_DB_PATH = os.path.join(DATA_DIR, "lichess_db_openings.parquet")   # NEW
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  BOARD / RENDERING CONSTANTS
@@ -86,6 +87,8 @@ ANIM_FPS           = 60
 #  BOARD THEMES
 # ═══════════════════════════════════════════════════════════════════════════════
 
+from PySide6.QtGui import QColor
+
 class BoardTheme:
     def __init__(self, name="Classic",
                  light=(240, 217, 181), dark=(181, 136, 99),
@@ -95,9 +98,6 @@ class BoardTheme:
         self.border = QColor(*border); self.highlight = QColor(*highlight)
         self.last_move = QColor(*last_move); self.arrow_clr = QColor(*arrow)
         self.bg = QColor(32, 32, 36); self.coord = QColor(180, 160, 130)
-
-# Deferred QColor import — BoardTheme needs it
-from PySide6.QtGui import QColor
 
 THEMES = {
     "Classic": BoardTheme(),

@@ -99,10 +99,4 @@ class ChessEngine:
             else:
                 self.last_move = None
             return True
-        return False
-
-    def load_fen(self, fen):
-        self.board.set_fen(fen)
-        self.game_over = self.board.is_game_over()
-        self.result = self.board.result() if self.game_over else ""
-        self.last_move = None
+        return False                              

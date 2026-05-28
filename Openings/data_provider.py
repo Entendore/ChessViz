@@ -264,17 +264,32 @@ class DataProvider:
     # ── Append / save / clear ──────────────────────────────────────────────
 
     def _append_records_to_parquet(self, db_type, records, cols):
-        import pandas as pd
+        """BUG-FIX: support pyarrow-only installs, not just pandas."""
         save_records = [self._serialize_record_for_parquet(rec, cols)
                         for rec in records]
-        new_df = self._records_to_dataframe(save_records, cols)
         path = self._cache_path(db_type)
-        if not os.path.exists(path):
-            new_df.to_parquet(path, index=False)
+        if HAS_PANDAS:
+            import pandas as pd
+            new_df = self._records_to_dataframe(save_records, cols)
+            if not os.path.exists(path):
+                new_df.to_parquet(path, index=False)
+            else:
+                existing = pd.read_parquet(path)
+                combined = pd.concat([existing, new_df], ignore_index=True)
+                combined.to_parquet(path, index=False); del existing, combined
+        elif HAS_PYARROW:
+            import pyarrow as pa; import pyarrow.parquet as pq
+            new_table = pa.Table.from_pandas(
+                self._records_to_dataframe(save_records, cols),
+                preserve_index=False)
+            if not os.path.exists(path):
+                pq.write_table(new_table, path)
+            else:
+                existing = pq.read_table(path)
+                combined = pa.concat_tables([existing, new_table])
+                pq.write_table(combined, path); del existing, combined
         else:
-            existing = pd.read_parquet(path)
-            combined = pd.concat([existing, new_df], ignore_index=True)
-            combined.to_parquet(path, index=False); del existing, combined
+            raise ImportError("Need pandas or pyarrow for parquet I/O")
 
     def _save_cache(self, db_type):
         self._dirty[db_type] = False
