@@ -44,18 +44,26 @@ class MoveListWidget(QWidget):
         self.update()
 
     def set_current(self, idx):
-        self._current = idx; self.update()
+        self._current = idx
+        self.update()
 
     def clear(self):
-        self._moves.clear(); self._qualities.clear()
-        self._current = -1; self.update()
+        self._moves.clear()
+        self._qualities.clear()
+        self._current = -1
+        self.update()
 
     @property
-    def moves(self): return list(self._moves)
+    def moves(self):
+        return list(self._moves)
+
     @property
-    def qualities(self): return list(self._qualities)
+    def qualities(self):
+        return list(self._qualities)
+
     @property
-    def current_index(self): return self._current
+    def current_index(self):
+        return self._current
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -80,15 +88,19 @@ class BoardPreviewWidget(QWidget):
         self.setMinimumSize(360, 360)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-    def _get_ap(self): return self._anim_progress_val
+    def _get_ap(self):
+        return self._anim_progress_val
+
     def _set_ap(self, v):
         self._anim_progress_val = v
         self._renderer.anim_progress = v
         self.update()
+
     animProgress = Property(float, _get_ap, _set_ap)
 
     @property
-    def flipped(self): return self._renderer.flipped
+    def flipped(self):
+        return self._renderer.flipped
 
     def set_board(self, board, last_move=None):
         self._renderer.board = board
@@ -100,19 +112,23 @@ class BoardPreviewWidget(QWidget):
         self.update()
 
     def set_theme(self, theme):
-        self._renderer.theme = theme; self.update()
+        self._renderer.theme = theme
+        self.update()
 
     def set_flipped(self, f):
-        self._renderer.flipped = f; self.update()
+        self._renderer.flipped = f
+        self.update()
 
     def set_anim_duration(self, ms):
         self._anim_duration = max(50, int(ms))
 
     def set_show_coords(self, show):
-        self._renderer.show_coords = show; self.update()
+        self._renderer.show_coords = show
+        self.update()
 
     def set_move_quality(self, q):
-        self._renderer.move_quality = q; self.update()
+        self._renderer.move_quality = q
+        self.update()
 
     def animate_move(self, move):
         self._renderer.anim_move = move
@@ -130,9 +146,15 @@ class BoardPreviewWidget(QWidget):
                 rook_move = (chess.square(0, rank), chess.square(3, rank))
         self._renderer.anim_rook_move = rook_move
 
+        # FIX: Stop previous animation to prevent reference leak
+        if self._active_anim is not None:
+            self._active_anim.stop()
+            self._active_anim = None
+
         anim = QPropertyAnimation(self, b"animProgress")
         anim.setDuration(self._anim_duration)
-        anim.setStartValue(0.0); anim.setEndValue(1.0)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
         anim.setEasingCurve(QEasingCurve.OutQuint)
 
         def cleanup():
@@ -164,9 +186,11 @@ class BoardPreviewWidget(QWidget):
 class EvalBarWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._eval_cp = 0.0; self._anim_cp = 0.0
+        self._eval_cp = 0.0
+        self._anim_cp = 0.0
         self._game_state = GAME_NORMAL
-        self._game_result = ""; self._game_detail = ""
+        self._game_result = ""
+        self._game_detail = ""
         self.setFixedWidth(48 + 16)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setMinimumHeight(200)
@@ -175,21 +199,33 @@ class EvalBarWidget(QWidget):
         self._animation.setEasingCurve(QEasingCurve.OutQuart)
 
     def set_game_state(self, state, result="", detail=""):
-        self._game_state = state; self._game_result = result
-        self._game_detail = detail; self.update()
+        self._game_state = state
+        self._game_result = result
+        self._game_detail = detail
+        self.update()
 
     def reset_game_state(self):
         self._game_state = GAME_NORMAL
-        self._game_result = ""; self._game_detail = ""; self.update()
+        self._game_result = ""
+        self._game_detail = ""
+        self.update()
 
-    def _get_ac(self): return self._anim_cp
-    def _set_ac(self, v): self._anim_cp = v; self.update()
+    def _get_ac(self):
+        return self._anim_cp
+
+    def _set_ac(self, v):
+        self._anim_cp = v
+        self.update()
+
     anim_cp = Property(float, _get_ac, _set_ac)
 
     def set_eval(self, cp):
-        old = self._eval_cp; self._eval_cp = cp
+        old = self._eval_cp
+        self._eval_cp = cp
         if self._game_state != GAME_NORMAL or abs(cp) > 9000 or abs(old) > 9000:
-            self._anim_cp = float(cp); self.update(); return
+            self._anim_cp = float(cp)
+            self.update()
+            return
         self._animation.stop()
         self._animation.setStartValue(self._anim_cp)
         self._animation.setEndValue(float(cp))
@@ -218,7 +254,8 @@ class EvalBarWidget(QWidget):
         blk.setColorAt(0.0, QColor(58, 58, 66))
         blk.setColorAt(0.5, QColor(44, 44, 52))
         blk.setColorAt(1.0, QColor(38, 38, 45))
-        p.setPen(Qt.NoPen); p.setBrush(blk)
+        p.setPen(Qt.NoPen)
+        p.setBrush(blk)
         p.drawRoundedRect(QRectF(bx, by, bw, bh), cr, cr)
 
         ratio = self._cp2r(self._anim_cp)
@@ -242,7 +279,8 @@ class EvalBarWidget(QWidget):
                 path.quadTo(bx + bw, by + bh, bx + bw - cr, by + bh)
                 path.lineTo(bx + cr, by + bh)
                 path.quadTo(bx, by + bh, bx, by + bh - cr)
-                path.lineTo(bx, wt); path.closeSubpath()
+                path.lineTo(bx, wt)
+                path.closeSubpath()
                 p.drawPath(path)
 
         ig = QLinearGradient(bx, by, bx, by + bh)
@@ -281,7 +319,7 @@ class EvalBarWidget(QWidget):
             elif on_white:
                 pbg, pfg = QColor(255, 255, 255, 210), QColor(32, 30, 26)
             else:
-                pbg, pfg = QColor(20, 20, 28, 215), QColor(235, 232, 224)
+                pbg, pfg = QColor(20, 20, 28, 210), QColor(235, 232, 224)
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 80))
             p.drawRoundedRect(pill.adjusted(1, 2, 1, 2), 11, 11)
@@ -308,7 +346,9 @@ class EvalBarWidget(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 80))
             p.drawRoundedRect(pill.adjusted(1, 2, 1, 2), 11, 11)
-            p.setBrush(pbg); p.drawRoundedRect(pill, 11, 11)
-            p.setPen(pfg); p.drawText(pill, Qt.AlignCenter, txt)
+            p.setBrush(pbg)
+            p.drawRoundedRect(pill, 11, 11)
+            p.setPen(pfg)
+            p.drawText(pill, Qt.AlignCenter, txt)
 
         p.end()

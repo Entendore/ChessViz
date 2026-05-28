@@ -29,7 +29,6 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-
 from constants import (
     RESOLUTION_SIZES, GAME_NORMAL, GAME_CHECKMATE,
     GAME_STALEMATE, GAME_DRAW, GAME_INSUFFICIENT, MQ_GOOD,
@@ -45,17 +44,10 @@ from video_renderer import VideoRenderer
 
 logger = logging.getLogger("AIvsAI2MP4")
 
-# ════════════════════════════════════════════════════════════════════
-#  Easing Functions
-# ════════════════════════════════════════════════════════════════════
 
 def _ease_out_quint(t):
     return 1.0 - (1.0 - t) ** 5
 
-
-# ════════════════════════════════════════════════════════════════════
-#  Game Worker Thread
-# ════════════════════════════════════════════════════════════════════
 
 class GameWorker(QObject):
     move_made = Signal(chess.Board, chess.Move, float, int, dict, str, str, str)
@@ -95,11 +87,14 @@ class GameWorker(QObject):
                         if not self.stockfish_path:
                             self.error.emit("Stockfish path not configured.")
                             return
-                        sf_instance = SyncUCI(self.stockfish_path)
+                        try:
+                            sf_instance = SyncUCI(self.stockfish_path)
+                        except Exception as e:
+                            self.error.emit(f"Failed to start Stockfish: {e}")
+                            return
                     engines[color] = ("stockfish", sf_instance, depth)
 
             self.board.reset()
-            move_num = 0
 
             while not self.board.is_game_over() and not self._stop:
                 current_color = self.board.turn
@@ -111,6 +106,7 @@ class GameWorker(QObject):
                     if bm:
                         move = chess.Move.from_uci(bm)
                     else:
+                        self.error.emit("Stockfish returned no move.")
                         break
                     eval_cp, nodes, policy = sc, 0, {}
                 elif engine_type == "minimax":
@@ -124,15 +120,14 @@ class GameWorker(QObject):
                     break
 
                 if move is None or move not in self.board.legal_moves:
+                    logger.warning("Engine returned illegal/None move, stopping.")
                     break
 
-                move_num += 1
                 self.board.push(move)
                 game_state, result, detail = self._detect_game_state()
-                white_eval = eval_cp
 
                 self.move_made.emit(
-                    self.board.copy(), move, white_eval, nodes, policy,
+                    self.board.copy(), move, eval_cp, nodes, policy,
                     game_state, result, detail,
                 )
 
@@ -147,7 +142,10 @@ class GameWorker(QObject):
             self.error.emit(str(e))
         finally:
             if sf_instance:
-                sf_instance.close()
+                try:
+                    sf_instance.close()
+                except Exception:
+                    pass
             self.finished.emit()
 
     def _detect_game_state(self):
@@ -166,10 +164,6 @@ class GameWorker(QObject):
             return GAME_DRAW, "½-½", "Draw"
         return GAME_NORMAL, "", ""
 
-
-# ════════════════════════════════════════════════════════════════════
-#  Video Export Worker Thread  — Batch-accelerated + Audio Muxing
-# ════════════════════════════════════════════════════════════════════
 
 class ExportWorker(QObject):
     progress = Signal(int)
@@ -215,8 +209,12 @@ class ExportWorker(QObject):
             self.error.emit("opencv-python is required.\npip install opencv-python")
             return
         try:
-            game = (chess.pgn.read_gameFromString(self.pgn_text)
-                    if hasattr(chess.pgn, 'read_gameFromString') else None)
+            game = None
+            if hasattr(chess.pgn, 'read_gameFromString'):
+                try:
+                    game = chess.pgn.read_gameFromString(self.pgn_text)
+                except Exception:
+                    pass
             if game is None:
                 io = StringIO(self.pgn_text)
                 game = chess.pgn.read_game(io)
@@ -229,25 +227,27 @@ class ExportWorker(QObject):
 
             moves = list(game.mainline_moves())
             total_moves = len(moves)
+            if total_moves == 0:
+                self.error.emit("No moves found in PGN.")
+                return
             logger.info("Export starting: %dx%d @ %d fps, %d moves",
                         w, h, fps, total_moves)
 
-            # ── Frame budget per move ──────────────────────────
             anim_frames = max(1, int(fps * self.anim_duration))
             total_move_frames = max(anim_frames + 1,
                                     int(fps * self.move_duration))
             pause_before = max(0, (total_move_frames - anim_frames) // 2)
             pause_after = total_move_frames - anim_frames - pause_before
 
-            # Total frames for progress
             title_frames = int(fps * self.title_duration) if self.show_title else 0
             result_frames = int(fps * self.result_duration) if self.show_result else 0
             total_frames = (title_frames
                             + total_moves * total_move_frames
                             + result_frames)
+            if total_frames <= 0:
+                total_frames = 1
             frames_done = 0
 
-            # ── Setup video writer ─────────────────────────────
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             tmp_path = self.save_path.replace(".mp4", "_tmp.mp4")
             out = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
@@ -255,7 +255,6 @@ class ExportWorker(QObject):
                 self.error.emit("Failed to create video writer.")
                 return
 
-            # ── Setup renderers ────────────────────────────────
             board = chess.Board()
             renderer = BoardRenderer(board=board, theme=self.board_theme)
             video = VideoRenderer(renderer, w=w, h=h)
@@ -264,16 +263,15 @@ class ExportWorker(QObject):
             video.white_engine_info = self.white_engine_info
             video.black_engine_info = self.black_engine_info
 
-            # ── Pre-allocated numpy buffer for QImage conversion ─
             frame_buf = np.empty((h, w * 3), dtype=np.uint8)
 
-            # ── Pre-load sound data ────────────────────────────
+            # Audio setup
             audio_data = {}
             sr = 44100
             mix = None
             if self.sound_engine and self.sound_engine.enabled:
                 sr = self.sound_engine._sr
-                for event in [SND_MOVE, SND_CAPTURE, SND_CHECK, SND_CASTLE, 
+                for event in [SND_MOVE, SND_CAPTURE, SND_CHECK, SND_CASTLE,
                               SND_CHECKMATE, SND_STALEMATE, SND_DRAW, SND_GAME_START]:
                     fp = self.sound_engine.get_sound_path(event)
                     if fp and os.path.exists(fp):
@@ -284,17 +282,14 @@ class ExportWorker(QObject):
                                 audio_data[event] = np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32767.0
                         except Exception:
                             pass
-                
+
                 if audio_data:
-                    # Allocate audio buffer (add 2 seconds padding)
                     total_samples = int(sr * (total_frames / fps)) + sr * 2
                     mix = np.zeros(total_samples, dtype=np.float64)
-                    
-                    # Add game start sound
                     if SND_GAME_START in audio_data and title_frames > 0:
                         self._add_audio(mix, 0, audio_data[SND_GAME_START], sr, fps)
 
-            # ── Title screen (cached — render once) ────────────
+            # Title screen
             if self.show_title and title_frames > 0:
                 title_img = video.render_title_screen()
                 title_bgr = self._qimage_to_bgr_numpy(title_img, frame_buf)
@@ -306,7 +301,7 @@ class ExportWorker(QObject):
                         frames_done += 1
                     self.progress.emit(int(frames_done / total_frames * 100))
 
-            # ── Game frames ────────────────────────────────────
+            # Game frames
             move_list_text = []
 
             for i, move in enumerate(moves):
@@ -328,7 +323,6 @@ class ExportWorker(QObject):
                 video.eval_cp = eval_cp
                 video.eval_history = self.eval_history[:i + 1]
 
-                # ── Detect castling rook move ──────────────────
                 rook_move = None
                 piece = board.piece_at(move.from_square)
                 if (piece and piece.piece_type == chess.KING and
@@ -340,12 +334,11 @@ class ExportWorker(QObject):
                     else:
                         rook_move = (chess.square(0, rank), chess.square(3, rank))
 
-                # Check properties for sound before pushing
                 is_cap = board.is_capture(move)
                 is_castle = rook_move is not None
                 gives_check = board.gives_check(move)
 
-                # ── Pre-move pause frames (CACHE: render once) ─
+                # Pre-move pause
                 renderer.board = board
                 renderer.last_move = (moves[i - 1] if i > 0 else None)
                 renderer.move_quality = (self.move_qualities[i - 1]
@@ -365,15 +358,14 @@ class ExportWorker(QObject):
                             out.write(pause_bgr)
                             frames_done += 1
 
-                # ── Animation frames (BATCH render + convert) ──
+                # Animation frames
                 board.push(move)
 
-                # Add sound to mix
                 if mix is not None:
                     is_mate = board.is_checkmate()
                     is_stale = board.is_stalemate()
                     is_draw = board.is_game_over() and not is_mate and not is_stale
-                    
+
                     if is_mate:       snd_event = SND_CHECKMATE
                     elif is_stale:    snd_event = SND_STALEMATE
                     elif is_draw:     snd_event = SND_DRAW
@@ -381,7 +373,7 @@ class ExportWorker(QObject):
                     elif is_castle:   snd_event = SND_CASTLE
                     elif is_cap:      snd_event = SND_CAPTURE
                     else:             snd_event = SND_MOVE
-                    
+
                     if snd_event in audio_data:
                         self._add_audio(mix, frames_done, audio_data[snd_event], sr, fps)
 
@@ -391,7 +383,6 @@ class ExportWorker(QObject):
                 renderer.anim_move = move
                 renderer.anim_rook_move = rook_move
 
-                # Render all animation frames into a batch
                 anim_rgb_frames = []
                 for f_idx in range(anim_frames):
                     if self._stop:
@@ -404,13 +395,12 @@ class ExportWorker(QObject):
                         anim_rgb_frames.append(rgb)
                     frames_done += 1
 
-                # Batch convert RGB → BGR (uses CuPy if available)
                 if anim_rgb_frames:
                     anim_bgr_frames = rgb_to_bgr_batch(anim_rgb_frames)
                     for bgr in anim_bgr_frames:
                         out.write(bgr)
 
-                # ── Post-move settle frames (CACHE: render once) ─
+                # Post-move settle
                 renderer.anim_move = None
                 renderer.anim_rook_move = None
                 renderer.anim_progress = 1.0
@@ -432,12 +422,9 @@ class ExportWorker(QObject):
                             frames_done += 1
 
                 pct = int(frames_done / max(1, total_frames) * 100)
-                if pct % 5 == 0:
-                    logger.info("Export progress: %d%% (%d/%d moves)",
-                                pct, i + 1, total_moves)
                 self.progress.emit(min(95, pct))
 
-            # ── Result screen (cached) ─────────────────────────
+            # Result screen
             if self.show_result and result_frames > 0 and not self._stop:
                 result_img = video.render_result_screen()
                 result_bgr = self._qimage_to_bgr_numpy(result_img, frame_buf)
@@ -451,15 +438,16 @@ class ExportWorker(QObject):
             out.release()
             logger.info("Raw video written: %s", tmp_path)
 
-            # ── Export Audio to .wav ────────────────────────────
+            # Export Audio
             audio_tmp_path = None
             if mix is not None:
-                # Normalize and save
+                actual_samples = int(sr * (frames_done / fps)) + sr
+                mix = mix[:actual_samples]
                 max_val = np.max(np.abs(mix))
                 if max_val > 0:
-                    mix = mix / max(max_val * 1.1, 1.0) # 1.1 for headroom
+                    mix = mix / max(max_val * 1.1, 1.0)
                 mix_int16 = (mix * 32767).astype(np.int16)
-                
+
                 audio_tmp_path = tmp_path.replace(".mp4", "_audio.wav")
                 try:
                     with wave.open(audio_tmp_path, 'wb') as wf:
@@ -472,7 +460,7 @@ class ExportWorker(QObject):
                     logger.warning("Failed to write audio track: %s", e)
                     audio_tmp_path = None
 
-            # ── H.264 re-encode via ffmpeg ─────────────────────
+            # H.264 re-encode
             final_path = self._reencode_h264(tmp_path, self.save_path, audio_tmp_path)
             if final_path:
                 logger.info("Export complete: %s", final_path)
@@ -487,10 +475,11 @@ class ExportWorker(QObject):
                 else:
                     self.finished.emit("")
 
-                # Clean up audio if muxing failed
                 if audio_tmp_path and os.path.exists(audio_tmp_path):
-                    try: os.remove(audio_tmp_path)
-                    except: pass
+                    try:
+                        os.remove(audio_tmp_path)
+                    except OSError:
+                        pass
 
         except Exception as e:
             logger.exception("Export failed")
@@ -498,14 +487,15 @@ class ExportWorker(QObject):
 
     @staticmethod
     def _add_audio(mix, frame_idx, sound_arr, sr, fps):
-        """Add a sound array to the mix buffer at the given video frame index."""
-        if sound_arr is None: return
+        if sound_arr is None or len(mix) == 0:
+            return
         start_sample = int(sr * frame_idx / fps)
         end_sample = start_sample + len(sound_arr)
         if end_sample > len(mix):
             end_sample = len(mix)
             sound_arr = sound_arr[:end_sample - start_sample]
-        mix[start_sample:end_sample] += sound_arr
+        if start_sample < len(mix):
+            mix[start_sample:end_sample] += sound_arr
 
     @staticmethod
     def _detect_game_state(board):
@@ -526,7 +516,6 @@ class ExportWorker(QObject):
 
     @staticmethod
     def _reencode_h264(tmp_path, final_path, audio_path=None):
-        """Re-encode video to H.264 using ffmpeg for YouTube compatibility."""
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             logger.info("ffmpeg not found — skipping H.264 re-encode")
@@ -536,7 +525,7 @@ class ExportWorker(QObject):
             return None
 
         cmd = [ffmpeg, "-y", "-i", tmp_path]
-        
+
         if audio_path and os.path.exists(audio_path):
             cmd.extend(["-i", audio_path])
             cmd.extend([
@@ -550,9 +539,9 @@ class ExportWorker(QObject):
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-pix_fmt", "yuv420p",
             ])
-            
+
         cmd.extend(["-movflags", "+faststart", final_path])
-        
+
         logger.info("Re-encoding to H.264: %s", " ".join(cmd))
         try:
             result = subprocess.run(
@@ -586,10 +575,11 @@ class ExportWorker(QObject):
 
     @staticmethod
     def _qimage_to_bgr_numpy(qimg, buf=None):
-        """Convert QImage → BGR numpy array for cv2 (reuses buffer)."""
         from PySide6.QtGui import QImage
         img = qimg.convertToFormat(QImage.Format_RGB888)
         w, h = img.width(), img.height()
+        if w == 0 or h == 0:
+            return None
         bpl = img.bytesPerLine()
         ptr = img.bits()
 
@@ -615,10 +605,11 @@ class ExportWorker(QObject):
 
     @staticmethod
     def _qimage_to_rgb_numpy(qimg, buf=None):
-        """Convert QImage → RGB numpy array (for batch BGR conversion)."""
         from PySide6.QtGui import QImage
         img = qimg.convertToFormat(QImage.Format_RGB888)
         w, h = img.width(), img.height()
+        if w == 0 or h == 0:
+            return None
         bpl = img.bytesPerLine()
         ptr = img.bits()
 

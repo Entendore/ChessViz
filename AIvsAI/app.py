@@ -5,6 +5,7 @@ Lichess-style layout with player bars.
 Updated export tab with animation, title/result screen controls.
 Dynamic depth ranges and tooltips for each AI engine.
 Minimal color theme for settings.
+Dramatic, rare quality badges.
 """
 
 import sys
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QSpinBox, QDoubleSpinBox,
     QGroupBox, QComboBox, QFormLayout, QTabWidget,
     QFileDialog, QSlider, QCheckBox, QFrame,
-    QLineEdit, QScrollArea, QSizePolicy,
+    QLineEdit, QScrollArea, QSizePolicy, QMessageBox,
 )
 from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QPalette, QColor
@@ -28,8 +29,11 @@ from constants import (
     AI_MAP, AI_SHORT_NAMES, RESOLUTION_LIST, RESOLUTION_SIZES, THEMES,
     SOUND_THEME_LIST, GAME_NORMAL, GAME_CHECKMATE, GAME_STALEMATE,
     GAME_DRAW, GAME_INSUFFICIENT, SND_GAME_START, DEFAULT_OUTPUT_DIR,
-    find_stockfish, MQ_GOOD, MQ_SYMBOLS, MQ_LABELS, MQ_COLORS,
-    MQ_ICONS, DEFAULT_VIDEO_FPS, DEFAULT_MOVE_DURATION,
+    find_stockfish, MQ_GOOD, MQ_BEST, MQ_GREAT, MQ_MISTAKE,
+    MQ_INACCURACY, MQ_BOOK, MQ_BRILLIANT, MQ_BLUNDER,
+    MQ_SYMBOLS, MQ_LABELS, MQ_COLORS,
+    MQ_ICONS, MQ_SHOW_BADGE, MQ_SHOW_MOVES_BADGE,
+    DEFAULT_VIDEO_FPS, DEFAULT_MOVE_DURATION,
     DEFAULT_ANIM_DURATION, DEFAULT_TITLE_DURATION,
     DEFAULT_RESULT_DURATION,
 )
@@ -221,12 +225,13 @@ class MainWindow(QMainWindow):
 
     # ── Dynamic Depth / Tooltip Logic ─────────────────────────
     def _on_engine_changed(self, combo, spin):
-        """Update depth spinbox range, default, and tooltip based on engine."""
         engine_type = combo.currentData()
-        
+
         if engine_type == 0:  # Minimax
             spin.setRange(1, 8)
-            spin.setValue(4)
+            spin.setValue(min(max(spin.value(), 1), 8))
+            if spin.value() < 3:
+                spin.setValue(4)
             spin.setToolTip(
                 "Minimax Search Depth (half-moves ahead)\n\n"
                 "• 1-3: Fast, beginner play\n"
@@ -235,7 +240,9 @@ class MainWindow(QMainWindow):
             )
         elif engine_type == 1:  # MCTS
             spin.setRange(1, 50)
-            spin.setValue(15)
+            spin.setValue(min(max(spin.value(), 1), 50))
+            if spin.value() < 5:
+                spin.setValue(15)
             spin.setToolTip(
                 "MCTS Simulations (value × 100)\n\n"
                 "• 5-10: Fast, weak play (500-1000 sims)\n"
@@ -244,14 +251,16 @@ class MainWindow(QMainWindow):
             )
         elif engine_type == 2:  # Stockfish
             spin.setRange(1, 30)
-            spin.setValue(18)
+            spin.setValue(min(max(spin.value(), 1), 30))
+            if spin.value() < 5:
+                spin.setValue(18)
             spin.setToolTip(
                 "Stockfish Search Depth (plies)\n\n"
                 "• 1-8: Fast, beginner play\n"
                 "• 10-15: Advanced play\n"
                 "• 18+: Master level, very fast (C++ engine)"
             )
-        
+
         self._update_player_labels()
 
     # ── UI ────────────────────────────────────────────────────
@@ -335,12 +344,14 @@ class MainWindow(QMainWindow):
         bf.addRow("Depth", self.black_depth_spin)
         gl.addWidget(bg)
 
-        # Connect UI updates (Dynamic depth adjustment)
+        # FIX: Use lambda default args to avoid late-binding closures
         self.white_ai_combo.currentIndexChanged.connect(
-            lambda: self._on_engine_changed(self.white_ai_combo, self.white_depth_spin)
+            lambda _idx, c=self.white_ai_combo, s=self.white_depth_spin:
+                self._on_engine_changed(c, s)
         )
         self.black_ai_combo.currentIndexChanged.connect(
-            lambda: self._on_engine_changed(self.black_ai_combo, self.black_depth_spin)
+            lambda _idx, c=self.black_ai_combo, s=self.black_depth_spin:
+                self._on_engine_changed(c, s)
         )
         self.white_depth_spin.valueChanged.connect(self._update_player_labels)
         self.black_depth_spin.valueChanged.connect(self._update_player_labels)
@@ -548,10 +559,6 @@ class MainWindow(QMainWindow):
         self.fps_spin.setRange(1, 60)
         self.fps_spin.setValue(DEFAULT_VIDEO_FPS)
         self.fps_spin.setSuffix(" fps")
-        self.fps_spin.setToolTip(
-            "Frames per second for the output video.\n"
-            "30 fps is recommended for smooth YouTube playback."
-        )
         ef.addRow("Resolution", self.resolution_combo)
         ef.addRow("Frame rate", self.fps_spin)
         el.addWidget(eg)
@@ -568,10 +575,6 @@ class MainWindow(QMainWindow):
         self.move_duration_spin.setSuffix(" s")
         self.move_duration_spin.setSingleStep(0.5)
         self.move_duration_spin.setDecimals(1)
-        self.move_duration_spin.setToolTip(
-            "Total seconds to spend showing each move in the video\n"
-            "(includes animation time + pause time)"
-        )
         tf.addRow("Per move", self.move_duration_spin)
 
         self.anim_duration_spin = QDoubleSpinBox()
@@ -580,9 +583,6 @@ class MainWindow(QMainWindow):
         self.anim_duration_spin.setSuffix(" s")
         self.anim_duration_spin.setSingleStep(0.1)
         self.anim_duration_spin.setDecimals(1)
-        self.anim_duration_spin.setToolTip(
-            "Seconds spent animating the piece sliding to its new square"
-        )
         tf.addRow("Animation", self.anim_duration_spin)
 
         self.title_duration_spin = QDoubleSpinBox()
@@ -591,9 +591,6 @@ class MainWindow(QMainWindow):
         self.title_duration_spin.setSuffix(" s")
         self.title_duration_spin.setSingleStep(0.5)
         self.title_duration_spin.setDecimals(1)
-        self.title_duration_spin.setToolTip(
-            "Seconds to show the VS title screen at the start of the video"
-        )
         tf.addRow("Title card", self.title_duration_spin)
 
         self.result_duration_spin = QDoubleSpinBox()
@@ -602,9 +599,6 @@ class MainWindow(QMainWindow):
         self.result_duration_spin.setSuffix(" s")
         self.result_duration_spin.setSingleStep(0.5)
         self.result_duration_spin.setDecimals(1)
-        self.result_duration_spin.setToolTip(
-            "Seconds to show the game result overlay at the end of the video"
-        )
         tf.addRow("Result card", self.result_duration_spin)
         el.addWidget(tg)
 
@@ -625,7 +619,7 @@ class MainWindow(QMainWindow):
         # Estimated duration
         self.estimate_label = QLabel("")
         self.estimate_label.setStyleSheet(
-            f"color:#5b8fd4; font-size:11px; font-weight:600; padding:4px;"
+            "color:#5b8fd4; font-size:11px; font-weight:600; padding:4px;"
         )
         self._update_export_estimate()
         self.move_duration_spin.valueChanged.connect(self._update_export_estimate)
@@ -671,11 +665,10 @@ class MainWindow(QMainWindow):
         # Initialize ranges/tooltips on startup
         self._on_engine_changed(self.white_ai_combo, self.white_depth_spin)
         self._on_engine_changed(self.black_ai_combo, self.black_depth_spin)
-        
+
         self._update_player_labels()
 
     def _update_export_estimate(self):
-        """Show estimated video duration based on current settings."""
         n = len(self._move_list)
         move_dur = self.move_duration_spin.value()
         title_dur = self.title_duration_spin.value() if self.show_title_check.isChecked() else 0
@@ -738,6 +731,18 @@ class MainWindow(QMainWindow):
     def _start_game(self):
         if self._game_thread and self._game_thread.isRunning():
             return
+
+        # Validate Stockfish selection
+        w_type = self.white_ai_combo.currentData()
+        b_type = self.black_ai_combo.currentData()
+        if (w_type == 2 or b_type == 2) and not self._stockfish_path:
+            QMessageBox.warning(
+                self, "Stockfish Not Found",
+                "Stockfish is selected but the path is not configured.\n"
+                "Please browse to the Stockfish executable in Settings."
+            )
+            return
+
         self._reset_game()
         self.status_label.setText("Game running…")
         self.start_btn.setEnabled(False)
@@ -803,6 +808,7 @@ class MainWindow(QMainWindow):
         self.eval_bar.set_eval(0.0)
         self.eval_bar.reset_game_state()
         self.quality_label.setText("")
+        self.quality_label.setStyleSheet("")
         self.status_label.setText("Ready")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -827,6 +833,7 @@ class MainWindow(QMainWindow):
         self._move_list.append(san)
 
         self.board_widget.animate_move(move)
+        # FIX: Use a copied reference to avoid late-binding issues
         QTimer.singleShot(
             350,
             lambda b=self._board.copy(), m=move: self.board_widget.set_board(b, m),
@@ -841,16 +848,50 @@ class MainWindow(QMainWindow):
 
         self.sound_engine.play_move_sound(prev_board, move)
 
-        # Quality label
+        # ── Dramatic quality label ────────────────────────────
         icon = MQ_ICONS.get(quality, "")
         lbl = MQ_LABELS.get(quality, "")
         color = MQ_COLORS.get(quality, QColor(150, 150, 150)).name()
-        quality_txt = f"{icon} {lbl}" if icon else lbl
 
-        self.quality_label.setText(f"Last move: {san}  ·  {quality_txt}")
-        self.quality_label.setStyleSheet(
-            f"font-size:13px;font-weight:bold;padding:4px;color:{color};"
-        )
+        if quality in MQ_SHOW_BADGE:
+            # Brilliant or Blunder — dramatic display
+            quality_txt = f"{icon}  {lbl}" if icon else lbl
+            self.quality_label.setText(f"  {quality_txt}  ")
+            self.quality_label.setStyleSheet(
+                f"font-size:15px; font-weight:bold; padding:6px 12px; "
+                f"color:white; background-color:{color}; "
+                f"border-radius:6px; border:2px solid rgba(255,255,255,60);"
+            )
+        elif quality == MQ_MISTAKE:
+            quality_txt = f"{icon}  {lbl}" if icon else lbl
+            self.quality_label.setText(f"  {quality_txt}  ")
+            self.quality_label.setStyleSheet(
+                f"font-size:13px; font-weight:bold; padding:4px 10px; "
+                f"color:{color}; "
+                f"background-color:rgba(230,140,30,30); "
+                f"border-radius:4px; border:1px solid {color};"
+            )
+        elif quality == MQ_GREAT:
+            quality_txt = f"{icon}  {lbl}" if icon else lbl
+            self.quality_label.setText(f"  {quality_txt}  ")
+            self.quality_label.setStyleSheet(
+                f"font-size:13px; font-weight:bold; padding:4px 10px; "
+                f"color:{color}; "
+                f"background-color:rgba(50,170,80,25); "
+                f"border-radius:4px; border:1px solid {color};"
+            )
+        else:
+            # Good/Best/Inaccuracy/Book
+            if quality == MQ_INACCURACY:
+                quality_txt = f"{icon}  {lbl}" if icon else lbl
+                self.quality_label.setText(quality_txt)
+                self.quality_label.setStyleSheet(
+                    f"font-size:11px; font-weight:600; padding:4px; "
+                    f"color:{color};"
+                )
+            else:
+                self.quality_label.setText("")
+                self.quality_label.setStyleSheet("")
 
         # Status
         eval_str = (
@@ -872,6 +913,8 @@ class MainWindow(QMainWindow):
     def _on_error(self, msg):
         logger.error("Error: %s", msg)
         self.status_label.setText(f"Error: {msg}")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
     def _on_game_finished(self):
         if self._game_thread:
@@ -956,6 +999,7 @@ class MainWindow(QMainWindow):
         if self._export_thread:
             self._export_thread.quit()
             self._export_thread.wait()
+        self._export_worker = None
         if path:
             self.status_label.setText(f"✓ Export complete: {path}")
             logger.info("Export complete: %s", path)

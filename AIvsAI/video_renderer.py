@@ -61,7 +61,6 @@ class VideoRenderer:
         else:
             self._render_landscape(p)
         for ov in self.overlays:
-            
             if os.path.exists(ov["path"]):
                 oi = QImage(ov["path"])
                 if not oi.isNull():
@@ -71,7 +70,6 @@ class VideoRenderer:
 
     # ── Title Screen ──────────────────────────────────────────
     def render_title_screen(self):
-        """Render a title/intro card for the video."""
         img = QImage(self.w, self.h, QImage.Format_ARGB32)
         bg = QLinearGradient(0, 0, 0, self.h)
         bg.setColorAt(0.0, QColor(26, 26, 30))
@@ -82,14 +80,11 @@ class VideoRenderer:
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
         p.fillRect(QRectF(0, 0, self.w, self.h), bg)
-
         cx, cy = self.w / 2, self.h / 2
-
         if self.h > self.w:
             self._render_title_portrait(p, cx, cy)
         else:
             self._render_title_landscape(p, cx, cy)
-
         p.end()
         return img
 
@@ -107,17 +102,16 @@ class VideoRenderer:
         p.drawImage(QRectF(bx, by, bsz, bsz), bimg)
         p.setOpacity(1.0)
 
-        card_w = min(340, (self.w - bsz) / 2 - 60)
+        card_w = min(340, max(120, (self.w - bsz) / 2 - 60))
         card_h = 120
-        left_cx = (bx - card_w) / 2
+        left_cx = max(10, (bx - card_w) / 2)
         self._draw_player_card(p, left_cx, cy - card_h / 2, card_w, card_h,
                                self.white_name, self.white_engine_info, True)
 
-        right_cx = bx + bsz + (self.w - bx - bsz - card_w) / 2
+        right_cx = min(self.w - card_w - 10, bx + bsz + (self.w - bx - bsz - card_w) / 2)
         self._draw_player_card(p, right_cx, cy - card_h / 2, card_w, card_h,
                                self.black_name, self.black_engine_info, False)
 
-        # VS emblem
         vs_r = 48
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 80))
@@ -157,11 +151,9 @@ class VideoRenderer:
 
         card_w = min(300, self.w - 60)
         card_h = 80
-
         self._draw_player_card(p, (self.w - card_w) / 2, by - card_h - 30,
                                card_w, card_h,
                                self.white_name, self.white_engine_info, True)
-
         self._draw_player_card(p, (self.w - card_w) / 2, by + bsz + 30,
                                card_w, card_h,
                                self.black_name, self.black_engine_info, False)
@@ -204,14 +196,16 @@ class VideoRenderer:
         p.drawText(QRectF(icon_x, icon_y, icon_r * 2, icon_r * 2),
                    Qt.AlignCenter, sym)
 
+        text_x = icon_x + icon_r * 2 + 14
+        text_w = max(40, w - 100)
         p.setPen(QColor(225, 225, 230))
         p.setFont(QFont("Inter", 14, QFont.Bold))
-        p.drawText(QRectF(icon_x + icon_r * 2 + 14, y + 8, w - 100, h / 2),
+        p.drawText(QRectF(text_x, y + 8, text_w, h / 2),
                    Qt.AlignVCenter | Qt.AlignLeft, name)
 
         p.setPen(QColor(140, 140, 160))
         p.setFont(QFont("Inter", 10))
-        p.drawText(QRectF(icon_x + icon_r * 2 + 14, y + h / 2 - 4, w - 100, h / 2),
+        p.drawText(QRectF(text_x, y + h / 2 - 4, text_w, h / 2),
                    Qt.AlignVCenter | Qt.AlignLeft, engine_info)
 
     # ── Result Screen ─────────────────────────────────────────
@@ -227,15 +221,15 @@ class VideoRenderer:
 
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 80))
-        p.drawRoundedRect(QRectF(cx - card_w/2 + 4, cy - card_h/2 + 4,
+        p.drawRoundedRect(QRectF(cx - card_w / 2 + 4, cy - card_h / 2 + 4,
                                  card_w, card_h), 16, 16)
 
-        card_bg = QLinearGradient(cx, cy - card_h/2, cx, cy + card_h/2)
+        card_bg = QLinearGradient(cx, cy - card_h / 2, cx, cy + card_h / 2)
         card_bg.setColorAt(0.0, QColor(38, 38, 44))
         card_bg.setColorAt(1.0, QColor(30, 30, 36))
         p.setBrush(card_bg)
         p.setPen(QPen(QColor(70, 70, 80), 1.5))
-        p.drawRoundedRect(QRectF(cx - card_w/2, cy - card_h/2,
+        p.drawRoundedRect(QRectF(cx - card_w / 2, cy - card_h / 2,
                                  card_w, card_h), 16, 16)
 
         if self.game_state == GAME_CHECKMATE:
@@ -253,7 +247,7 @@ class VideoRenderer:
         p.setBrush(accent)
         path = QPainterPath()
         r = 16
-        bx1, by1 = cx - card_w/2, cy - card_h/2
+        bx1, by1 = cx - card_w / 2, cy - card_h / 2
         path.moveTo(bx1 + r, by1)
         path.lineTo(bx1 + card_w - r, by1)
         path.quadTo(bx1 + card_w, by1, bx1 + card_w, by1 + r)
@@ -266,25 +260,25 @@ class VideoRenderer:
 
         p.setFont(QFont("Inter", 28, QFont.Bold))
         p.setPen(accent)
-        p.drawText(QRectF(cx - card_w/2, cy - card_h/2 + bar_h + 20,
+        p.drawText(QRectF(cx - card_w / 2, cy - card_h / 2 + bar_h + 20,
                           card_w, 50), Qt.AlignHCenter | Qt.AlignTop, result_txt)
 
         p.setFont(QFont("Inter", 42, QFont.Bold))
         p.setPen(QColor(240, 240, 245))
-        p.drawText(QRectF(cx - card_w/2, cy - card_h/2 + bar_h + 65,
+        p.drawText(QRectF(cx - card_w / 2, cy - card_h / 2 + bar_h + 65,
                           card_w, 70), Qt.AlignHCenter | Qt.AlignTop, score_txt)
 
         if self.game_detail:
             p.setFont(QFont("Inter", 12))
             p.setPen(QColor(140, 140, 160))
-            p.drawText(QRectF(cx - card_w/2, cy - card_h/2 + bar_h + 135,
+            p.drawText(QRectF(cx - card_w / 2, cy - card_h / 2 + bar_h + 135,
                               card_w, 30), Qt.AlignHCenter | Qt.AlignTop,
                        self.game_detail)
 
         n = len(self.move_list_text)
         p.setFont(QFont("Inter", 10))
         p.setPen(QColor(100, 100, 120))
-        p.drawText(QRectF(cx - card_w/2, cy - card_h/2 + card_h - 40,
+        p.drawText(QRectF(cx - card_w / 2, cy - card_h / 2 + card_h - 40,
                           card_w, 24), Qt.AlignHCenter | Qt.AlignTop,
                    f"{n} moves played")
 
@@ -316,14 +310,15 @@ class VideoRenderer:
         p.drawText(QRectF(icon_x, icon_y, icon_r * 2, icon_r * 2),
                    Qt.AlignCenter, sym)
 
+        name_w = max(40, w - 130)
         p.setPen(QColor(220, 220, 225))
         p.setFont(QFont("Inter", 12, QFont.Bold))
-        p.drawText(QRectF(icon_x + icon_r * 2 + 10, y, w - 130, h / 2 + 4),
+        p.drawText(QRectF(icon_x + icon_r * 2 + 10, y, name_w, h / 2 + 4),
                    Qt.AlignVCenter | Qt.AlignLeft, name)
 
         p.setPen(QColor(140, 140, 155))
         p.setFont(QFont("Inter", 9))
-        p.drawText(QRectF(icon_x + icon_r * 2 + 10, y + h / 2 - 4, w - 130, h / 2 + 4),
+        p.drawText(QRectF(icon_x + icon_r * 2 + 10, y + h / 2 - 4, name_w, h / 2 + 4),
                    Qt.AlignVCenter | Qt.AlignLeft, engine_info)
 
         if abs(eval_cp) > 9000:
@@ -374,8 +369,10 @@ class VideoRenderer:
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 45))
         p.drawRoundedRect(epill.adjusted(1, 1, 1, 1), 10, 10)
-        p.setBrush(epbg); p.drawRoundedRect(epill, 10, 10)
-        p.setPen(epfg); p.drawText(epill, Qt.AlignCenter, txt)
+        p.setBrush(epbg)
+        p.drawRoundedRect(epill, 10, 10)
+        p.setPen(epfg)
+        p.drawText(epill, Qt.AlignCenter, txt)
 
     def _draw_gameover_pill_h(self, p, ebx, eby, ebw, ebh):
         pill_w, pill_h = max(50, ebh + 30), 24
@@ -393,8 +390,10 @@ class VideoRenderer:
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 80))
         p.drawRoundedRect(pill.adjusted(1, 2, 1, 2), 11, 11)
-        p.setBrush(pbg); p.drawRoundedRect(pill, 11, 11)
-        p.setPen(pfg); p.drawText(pill, Qt.AlignCenter, txt)
+        p.setBrush(pbg)
+        p.drawRoundedRect(pill, 11, 11)
+        p.setPen(pfg)
+        p.drawText(pill, Qt.AlignCenter, txt)
 
     # ── Portrait ──────────────────────────────────────────────
     def _render_portrait(self, p):
@@ -412,14 +411,19 @@ class VideoRenderer:
         p.drawText(QRectF(bx, wy, bsz, 35),
                    Qt.AlignLeft | Qt.AlignVCenter, f"♔ {self.white_name}")
 
-        ebx = bx; eby = wy + 45; ebh = 32; ebw = bsz; cr = 5
+        ebx = bx
+        eby = wy + 45
+        ebh = 32
+        ebw = bsz
+        cr = 5
         p.setPen(QPen(QColor(50, 50, 58), 1.0))
         p.setBrush(QColor(16, 16, 20))
         p.drawRoundedRect(QRectF(ebx - 2, eby - 2, ebw + 4, ebh + 4), cr + 2, cr + 2)
         blk = QLinearGradient(ebx, eby, ebx + ebw, eby)
         blk.setColorAt(0.0, QColor(38, 38, 45))
         blk.setColorAt(1.0, QColor(58, 58, 66))
-        p.setPen(Qt.NoPen); p.setBrush(blk)
+        p.setPen(Qt.NoPen)
+        p.setBrush(blk)
         p.drawRoundedRect(QRectF(ebx, eby, ebw, ebh), cr, cr)
 
         ratio = self._cp2r(self.eval_cp)
@@ -435,12 +439,14 @@ class VideoRenderer:
             elif ww < cr * 2:
                 path.addRoundedRect(QRectF(ebx, eby, ww, ebh), cr, cr)
             else:
-                path.moveTo(ebx + cr, eby); path.lineTo(ebx + ww, eby)
+                path.moveTo(ebx + cr, eby)
+                path.lineTo(ebx + ww, eby)
                 path.lineTo(ebx + ww, eby + ebh)
                 path.lineTo(ebx + cr, eby + ebh)
                 path.quadTo(ebx, eby + ebh, ebx, eby + ebh - cr)
                 path.lineTo(ebx, eby + cr)
-                path.quadTo(ebx, eby, ebx + cr, eby); path.closeSubpath()
+                path.quadTo(ebx, eby, ebx + cr, eby)
+                path.closeSubpath()
             p.drawPath(path)
 
         xdy = ebx + ww
@@ -471,10 +477,12 @@ class VideoRenderer:
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 80))
             p.drawRoundedRect(pill.adjusted(1, 2, 1, 2), 11, 11)
-            p.setBrush(pbg); p.drawRoundedRect(pill, 11, 11)
+            p.setBrush(pbg)
+            p.drawRoundedRect(pill, 11, 11)
             p.setPen(QPen(QColor(255, 255, 255, 35), 0.8))
             p.drawRoundedRect(pill, 11, 11)
-            p.setPen(pfg); p.drawText(pill, Qt.AlignCenter, txt)
+            p.setPen(pfg)
+            p.drawText(pill, Qt.AlignCenter, txt)
         else:
             self._draw_gameover_pill_h(p, ebx, eby, ebw, ebh)
 
@@ -499,7 +507,6 @@ class VideoRenderer:
         ratio = self._cp2r(self.eval_cp)
         wh = max(0, min(bsz, int(bsz * ratio)))
 
-        # Eval bar background
         p.setPen(QPen(QColor(50, 50, 58), 1.0))
         p.setBrush(QColor(16, 16, 20))
         p.drawRoundedRect(QRectF(ebx - 2, by - 2, ebw + 4, bsz + 4), 7, 7)
@@ -507,7 +514,8 @@ class VideoRenderer:
         blk.setColorAt(0.0, QColor(58, 58, 66))
         blk.setColorAt(0.5, QColor(44, 44, 52))
         blk.setColorAt(1.0, QColor(38, 38, 45))
-        p.setPen(Qt.NoPen); p.setBrush(blk)
+        p.setPen(Qt.NoPen)
+        p.setBrush(blk)
         p.drawRoundedRect(QRectF(ebx, by, ebw, bsz), 5, 5)
 
         if wh > 0:
@@ -523,12 +531,14 @@ class VideoRenderer:
                 p.drawRoundedRect(QRectF(ebx, wt, ebw, wh), 5, 5)
             else:
                 path = QPainterPath()
-                path.moveTo(ebx, wt); path.lineTo(ebx + ebw, wt)
+                path.moveTo(ebx, wt)
+                path.lineTo(ebx + ebw, wt)
                 path.lineTo(ebx + ebw, by + bsz - 5)
                 path.quadTo(ebx + ebw, by + bsz, ebx + ebw - 5, by + bsz)
                 path.lineTo(ebx + 5, by + bsz)
                 path.quadTo(ebx, by + bsz, ebx, by + bsz - 5)
-                path.lineTo(ebx, wt); path.closeSubpath()
+                path.lineTo(ebx, wt)
+                path.closeSubpath()
                 p.drawPath(path)
 
         p.setPen(QPen(QColor(115, 175, 250, 60), 1, Qt.DashLine))
@@ -562,13 +572,17 @@ class VideoRenderer:
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 45))
             p.drawRoundedRect(epill.adjusted(1, 1, 1, 1), 10, 10)
-            p.setBrush(epbg); p.drawRoundedRect(epill, 10, 10)
-            p.setPen(epfg); p.drawText(epill, Qt.AlignCenter, txt)
+            p.setBrush(epbg)
+            p.drawRoundedRect(epill, 10, 10)
+            p.setPen(epfg)
+            p.drawText(epill, Qt.AlignCenter, txt)
         else:
             self._draw_gameover_pill_v(p, ebx, by, ebw, bsz)
 
         # Board
         bx_board = ebx + ebw + margin
+        if bx_board + bsz > self.w:
+            bsz = max(100, self.w - bx_board - margin)
         bimg = self.board_renderer.render(bsz)
         p.drawImage(QRectF(bx_board, by, bsz, bsz), bimg)
 
@@ -580,13 +594,11 @@ class VideoRenderer:
             bar_h = 52
             gap = 8
 
-            # Black Player Bar (Top)
             black_eval = -self.eval_cp
             self._draw_player_bar_v(p, mx, by, mw, bar_h,
                                     self.black_name, self.black_engine_info,
                                     black_eval, False)
 
-            # Move List (Middle - full available height)
             ml_y = by + bar_h + gap
             ml_h = bsz - 2 * (bar_h + gap)
             ml_h = max(60, ml_h)
@@ -595,7 +607,6 @@ class VideoRenderer:
                                  self.move_list_text, self.current_move_index,
                                  self.move_qualities)
 
-            # White Player Bar (Bottom)
             white_y = by + bsz - bar_h
             white_eval = self.eval_cp
             self._draw_player_bar_v(p, mx, white_y, mw, bar_h,
@@ -610,6 +621,8 @@ class VideoRenderer:
         if landscape:
             banner_h = int(self.h * 0.06)
             banner_y = by + bsz + 10
+            if banner_y + banner_h > self.h:
+                banner_y = by + bsz - banner_h - 5
         else:
             banner_h = int(bsz * 0.08)
             banner_y = by + bsz - banner_h - 30

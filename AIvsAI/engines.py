@@ -1,7 +1,402 @@
-"""Chess engine — board state, move generation, validation, and FEN handling."""
+"""Chess engines — Minimax (α-β), MCTS, and Stockfish UCI wrapper.
 
-from constants import log, PIECE_VAL, PST, FILES_STR, RANKS_STR
+All engines operate on python-chess Board objects for consistency.
+"""
 
+import random
+import time
+import logging
+import subprocess
+import threading
+from typing import Optional
+
+import chess
+
+from constants import PIECE_VAL, PST, FILES_STR, RANKS_STR, log
+
+logger = logging.getLogger("AIvsAI2MP4")
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Minimax with Alpha-Beta Pruning
+# ════════════════════════════════════════════════════════════════════
+
+class MinimaxEngine:
+    """Minimax engine using python-chess for move generation."""
+
+    def __init__(self):
+        self._nodes = 0
+
+    def search(self, board: chess.Board, depth: int):
+        """
+        Returns (chess.Move, eval_cp, nodes_searched, policy_dict).
+        eval_cp is from White's POV.
+        """
+        self._nodes = 0
+        is_white = board.turn == chess.WHITE
+
+        best_move = None
+        best_score = float('-inf')
+        alpha = float('-inf')
+        beta = float('inf')
+        policy = {}
+
+        moves = list(board.legal_moves)
+        moves.sort(key=lambda m: (
+            0 if board.is_capture(m) else (1 if board.gives_check(m) else 2)
+        ))
+
+        for move in moves:
+            board.push(move)
+            score = -self._alphabeta(board, depth - 1, -beta, -alpha,
+                                     not is_white)
+            board.pop()
+            self._nodes += 1
+
+            policy[move.uci()] = score
+            if score > best_score:
+                best_score = score
+                best_move = move
+            alpha = max(alpha, score)
+
+        eval_cp = best_score if is_white else -best_score
+        return best_move, eval_cp, self._nodes, policy
+
+    def _alphabeta(self, board, depth, alpha, beta, maximizing):
+        if depth == 0 or board.is_game_over():
+            if depth == 0 and not board.is_game_over():
+                return self._quiesce(board, alpha, beta, 3)
+            return self._evaluate(board)
+
+        self._nodes += 1
+        moves = list(board.legal_moves)
+        moves.sort(key=lambda m: (
+            0 if board.is_capture(m) else (1 if board.gives_check(m) else 2)
+        ))
+
+        if maximizing:
+            value = float('-inf')
+            for move in moves:
+                board.push(move)
+                value = max(value, self._alphabeta(board, depth - 1, alpha, beta, False))
+                board.pop()
+                alpha = max(alpha, value)
+                if alpha >= beta:
+                    break
+            return value
+        else:
+            value = float('inf')
+            for move in moves:
+                board.push(move)
+                value = min(value, self._alphabeta(board, depth - 1, alpha, beta, True))
+                board.pop()
+                beta = min(beta, value)
+                if alpha >= beta:
+                    break
+            return value
+
+    def _quiesce(self, board, alpha, beta, depth_left):
+        """Quiescence search — only examine captures."""
+        self._nodes += 1
+        stand_pat = self._evaluate(board)
+
+        if depth_left == 0:
+            return stand_pat
+
+        if stand_pat >= beta:
+            return beta
+        alpha = max(alpha, stand_pat)
+
+        for move in board.legal_moves:
+            if not board.is_capture(move):
+                continue
+            board.push(move)
+            score = -self._quiesce(board, -beta, -alpha, depth_left - 1)
+            board.pop()
+            if score >= beta:
+                return beta
+            alpha = max(alpha, score)
+        return alpha
+
+    def _evaluate(self, board: chess.Board) -> int:
+        """Static evaluation in centipawns from the side-to-move's POV."""
+        if board.is_checkmate():
+            return -30000
+        if board.is_stalemate() or board.is_insufficient_material():
+            return 0
+
+        score = 0
+        for sq in chess.SQUARES:
+            piece = board.piece_at(sq)
+            if piece is None:
+                continue
+            pt = piece.symbol().upper()
+            val = PIECE_VAL.get(pt, 0)
+            pst = PST.get(pt)
+            if piece.color == chess.WHITE:
+                rank = chess.square_rank(sq)
+                file_ = chess.square_file(sq)
+                score += val + (pst[7 - rank][file_] if pst else 0)
+            else:
+                rank = chess.square_rank(sq)
+                file_ = chess.square_file(sq)
+                score -= val + (pst[rank][file_] if pst else 0)
+
+        mobility = board.legal_moves.count()
+        mob_bonus = 5 * mobility
+        if board.turn == chess.WHITE:
+            score += mob_bonus
+        else:
+            score -= mob_bonus
+
+        return score if board.turn == chess.WHITE else -score
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Monte Carlo Tree Search
+# ════════════════════════════════════════════════════════════════════
+
+class _MCTSNode:
+    __slots__ = ('board', 'move', 'parent', 'children',
+                 'visits', 'wins', 'untried_moves')
+
+    def __init__(self, board, move=None, parent=None):
+        self.board = board
+        self.move = move
+        self.parent = parent
+        self.children = []
+        self.visits = 0
+        self.wins = 0.0
+        self.untried_moves = list(board.legal_moves)
+        random.shuffle(self.untried_moves)
+
+    def ucb1(self, c=1.414):
+        if self.visits == 0:
+            return float('inf')
+        return (self.wins / self.visits +
+                c * (2.0 * (self.parent.visits + 1) / (self.visits + 1)) ** 0.5)
+
+    def best_child(self):
+        return max(self.children, key=lambda ch: ch.ucb1())
+
+    def expand(self):
+        move = self.untried_moves.pop()
+        next_board = self.board.copy()
+        next_board.push(move)
+        child = _MCTSNode(next_board, move=move, parent=self)
+        self.children.append(child)
+        return child
+
+    def is_fully_expanded(self):
+        return len(self.untried_moves) == 0
+
+    def is_terminal(self):
+        return self.board.is_game_over()
+
+
+class MCTSEngine:
+    """MCTS engine using python-chess Board."""
+
+    def __init__(self):
+        self._nodes = 0
+
+    def search(self, board: chess.Board, iterations: int):
+        """
+        Returns (chess.Move, eval_cp, nodes_visited, policy_dict).
+        eval_cp is from White's POV.
+        """
+        self._nodes = 0
+        root = _MCTSNode(board.copy())
+
+        if not list(board.legal_moves):
+            return None, 0.0, 0, {}
+
+        for _ in range(iterations):
+            node = root
+            while not node.is_terminal() and node.is_fully_expanded():
+                node = node.best_child()
+            if not node.is_terminal() and not node.is_fully_expanded():
+                node = node.expand()
+            self._nodes += 1
+            result = self._rollout(node.board.copy())
+            while node is not None:
+                node.visits += 1
+                if node.board.turn == chess.WHITE:
+                    node.wins += (1.0 - result)
+                else:
+                    node.wins += result
+                node = node.parent
+
+        if not root.children:
+            return None, 0.0, self._nodes, {}
+
+        best = max(root.children, key=lambda ch: ch.visits)
+        policy = {ch.move.uci(): ch.visits / max(1, root.visits) for ch in root.children}
+
+        wr = best.wins / max(1, best.visits)
+        eval_cp = (wr - 0.5) * 600
+        if board.turn == chess.BLACK:
+            eval_cp = -eval_cp
+
+        return best.move, eval_cp, self._nodes, policy
+
+    def _rollout(self, board: chess.Board, max_moves: int = 80) -> float:
+        """Random playout; returns 1.0 if White wins, 0.0 if Black wins, 0.5 draw."""
+        for _ in range(max_moves):
+            if board.is_game_over():
+                break
+            moves = list(board.legal_moves)
+            captures = [m for m in moves if board.is_capture(m)]
+            if captures and random.random() < 0.3:
+                move = random.choice(captures)
+            else:
+                move = random.choice(moves)
+            board.push(move)
+
+        if board.is_checkmate():
+            return 1.0 if board.turn == chess.BLACK else 0.0
+        return 0.5
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Stockfish UCI Wrapper
+# ════════════════════════════════════════════════════════════════════
+
+class SyncUCI:
+    """Synchronous UCI protocol wrapper for Stockfish."""
+
+    def __init__(self, path: str, timeout: int = 30):
+        self._path = path
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        try:
+            self._proc = subprocess.Popen(
+                [path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+            self._uci_init()
+        except Exception as e:
+            logger.error("Failed to start Stockfish: %s", e)
+            raise
+
+    def _send(self, cmd: str):
+        self._proc.stdin.write((cmd + "\n").encode())
+        self._proc.stdin.flush()
+
+    def _read_line(self) -> str:
+        return self._proc.stdout.readline().decode().strip()
+
+    def _uci_init(self):
+        self._send("uci")
+        while True:
+            line = self._read_line()
+            if line == "uciok":
+                break
+        self._send("isready")
+        while True:
+            line = self._read_line()
+            if line == "readyok":
+                break
+
+    def analyse(self, fen: str, depth: int = 18,
+                movetime: Optional[int] = None) -> tuple:
+        """
+        Analyse position; returns (best_move_uci, score_cp).
+        score_cp is from White's POV.
+        """
+        with self._lock:
+            self._send("ucinewgame")
+            self._send(f"position fen {fen}")
+            if movetime is not None:
+                self._send(f"go movetime {movetime}")
+            else:
+                self._send(f"go depth {depth}")
+
+            best_move = None
+            score_cp = 0.0
+            while True:
+                line = self._read_line()
+                if not line:
+                    break
+                parts = line.split()
+                if parts and parts[0] == "bestmove":
+                    best_move = parts[1] if len(parts) > 1 else None
+                    break
+                if "score" in parts:
+                    idx = parts.index("score")
+                    if idx + 2 < len(parts):
+                        stype = parts[idx + 1]
+                        sval = parts[idx + 2]
+                        if stype == "cp":
+                            score_cp = int(sval)
+                        elif stype == "mate":
+                            mate_plies = int(sval)
+                            score_cp = 10000 - abs(mate_plies)
+                            if mate_plies < 0:
+                                score_cp = -score_cp
+
+            board = chess.Board(fen)
+            if board.turn == chess.BLACK:
+                score_cp = -score_cp
+
+            return best_move, score_cp
+
+    def close(self):
+        try:
+            self._send("quit")
+            self._proc.wait(timeout=5)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Batch RGB → BGR conversion (optional GPU acceleration)
+# ════════════════════════════════════════════════════════════════════
+
+def rgb_to_bgr_batch(frames):
+    """Convert a list of RGB numpy arrays to BGR for OpenCV.
+    Uses CuPy if available, else NumPy batch."""
+    if not HAS_NUMPY:
+        import cv2
+        return [cv2.cvtColor(f, cv2.COLOR_RGB2BGR) for f in frames]
+
+    try:
+        import cupy as cp
+        results = []
+        for f in frames:
+            gpu = cp.asarray(f)
+            bgr = cp.stack([gpu[:, :, 2], gpu[:, :, 1], gpu[:, :, 0]], axis=2)
+            results.append(cp.asnumpy(bgr))
+        return results
+    except ImportError:
+        pass
+
+    arr = np.stack(frames)
+    bgr = arr[:, :, :, ::-1].copy()
+    return [bgr[i] for i in range(len(frames))]
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Legacy ChessEngine (backward compat)
+# ════════════════════════════════════════════════════════════════════
 
 class ChessEngine:
     def __init__(self):
@@ -41,14 +436,6 @@ class ChessEngine:
             for c in range(8):
                 if self.board[r][c] == k: return (r, c)
         return None
-
-    def check_squares(self):
-        sq = []
-        for co in ('w', 'b'):
-            if self.in_check(co):
-                kp = self.find_king(co)
-                if kp: sq.append(kp)
-        return sq
 
     def attacked(self, row, col, by):
         kn = 'N' if by == 'w' else 'n'

@@ -1,6 +1,11 @@
 """
 Two-column move list rendering with move-quality colour badges.
 Used by both the live GUI widget and the video exporter.
+
+Badge visibility:
+  - Full pill badge: Brilliant, Blunder, Mistake, Great
+  - Small colored dot: Inaccuracy
+  - Nothing: Good, Best, Book
 """
 
 import math
@@ -9,15 +14,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtCore import Qt, QRectF, QPointF
 from constants import (
-    MQ_COLORS, MQ_SYMBOLS, MQ_GOOD, MQ_BEST, MQ_VIDEO_COLORS, MQ_BG_COLORS,
-    MQ_SHOW_BADGE,
+    MQ_COLORS, MQ_SYMBOLS, MQ_GOOD, MQ_VIDEO_COLORS, MQ_BG_COLORS,
+    MQ_SHOW_MOVES_BADGE,
 )
 
 
 def render_movelist_2col(p, mx, my, mw, mh,
                          move_list_text, current_move_index,
                          move_qualities=None):
-    """Render move list; *move_qualities* is a parallel list of MQ_* strings."""
     if mw < 160 or mh < 80:
         return
     qualities = move_qualities or [MQ_GOOD] * len(move_list_text)
@@ -33,7 +37,8 @@ def render_movelist_2col(p, mx, my, mw, mh,
     hg = QLinearGradient(hr.topLeft(), hr.bottomLeft())
     hg.setColorAt(0.0, QColor(48, 48, 56))
     hg.setColorAt(1.0, QColor(38, 38, 44))
-    p.setPen(Qt.NoPen); p.setBrush(hg)
+    p.setPen(Qt.NoPen)
+    p.setBrush(hg)
     cr = 7
     hp = QPainterPath()
     hp.moveTo(hr.left(), hr.bottom())
@@ -41,7 +46,8 @@ def render_movelist_2col(p, mx, my, mw, mh,
     hp.quadTo(hr.left(), hr.top(), hr.left() + cr, hr.top())
     hp.lineTo(hr.right() - cr, hr.top())
     hp.quadTo(hr.right(), hr.top(), hr.right(), hr.top() + cr)
-    hp.lineTo(hr.right(), hr.bottom()); hp.closeSubpath()
+    hp.lineTo(hr.right(), hr.bottom())
+    hp.closeSubpath()
     p.drawPath(hp)
 
     p.setFont(QFont("Inter", 10, QFont.Bold))
@@ -75,30 +81,24 @@ def render_movelist_2col(p, mx, my, mw, mh,
     content_y = my + hh + pad_top
     content_h = mh - hh - pad_top * 2
     rows_avail = max(1, int(content_h / line_h))
-    col_gap = 16
-    min_col_w = 160
-    max_cols_w = max(1, int((mw - pad_x * 2 + col_gap) / (min_col_w + col_gap)))
-    req_cols = 1
-    if len(pairs) > rows_avail:
-        req_cols = math.ceil(len(pairs) / rows_avail)
-    
-    # FORCE strictly 2 columns (1 pair of White/Black) instead of 4 columns
+
     num_cols = 1
-    
-    ppc = max(1, math.ceil(len(pairs) / num_cols))
-    col_w = (mw - pad_x * 2 - col_gap * (num_cols - 1)) / num_cols
+    ppc = math.ceil(len(pairs) / num_cols)
+    col_w = mw - pad_x * 2
+
     start_pair = 0
     if current_move_index >= 0:
         cp = current_move_index // 2
         if cp >= rows_avail:
-            start_pair = max(0, min(cp - rows_avail + 1, len(pairs) - rows_avail))
+            start_pair = max(0, min(cp - rows_avail + 2, len(pairs) - rows_avail))
 
     for ci in range(num_cols):
-        cx = mx + pad_x + ci * (col_w + col_gap)
+        cx = mx + pad_x + ci * col_w
         start = ci * ppc + start_pair
         end = min(start + ppc, len(pairs))
+        end = min(end, start_pair + rows_avail)
         num_w = 30
-        move_w = (col_w - num_w - 12) / 2
+        move_w = max(20, (col_w - num_w - 12) / 2)
         w_x = cx + num_w + 4
         b_x = w_x + move_w + 4
 
@@ -131,20 +131,16 @@ def render_movelist_2col(p, mx, my, mw, mh,
                 _draw_move_cell(p, b_x, ry, move_w, line_h, bm, bq,
                                 bidx == current_move_index)
 
-    if num_cols > 1:
-        for ci in range(num_cols - 1):
-            sx = mx + pad_x + (ci + 1) * col_w + ci * col_gap + col_gap / 2
-            p.setPen(QPen(QColor(52, 52, 62, 150), 1, Qt.DotLine))
-            p.drawLine(QPointF(sx, content_y),
-                       QPointF(sx, content_y + ppc * line_h))
-
 
 def _draw_move_cell(p, x, y, w, h, san, quality, is_current):
-    """Draw a single move cell with optional quality badge.
-    No badge for normal/good/best/book moves."""
+    """Draw a single move cell with quality indicator."""
     sym = MQ_SYMBOLS.get(quality, "")
-    show_badge = quality in MQ_SHOW_BADGE and sym
-    badge_w = 28 if show_badge else 0
+    show_pill = quality in MQ_SHOW_MOVES_BADGE and sym
+    show_dot = (quality not in MQ_SHOW_MOVES_BADGE and
+                quality in MQ_BG_COLORS and
+                MQ_BG_COLORS.get(quality, QColor(0, 0, 0, 0)).alpha() > 0)
+
+    badge_w = 30 if show_pill else (12 if show_dot else 0)
 
     bg = MQ_BG_COLORS.get(quality, QColor(0, 0, 0, 0))
     if bg.alpha() > 0:
@@ -162,7 +158,7 @@ def _draw_move_cell(p, x, y, w, h, san, quality, is_current):
     p.drawText(QRectF(x, y, w - badge_w, h - 1),
                Qt.AlignVCenter | Qt.AlignLeft, san)
 
-    if show_badge:
+    if show_pill:
         bx = x + w - badge_w
         color = MQ_COLORS.get(quality, QColor(150, 150, 150))
         pill = QRectF(bx + 2, y + (h - 16) / 2, badge_w - 4, 16)
@@ -181,7 +177,16 @@ def _draw_move_cell(p, x, y, w, h, san, quality, is_current):
         if sym in ("★", "✕"):
             fnt = QFont("Segoe UI Symbol", max(7, int(16 * 0.6)), QFont.Bold)
         else:
-            fnt = QFont("Inter", max(7, int(16 * 0.6)), QFont.Bold)
+            fnt = QFont("Inter", max(7, int(16 * 0.55)), QFont.Bold)
         p.setFont(fnt)
         p.setPen(QColor(255, 255, 255))
         p.drawText(pill, Qt.AlignCenter, sym)
+
+    elif show_dot:
+        dot_r = 3
+        dot_x = x + w - badge_w + 4
+        dot_y = y + h / 2
+        dot_color = MQ_COLORS.get(quality, QColor(150, 150, 150))
+        p.setPen(Qt.NoPen)
+        p.setBrush(dot_color)
+        p.drawEllipse(QRectF(dot_x - dot_r, dot_y - dot_r, dot_r * 2, dot_r * 2))
