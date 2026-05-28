@@ -1,7 +1,7 @@
-"""Chess engine — Wrapper around python-chess for robust board logic and validation."""
+#!/usr/bin/env python3
+"""Chess engine wrapper around python-chess."""
 
 import chess
-from constants import log, FILES_STR, RANKS_STR
 
 
 class ChessEngine:
@@ -17,7 +17,6 @@ class ChessEngine:
         self.result = ""
         self.last_move = None
 
-    # ── Coordinate Helpers ────────────────────────────────────────────────────
     @staticmethod
     def sq_to_rc(sq):
         return 7 - chess.square_rank(sq), chess.square_file(sq)
@@ -26,7 +25,6 @@ class ChessEngine:
     def rc_to_sq(r, c):
         return chess.square(c, 7 - r)
 
-    # ── State Checks ──────────────────────────────────────────────────────────
     @property
     def turn(self):
         return 'w' if self.board.turn == chess.WHITE else 'b'
@@ -39,23 +37,17 @@ class ChessEngine:
             return [self.sq_to_rc(self.board.king(self.board.turn))]
         return []
 
-    # ── Move Generation ───────────────────────────────────────────────────────
     def legal_moves(self, r, c):
         sq = self.rc_to_sq(r, c)
         return [self.sq_to_rc(m.to_square) for m in self.board.legal_moves
                 if m.from_square == sq]
 
-    # ── Make / Undo ───────────────────────────────────────────────────────────
     def make_move(self, fr, fc, tr, tc, promo=None):
         from_sq = self.rc_to_sq(fr, fc)
         to_sq = self.rc_to_sq(tr, tc)
         piece = self.board.piece_at(from_sq)
         if not piece:
             return None
-
-        # FIX: PIECE_SYMBOLS.index is 0-based, but PieceType enum starts at 1
-        #   PIECE_SYMBOLS = ('p','n','b','r','q','k') → indices 0-5
-        #   PAWN=1, KNIGHT=2, BISHOP=3, ROOK=4, QUEEN=5, KING=6
         promotion = None
         if piece.piece_type == chess.PAWN:
             if (piece.color == chess.WHITE and tr == 0) or \
@@ -64,43 +56,31 @@ class ChessEngine:
                     promotion = chess.PIECE_SYMBOLS.index(promo.lower()) + 1
                 else:
                     promotion = chess.QUEEN
-
         move = chess.Move(from_sq, to_sq, promotion=promotion)
         if move not in self.board.legal_moves:
             return None
-
         is_castle = self.board.is_castling(move)
         is_ep = self.board.is_en_passant(move)
-
-        # FIX: For en passant, the captured pawn is NOT on to_sq
         if is_ep:
-            ep_cap_sq = chess.square(
-                chess.square_file(to_sq), chess.square_rank(from_sq))
+            ep_cap_sq = chess.square(chess.square_file(to_sq),
+                                     chess.square_rank(from_sq))
             cap = self.board.piece_at(ep_cap_sq)
         else:
             cap = self.board.piece_at(to_sq)
         captured = cap.symbol() if cap else '.'
-
         notation = self.board.san(move)
         piece_obj = chess.Piece(piece.piece_type, piece.color)
-
         self.board.push(move)
         self.last_move = ((fr, fc), (tr, tc))
-
         self.game_over = self.board.is_game_over()
         self.result = self.board.result() if self.game_over else ""
-
-        info = {
+        return {
             'from': (fr, fc), 'to': (tr, tc),
-            'piece': piece.symbol(),
-            'piece_obj': piece_obj,
-            'captured': captured,
-            'castle': is_castle, 'ep': is_ep, 'promo': promo,
-            'check': self.board.is_check(),
-            'mate': self.board.is_checkmate(),
-            'notation': notation,
+            'piece': piece.symbol(), 'piece_obj': piece_obj,
+            'captured': captured, 'castle': is_castle, 'ep': is_ep,
+            'promo': promo, 'check': self.board.is_check(),
+            'mate': self.board.is_checkmate(), 'notation': notation,
         }
-        return info
 
     def make_move_uci(self, uci_str):
         move = chess.Move.from_uci(uci_str)
@@ -125,7 +105,6 @@ class ChessEngine:
             return True
         return False
 
-    # ── FEN ───────────────────────────────────────────────────────────────────
     def load_fen(self, fen):
         self.board.set_fen(fen)
         self.game_over = self.board.is_game_over()

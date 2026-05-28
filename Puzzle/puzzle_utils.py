@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""Puzzle parsing, move conversion, and Numba/CuPy batch helpers."""
+
+import re
+import csv
+import chess
+import numpy as np
+
+from utils import log
+
+# ── Local Dependency Check ──────────────────────────────────────────────────
+
+HAS_NUMBA = False
+try:
+    import numba
+    HAS_NUMBA = True
+except ImportError:
+    pass
+
+HAS_CUPY = False
+try:
+    import cupy as _cp_gpu
+    HAS_CUPY = True
+except Exception:
+    pass
+
+HAS_PANDAS = False
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    pass
+
+csv.field_size_limit(2**31 - 1)
+
+# ── Regex patterns ──────────────────────────────────────────────────────────
+
+_UCI_RE = re.compile(r'^[a-h][1-8][a-h][1-8][qrbn]?$')
+_MVNUM_RE = re.compile(r'^\d+\.+$')
+_RESULT_RE = frozenset({'1-0', '0-1', '1/2-1/2', '*'})
+
+
+# ── Move helpers ────────────────────────────────────────────────────────────
+
+def _clean_move_tokens(tokens):
+    out = []
+    for t in tokens:
+        t = t.strip()
+        if not t or _MVNUM_RE.match(t) or t in _RESULT_RE:
+            continue
+        t = t.rstrip('.')
+        if not t:
+            continue
+        out.append(t)
+    return out
+
+
+def _detect_move_format(tokens):
+    for t in tokens:
+        if _UCI_RE.match(t):
+            return 'uci'
+        return 'san'
+    return 'uci'
+
+
+def _san_to_uci(tokens, fen=''):
+    board = chess.Board(fen) if fen else chess.Board()
+    result = []
+    for t in tokens:
+        try:
+            m = board.parse_san(t)
+            result.append(m.uci())
+            board.push(m)
+            continue
+        except Exception:
+            pass
+        try:
+            m = chess.Move.from_uci(t)
+            if m in board.legal_moves:
+                result.append(t)
+                board.push(m)
+                continue
+        except Exception:
+            pass
+        break
+    return result
+
+
+def _parse_uci_value(val):
+    if isinstance(val, list):
+        flat = []
+        for item in val:
+            if isinstance(item, str):
+                flat.extend(item.replace(',', ' ').split())
+            elif item is not None:
+                s = str(item).strip().replace(',', ' ')
+                if s:
+                    flat.extend(s.split())
+        return flat
+    s = str(val).strip().replace(',', ' ')
+    return s.split() if s else []
+
+
+def _extract_uci_moves(row):
+    raw_val = ''
+    for col in ('uci', 'moves', 'pgn'):
+        v = row.get(col, '')
+        if v and str(v).strip():
+            raw_val = v
+            break
+    tokens = _parse_uci_value(raw_val)
+    tokens = _clean_move_tokens(tokens)
+    if not tokens:
+        return []
+    fen = str(row.get('fen', row.get('epd', ''))).strip()
+    if fen and len(fen.split()) < 6:
+        fen += " 0 1"
+    fmt = _detect_move_format(tokens)
+    if fmt == 'san':
+        uci_moves = _san_to_uci(tokens, fen)
+        if uci_moves:
+            return uci_moves
+    return tokens
+
+
+# ── Rating / naming helpers ─────────────────────────────────────────────────
+
+def _rating_category(rating):
+    if rating < 800:  return "Beginner"
+    if rating < 1200: return "Easy"
+    if rating < 1600: return "Medium"
+    if rating < 2000: return "Hard"
+    return "Expert"
+
+
+def _generate_name(row, uci_moves, idx):
+    number = idx + 1
+    attrs = []
+    name = str(row.get('name', '')).strip()
+    if name and name.lower() not in ('nan', 'none', ''):
+        attrs.append(name)
+    themes = str(row.get('themes', row.get('theme', ''))).strip()
+    if themes and themes.lower() not in ('nan', 'none', ''):
+        attrs.append(themes)
+    opening = str(row.get('opening', row.get('opening_tags',
+                  row.get('openingtags', '')))).strip()
+    if opening and opening.lower() not in ('nan', 'none', ''):
+        attrs.append(opening)
+    for rkey in ('rating', 'elo', 'difficulty', 'score'):
+        rval = str(row.get(rkey, '')).strip()
+        if rval and rval.lower() not in ('nan', 'none', ''):
+            try:
+                rv = float(rval)
+                attrs.append(f"{_rating_category(rv)} ({int(rv)})")
+                break
+            except ValueError:
+                pass
+    if not name:
+        white = str(row.get('white', '')).strip()
+        black = str(row.get('black', '')).strip()
+        if white and black:
+            attrs.append(f"{white} vs {black}")
+    if not name:
+        event = str(row.get('event', '')).strip()
+        if event and event.lower() not in ('nan', 'none', ''):
+            attrs.append(event)
+    eco = str(row.get('eco', '')).strip()
+    if eco and eco.lower() not in ('nan', 'none', ''):
+        attrs.append(f"ECO {eco}")
+    if attrs:
+        return f"Puzzle #{number} — {' | '.join(attrs)}"
+    return _generate_name_fallback(row, uci_moves, idx)
+
+
+def _generate_name_fallback(row, uci_moves, idx):
+    number = idx + 1
+    ignore = frozenset({
+        'fen', 'moves', 'uci', 'pgn', 'id', 'name', 'img',
+        'desc', 'description', 'white', 'black', 'event',
+        'rating', 'difficulty', 'score', 'elo', 'themes',
+        'theme', 'opening', 'opening_tags', 'openingtags', 'eco'})
+    parts = []
+    for k, v in row.items():
+        val = str(v).strip() if v is not None else ''
+        if k not in ignore and val and val.lower() not in ('nan', 'none', ''):
+            parts.append(f"{k.title()}: {val}")
+            if len(parts) == 2:
+                break
+    if parts:
+        return f"Puzzle #{number} — {' | '.join(parts)}"
+    if uci_moves:
+        return f"Puzzle #{number} — {uci_moves[0]}…"
+    return f"Puzzle #{number}"
+
+
+# ── Numba-accelerated batch helpers ─────────────────────────────────────────
+
+if HAS_NUMBA:
+    from numba import njit as _njit3
+
+    @_njit3(cache=True, nogil=True)
+    def _count_moves_nb(data, offsets, lengths):
+        n = len(offsets)
+        out = np.empty(n, dtype=np.int64)
+        comma = np.uint8(44)
+        for i in range(n):
+            ln = lengths[i]
+            if ln == 0:
+                out[i] = 0
+                continue
+            c = 1
+            s = offsets[i]
+            e = s + ln
+            for j in range(s, e):
+                if data[j] == comma:
+                    c += 1
+            out[i] = c
+        return out
+
+    @_njit3(cache=True, nogil=True)
+    def _validate_uci_first_nb(data, offsets, lengths):
+        n = len(offsets)
+        valid = np.ones(n, dtype=np.bool_)
+        for i in range(n):
+            s = offsets[i]
+            ln = lengths[i]
+            if ln == 0 or ln < 4:
+                valid[i] = False
+                continue
+            for j in range(4):
+                b = int(data[s + j])
+                if not ((48 <= b <= 57) or (97 <= b <= 122)):
+                    valid[i] = False
+                    break
+        return valid
+
+    @_njit3(cache=True, nogil=True)
+    def _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals):
+        n = len(move_counts)
+        out = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            base = min(1.0, max(0.0, float(move_counts[i]) / 8.0))
+            fen_b = 0.15 if has_fen[i] else 0.0
+            if has_rating[i]:
+                rating = min(1.0, max(0.0, rating_vals[i] / 3000.0))
+            else:
+                rating = 0.5
+            out[i] = 0.4 * base + 0.2 * fen_b + 0.4 * rating
+        return out
+
+    log("Numba JIT puzzle helpers ready", "PUZZLE")
+else:
+    def _count_moves_nb(data, offsets, lengths):
+        out = np.empty(len(offsets), dtype=np.int64)
+        for i in range(len(offsets)):
+            if lengths[i] == 0:
+                out[i] = 0
+            else:
+                seg = data[offsets[i]:offsets[i] + lengths[i]].tobytes()
+                out[i] = seg.count(b',') + 1
+        return out
+
+    def _validate_uci_first_nb(data, offsets, lengths):
+        valid = np.ones(len(offsets), dtype=np.bool_)
+        for i in range(len(offsets)):
+            if lengths[i] < 4:
+                valid[i] = lengths[i] > 0
+        return valid
+
+    def _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals):
+        n = len(move_counts)
+        out = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            base = min(1.0, max(0.0, float(move_counts[i]) / 8.0))
+            fen_b = 0.15 if has_fen[i] else 0.0
+            rating = (min(1.0, max(0.0, rating_vals[i] / 3000.0))
+                      if has_rating[i] else 0.5)
+            out[i] = 0.4 * base + 0.2 * fen_b + 0.4 * rating
+        return out
+
+
+def _pack_strings(strings):
+    encoded = [s.encode('utf-8') if s else b'' for s in strings]
+    lengths = np.array([len(e) for e in encoded], dtype=np.int64)
+    offsets = np.empty(len(encoded), dtype=np.int64)
+    total = 0
+    for i in range(len(encoded)):
+        offsets[i] = total
+        total += lengths[i]
+    buf = b''.join(encoded)
+    data = (np.frombuffer(buf, dtype=np.uint8).copy()
+            if buf else np.empty(0, dtype=np.uint8))
+    return data, offsets, lengths
+
+
+def batch_count_moves(move_strings):
+    if not move_strings:
+        return np.array([], dtype=np.int64)
+    data, offsets, lengths = _pack_strings(move_strings)
+    return _count_moves_nb(data, offsets, lengths)
+
+
+def batch_validate_uci(move_strings):
+    if not move_strings:
+        return np.array([], dtype=np.bool_)
+    data, offsets, lengths = _pack_strings(move_strings)
+    return _validate_uci_first_nb(data, offsets, lengths)
+
+
+# ── GPU difficulty ──────────────────────────────────────────────────────────
+
+if HAS_CUPY:
+    def gpu_difficulty_scores(move_counts, has_fen, has_rating, rating_vals):
+        mc_gpu = _cp_gpu.asarray(move_counts.astype(np.float64))
+        hf_gpu = _cp_gpu.asarray(has_fen.astype(np.float64))
+        hr_gpu = _cp_gpu.asarray(has_rating.astype(np.float64))
+        rv_gpu = _cp_gpu.asarray(rating_vals.astype(np.float64))
+        base = _cp_gpu.clip(mc_gpu / 8.0, 0.0, 1.0)
+        fen_b = 0.15 * hf_gpu
+        rating = _cp_gpu.where(hr_gpu > 0,
+                               _cp_gpu.clip(rv_gpu / 3000.0, 0.0, 1.0), 0.5)
+        return _cp_gpu.asnumpy(0.4 * base + 0.2 * fen_b + 0.4 * rating)
+    log("CuPy GPU puzzle helpers ready", "PUZZLE")
+else:
+    def gpu_difficulty_scores(move_counts, has_fen, has_rating, rating_vals):
+        return _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals)
+
+
+def _compute_iterative_difficulty(row, uci_moves):
+    move_count = len(uci_moves)
+    base = min(1.0, max(0.0, move_count / 8.0))
+    fen = str(row.get('fen', '')).strip()
+    fen_b = 0.15 if fen else 0.0
+    rating = 0.5
+    for rkey in ('rating', 'elo', 'difficulty', 'score'):
+        rval = str(row.get(rkey, '')).strip()
+        if rval and rval.lower() not in ('nan', 'none', ''):
+            try:
+                rv = float(rval)
+                rating = min(1.0, max(0.0, rv / 3000.0))
+                break
+            except ValueError:
+                pass
+    return 0.4 * base + 0.2 * fen_b + 0.4 * rating

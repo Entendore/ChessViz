@@ -1,984 +1,501 @@
-"""Main application window — core layout, puzzle tab, settings tab.
-Openings tab is provided by the OpeningsMixin in openings_tab.py.
-All file/directory selection uses inline path inputs (no popup dialogs).
-"""
+#!/usr/bin/env python3
+"""Main application window with puzzle, export, and settings tabs."""
 
-import os, math
-from pathlib import Path
+import os
+import shutil
+import threading
+
+import chess
+
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
-    QLabel, QPushButton, QTextEdit,
-    QFrame, QListWidget, QListWidgetItem, QSlider,
-    QSpinBox, QLineEdit, QFormLayout, QComboBox,
-    QProgressBar, QGroupBox, QCheckBox, QScrollArea
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTabWidget, QLabel, QPushButton, QTextEdit, QFrame,
+    QListWidget, QListWidgetItem, QSlider, QSpinBox,
+    QLineEdit, QFormLayout, QComboBox, QProgressBar,
+    QGroupBox, QCheckBox, QFileDialog, QScrollArea,
+    QSplitter, QMessageBox,
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
-from constants import (
-    log, ExportConfig, ANIM_SPEED_DEFAULT, ANIM_SPEED_SLOW,
-    DATA_DIR, THEMES, HAS_CUPY, HAS_NUMBA, EXPORT_PRESETS
+
+from config import (
+    THEMES, EXPORT_PRESETS, ExportConfig,
+    ANIM_SPEED_SLOW, ANIM_SPEED_DEFAULT, ANIM_SPEED_FAST, SQ_SIZE,
 )
-from engine import ChessEngine
-from sound import SoundManager
+from utils import log, sanitize_filename
+from chess_engine import ChessEngine
+from sound_manager import SoundManager
 from board_widget import ChessBoardWidget
-from export import ExportWorker, BatchExportWorker
-from data_manager import DataProvider, DataLoadWorker
-from openings_tab import OpeningsMixin
+from puzzle_loader import PuzzleLoader
+from video_exporter import FFmpegVideoExporter
+
+# ── Local Dependency Check ──────────────────────────────────────────────────
+
+HAS_FFMPEG = shutil.which('ffmpeg') is not None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Checkable list helper
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class CheckableListWidget(QListWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setItemAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-
-    def add_checkable_item(self, text, data=None, checked=False):
-        item = QListWidgetItem(text)
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-        if data is not None:
-            item.setData(Qt.UserRole, data)
-        self.addItem(item)
-        return item
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Main Window
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class MainWindow(QWidget, OpeningsMixin):
-    _PAGE_SIZE = 100
-
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("♚ Chess Learning App")
-        log("Initializing Chess Learning App...", "APP")
+        self.setWindowTitle("Chess Puzzle Studio")
+        self.setMinimumSize(1100, 750)
 
-        self._apply_professional_style()
-
-        # ── Core state ────────────────────────────────────────────────────
+        # Core objects
         self.engine = ChessEngine()
-        self.snd = SoundManager()
-        self.db = DataProvider()
-        self.board_widget = ChessBoardWidget(self.engine, self.snd)
-        self.board_widget.move_made.connect(self.on_move)
+        self.sound_mgr = SoundManager()
+        self.puzzle_loader = PuzzleLoader()
+        self.export_config = ExportConfig()
+        self.exporter = None
+        self.export_thread = None
 
-        self.export_worker = None
-        # FIX: separate batch workers so signals don't overlap between tabs
-        self.puzzle_batch_worker = None
-        self.opening_batch_worker = None
-        self.puzzles_loaded = False
-        self.openings_loaded = False
-        self._active_workers = []
+        # Puzzle state
+        self.puzzles = []
+        self.current_puzzle_idx = -1
+        self.current_puzzle = None
+        self.puzzle_move_idx = 0
+        self.puzzle_mode = False
+        self.auto_play_timer = QTimer(self)
+        self.auto_play_timer.setSingleShot(True)
+        self.auto_play_timer.timeout.connect(self._auto_play_response)
 
-        self._pz_page = 0
-        self._pz_checked = set()
+        self._build_ui()
+        self._connect_signals()
+        self._apply_theme()
 
-        # Openings mixin state
-        self._op_page = 0
-        self._op_checked = set()
-        self._current_opening = None
-        self.opening_step_idx = 0
+    # ── UI Construction ─────────────────────────────────────────────────
 
-        # ── Layout ────────────────────────────────────────────────────────
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        left_panel = self._build_puzzle_list_panel()
+        splitter.addWidget(left_panel)
+
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.board_widget = ChessBoardWidget(self.engine, self.sound_mgr)
+        center_layout.addWidget(self.board_widget, alignment=Qt.AlignCenter)
 
         self.tabs = QTabWidget()
-        self.tabs.setFixedWidth(460)
-        layout.addWidget(self.tabs)
-
-        board_frame = QFrame()
-        board_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
-        board_frame.setStyleSheet(
-            "QFrame { border: 1px solid #4a4a4f; border-radius: 6px;"
-            " background: #25252a; }")
-        bl = QVBoxLayout(board_frame)
-        bl.setContentsMargins(8, 8, 8, 8)
-        bl.setSpacing(8)
-
-        top_ctrl = QHBoxLayout()
-        top_ctrl.addWidget(QLabel("Theme:"))
-        self.theme_cb = QComboBox()
-        self.theme_cb.addItems(THEMES.keys())
-        self.theme_cb.currentTextChanged.connect(self._change_theme)
-        top_ctrl.addWidget(self.theme_cb)
-        top_ctrl.addStretch()
-        top_ctrl.addWidget(QLabel("Speed:"))
-        self.anim_slider = QSlider(Qt.Horizontal)
-        self.anim_slider.setRange(0, 600)
-        self.anim_slider.setValue(600 - ANIM_SPEED_DEFAULT)
-        self.anim_slider.setInvertedAppearance(True)
-        self.anim_slider.setFixedWidth(120)
-        self.anim_lbl = QLabel(self._fmt_anim(ANIM_SPEED_DEFAULT))
-        self.anim_slider.valueChanged.connect(self._update_anim_speed)
-        top_ctrl.addWidget(self.anim_slider)
-        top_ctrl.addWidget(self.anim_lbl)
-        bl.addLayout(top_ctrl)
-
-        bl.addWidget(self.board_widget, alignment=Qt.AlignCenter)
-        layout.addWidget(board_frame, alignment=Qt.AlignCenter)
-
+        self.tabs.setMaximumHeight(320)
         self._build_puzzle_tab()
-        self._build_openings_tab()
+        self._build_export_tab()
         self._build_settings_tab()
+        center_layout.addWidget(self.tabs)
 
-        self.snd.play("start")
-        log("App initialization complete", "APP")
+        splitter.addWidget(center_panel)
 
-        QTimer.singleShot(50,  lambda: self._start_data_load("puzzles"))
-        QTimer.singleShot(100, lambda: self._start_data_load("openings"))
+        right_panel = self._build_history_panel()
+        splitter.addWidget(right_panel)
 
-    # ── Close event ──────────────────────────────────────────────────────────
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 1)
 
-    def closeEvent(self, event):
-        """Gracefully stop all running threads before closing the window."""
-        log("Closing application, waiting for threads to finish...", "APP")
+        main_layout.addWidget(splitter)
+        self.statusBar().showMessage("Ready — Load a puzzle file to begin")
 
-        for worker in self._active_workers[:]:
-            if worker.isRunning():
-                worker.abort()
-                worker.wait(2000)
+    def _build_puzzle_list_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        btn_load = QPushButton("📁 Load Puzzle File")
+        btn_load.clicked.connect(self._on_load_file)
+        layout.addWidget(btn_load)
 
-        if self.export_worker and self.export_worker.isRunning():
-            self.export_worker.abort()
-            self.export_worker.wait(2000)
+        self.puzzle_list = QListWidget()
+        self.puzzle_list.currentRowChanged.connect(self._on_puzzle_selected)
+        layout.addWidget(self.puzzle_list)
 
-        # FIX: clean up both batch workers
-        for bw in (self.puzzle_batch_worker, self.opening_batch_worker):
-            if bw and bw.isRunning():
-                bw.abort()
-                bw.wait(2000)
+        self.puzzle_count_label = QLabel("0 puzzles")
+        layout.addWidget(self.puzzle_count_label)
+        return panel
 
-        self.db.flush()
-        self.snd.cleanup()  # FIX: clean up temp sound files
-        event.accept()
+    def _build_history_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.addWidget(QLabel("Move History"))
+        self.history_text = QTextEdit()
+        self.history_text.setReadOnly(True)
+        self.history_text.setFont(QFont("Monospace", 10))
+        layout.addWidget(self.history_text)
 
-    # IMPROVEMENT: on_move now detects game-over states
-    def on_move(self, notation):
-        """Handle a move made on the board widget."""
-        if self.engine.game_over:
-            if self.engine.board.is_checkmate():
-                self.puzzle_status.setText("♔ Checkmate!")
-            elif self.engine.board.is_stalemate():
-                self.puzzle_status.setText("½ Stalemate — Draw")
-            elif self.engine.board.is_insufficient_material():
-                self.puzzle_status.setText("½ Insufficient material — Draw")
-            else:
-                self.puzzle_status.setText(
-                    f"Game over: {self.engine.result}")
-        self.board_widget.update()
+        self.fen_label = QLabel("FEN: —")
+        self.fen_label.setWordWrap(True)
+        self.fen_label.setFont(QFont("Monospace", 8))
+        layout.addWidget(self.fen_label)
+        return panel
 
-    # ── Styling ───────────────────────────────────────────────────────────────
-
-    def _apply_professional_style(self):
-        self.setStyleSheet("""
-            QWidget {
-                font-family: 'Segoe UI', Arial, sans-serif;
-                color: #d0d0d0;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #4a4a4f;
-                border-radius: 6px;
-                margin-top: 14px;
-                padding: 12px 8px 8px 8px;
-                background-color: #2e2e32;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-                color: #a0a0a8;
-            }
-            QPushButton {
-                padding: 6px 14px;
-                border-radius: 4px;
-                background-color: #3c3f41;
-                border: 1px solid #4a4a4f;
-                color: #d0d0d0;
-            }
-            QPushButton:hover {
-                background-color: #4e5254;
-                border-color: #606068;
-            }
-            QPushButton:pressed {
-                background-color: #2d2f30;
-            }
-            QPushButton:disabled {
-                background-color: #2a2a2e;
-                color: #606068;
-                border-color: #333338;
-            }
-            QTabWidget::pane {
-                border: 1px solid #4a4a4f;
-                border-radius: 4px;
-                background-color: #25252a;
-            }
-            QTabBar::tab {
-                padding: 8px 18px;
-                border: 1px solid #4a4a4f;
-                border-bottom: none;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                background: #2e2e32;
-                color: #a0a0a8;
-                font-weight: bold;
-            }
-            QTabBar::tab:selected {
-                background: #3c3f41;
-                color: #ffffff;
-            }
-            QListWidget {
-                border: 1px solid #4a4a4f;
-                border-radius: 4px;
-                background-color: #25252a;
-                padding: 2px;
-            }
-            QListWidget::item {
-                padding: 4px;
-                border-bottom: 1px solid #333338;
-            }
-            QListWidget::item:hover {
-                background-color: #3c3f41;
-            }
-            QListWidget::item:selected {
-                background-color: #4e5254;
-                color: white;
-            }
-            QLineEdit, QSpinBox, QComboBox {
-                padding: 4px 8px;
-                border: 1px solid #4a4a4f;
-                border-radius: 4px;
-                background-color: #25252a;
-                color: #d0d0d0;
-            }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QSlider::groove:horizontal {
-                border: 1px solid #4a4a4f;
-                height: 6px;
-                background: #25252a;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #a0a0a8;
-                border: 1px solid #4a4a4f;
-                width: 14px;
-                margin: -5px 0;
-                border-radius: 7px;
-            }
-            QTextEdit {
-                border: 1px solid #4a4a4f;
-                border-radius: 4px;
-                background-color: #25252a;
-                color: #d0d0d0;
-            }
-            QProgressBar {
-                border: 1px solid #4a4a4f;
-                border-radius: 4px;
-                text-align: center;
-                background-color: #25252a;
-                color: white;
-                height: 20px;
-                font-weight: bold;
-            }
-            QProgressBar::chunk {
-                background-color: #5c9fd6;
-                border-radius: 3px;
-            }
-        """)
-
-    # ── Theme / animation helpers ────────────────────────────────────────────
-
-    def _change_theme(self, name):
-        if name in THEMES:
-            self.board_widget.current_theme = THEMES[name]
-            self.board_widget.update()
-            self.theme_cb.blockSignals(True)
-            self.theme_cb.setCurrentText(name)
-            self.theme_cb.blockSignals(False)
-            if hasattr(self, 'settings_theme_cb'):
-                self.settings_theme_cb.blockSignals(True)
-                self.settings_theme_cb.setCurrentText(name)
-                self.settings_theme_cb.blockSignals(False)
-
-    def _fmt_anim(self, ms):
-        if ms == 0:   return "Instant"
-        if ms <= 100: return f"Fast ({ms}ms)"
-        if ms <= 350: return f"Normal ({ms}ms)"
-        return f"Slow ({ms}ms)"
-
-    def _update_anim_speed(self, raw_val):
-        val = 600 - raw_val
-        self.board_widget.anim_speed = val
-        self.anim_lbl.setText(self._fmt_anim(val))
-        self.anim_slider.blockSignals(True)
-        self.anim_slider.setValue(raw_val)
-        self.anim_slider.blockSignals(False)
-        if hasattr(self, 'settings_anim_slider'):
-            self.settings_anim_lbl.setText(self._fmt_anim(val))
-            self.settings_anim_slider.blockSignals(True)
-            self.settings_anim_slider.setValue(raw_val)
-            self.settings_anim_slider.blockSignals(False)
-
-    # ── Thread-safe data loading ─────────────────────────────────────────────
-
-    def _start_data_load(self, db_type, single_file=None):
-        if db_type == "puzzles":
-            self.puzzle_list.clear()
-            self.puzzle_list.add_checkable_item("Loading puzzles…", checked=False)
-            self.puzzles_loaded = False
-        else:
-            self.opening_list.clear()
-            self.opening_list.add_checkable_item("Loading openings…", checked=False)
-            self.openings_loaded = False
-
-        if single_file:
-            worker = DataLoadWorker(db_type, single_file=single_file)
-        else:
-            directory = str(Path(DATA_DIR) / db_type)
-            worker = DataLoadWorker(db_type, directory=directory)
-
-        worker.setObjectName(f"DataLoadWorker_{db_type}")
-        worker.data_ready.connect(self._on_data_ready)
-        worker.load_error.connect(self._on_load_error)
-        worker.finished.connect(lambda w=worker: self._cleanup_worker(w))
-        self._active_workers.append(worker)
-        worker.start()
-
-    def _on_data_ready(self, db_type, total_count):
-        self.db.reload(db_type)
-        if db_type == "puzzles":
-            self.puzzles_loaded = True
-            self._pz_checked.clear()
-            self._pz_page = 0
-            self._populate_puzzle_page()
-            self.puzzle_db_status.setText(f"Loaded {total_count:,} puzzles")
-        else:
-            self.openings_loaded = True
-            self._op_checked.clear()
-            self._op_page = 0
-            self._populate_opening_page()
-            self.opening_db_status.setText(f"Loaded {total_count:,} openings")
-
-    def _on_load_error(self, db_type, error_msg):
-        log(f"Load error ({db_type}): {error_msg}", "DATA")
-        if db_type == "puzzles":
-            self.puzzle_db_status.setText(f"Error: {error_msg}")
-        else:
-            self.opening_db_status.setText(f"Error: {error_msg}")
-
-    def _cleanup_worker(self, worker):
-        if worker in self._active_workers:
-            self._active_workers.remove(worker)
-        if not worker.isRunning():
-            worker.deleteLater()
-        else:
-            worker.finished.connect(worker.deleteLater)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    #  PUZZLE TAB
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Puzzle Tab ──────────────────────────────────────────────────────
 
     def _build_puzzle_tab(self):
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+
+        info_group = QGroupBox("Puzzle Info")
+        info_layout = QFormLayout(info_group)
+        self.puzzle_name_label = QLabel("—")
+        self.puzzle_name_label.setWordWrap(True)
+        self.puzzle_diff_label = QLabel("—")
+        self.puzzle_desc_label = QLabel("—")
+        self.puzzle_desc_label.setWordWrap(True)
+        info_layout.addRow("Name:", self.puzzle_name_label)
+        info_layout.addRow("Difficulty:", self.puzzle_diff_label)
+        info_layout.addRow("Description:", self.puzzle_desc_label)
+        layout.addWidget(info_group)
+
+        ctrl_group = QGroupBox("Controls")
+        ctrl_layout = QVBoxLayout(ctrl_group)
+        btn_row1 = QHBoxLayout()
+        self.btn_prev = QPushButton("◀ Prev")
+        self.btn_next = QPushButton("Next ▶")
+        self.btn_reset = QPushButton("↺ Reset")
+        self.btn_hint = QPushButton("💡 Hint")
+        btn_row1.addWidget(self.btn_prev)
+        self.btn_prev.clicked.connect(self._on_prev_puzzle)
+        btn_row1.addWidget(self.btn_next)
+        self.btn_next.clicked.connect(self._on_next_puzzle)
+        btn_row1.addWidget(self.btn_reset)
+        self.btn_reset.clicked.connect(self._on_reset_puzzle)
+        btn_row1.addWidget(self.btn_hint)
+        self.btn_hint.clicked.connect(self._on_hint)
+        ctrl_layout.addLayout(btn_row1)
+
+        self.puzzle_status_label = QLabel("")
+        self.puzzle_status_label.setAlignment(Qt.AlignCenter)
+        ctrl_layout.addWidget(self.puzzle_status_label)
+        layout.addWidget(ctrl_group)
+
+        self.tabs.addTab(tab, "♟ Puzzle")
+
+    # ── Export Tab ──────────────────────────────────────────────────────
+
+    def _build_export_tab(self):
+        tab = QWidget()
         scroll = QScrollArea()
+        scroll.setWidget(tab)
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        container = QWidget()
-        l = QVBoxLayout(container)
-        l.setSpacing(12)
-
-        # ── 1. Database ──────────────────────────────────────────────────
-        db_group = QGroupBox("📂 Puzzle Database")
-        db_layout = QVBoxLayout(db_group)
-        path_row = QHBoxLayout()
-        self.puzzle_db_path = QLineEdit()
-        self.puzzle_db_path.setPlaceholderText(
-            "Database file path (.csv .parquet .pq .duckdb .db .sqlite)…")
-        path_row.addWidget(self.puzzle_db_path, 1)
-        btn_load_db = QPushButton("Load")
-        btn_load_db.clicked.connect(self.load_puzzle_db)
-        path_row.addWidget(btn_load_db)
-        db_layout.addLayout(path_row)
-        self.puzzle_db_status = QLabel("No database loaded")
-        self.puzzle_db_status.setAlignment(Qt.AlignCenter)
-        db_layout.addWidget(self.puzzle_db_status)
-        l.addWidget(db_group)
-
-        # ── 2. Filter & Selection ────────────────────────────────────────
-        filter_group = QGroupBox("🔍 Filter & Selection")
-        fl = QVBoxLayout(filter_group)
-        filter_row = QHBoxLayout()
-        self.puzzle_filter = QLineEdit()
-        self.puzzle_filter.setPlaceholderText("Filter puzzles…")
-        filter_row.addWidget(self.puzzle_filter, 1)
-        fl.addLayout(filter_row)
-
-        self._pz_filter_timer = QTimer()
-        self._pz_filter_timer.setSingleShot(True)
-        self._pz_filter_timer.setInterval(300)
-        self._pz_filter_timer.timeout.connect(self._apply_puzzle_filter)
-        self.puzzle_filter.textChanged.connect(
-            lambda: self._pz_filter_timer.start())
-
-        sel_row = QHBoxLayout()
-        btn_all = QPushButton("All"); btn_all.setFixedWidth(55)
-        btn_all.clicked.connect(self._puzzle_select_all)
-        btn_none = QPushButton("None"); btn_none.setFixedWidth(55)
-        btn_none.clicked.connect(self._puzzle_select_none)
-        btn_inv = QPushButton("Invert"); btn_inv.setFixedWidth(60)
-        btn_inv.clicked.connect(self._puzzle_select_invert)
-        sel_row.addWidget(btn_all)
-        sel_row.addWidget(btn_none)
-        sel_row.addWidget(btn_inv)
-        sel_row.addStretch()
-        fl.addLayout(sel_row)
-
-        range_row = QHBoxLayout()
-        self.puzzle_range_from = QSpinBox()
-        self.puzzle_range_from.setRange(1, 999999)
-        self.puzzle_range_from.setPrefix("#")
-        self.puzzle_range_to = QSpinBox()
-        self.puzzle_range_to.setRange(1, 999999)
-        self.puzzle_range_to.setPrefix("#")
-        btn_range = QPushButton("Apply Range")
-        btn_range.clicked.connect(self._puzzle_select_range)
-        range_row.addWidget(QLabel("From:"))
-        range_row.addWidget(self.puzzle_range_from)
-        range_row.addWidget(QLabel("To:"))
-        range_row.addWidget(self.puzzle_range_to)
-        range_row.addWidget(btn_range)
-        fl.addLayout(range_row)
-
-        self.puzzle_sel_label = QLabel("Selected: 0")
-        self.puzzle_sel_label.setAlignment(Qt.AlignRight)
-        fl.addWidget(self.puzzle_sel_label)
-        l.addWidget(filter_group)
-
-        # ── 3. Puzzle List ───────────────────────────────────────────────
-        list_group = QGroupBox("📋 Puzzles")
-        ll = QVBoxLayout(list_group)
-        self.puzzle_list = CheckableListWidget()
-        self.puzzle_list.setMaximumHeight(160)
-        self.puzzle_list.itemChanged.connect(self._on_puzzle_item_changed)
-        ll.addWidget(self.puzzle_list)
-
-        nav = QHBoxLayout()
-        self.btn_pz_prev = QPushButton("◀")
-        self.btn_pz_prev.clicked.connect(self._pz_prev_page)
-        self.pz_page_lbl = QLabel("Page 0 / 0")
-        self.pz_page_lbl.setAlignment(Qt.AlignCenter)
-        self.btn_pz_next = QPushButton("▶")
-        self.btn_pz_next.clicked.connect(self._pz_next_page)
-        nav.addWidget(self.btn_pz_prev)
-        nav.addWidget(self.pz_page_lbl, 1)
-        nav.addWidget(self.btn_pz_next)
-        nav.addWidget(QLabel("Jump:"))
-        self.pz_jump_spin = QSpinBox()
-        self.pz_jump_spin.setRange(1, 999999)
-        self.pz_jump_spin.setFixedWidth(65)
-        btn_jump = QPushButton("Go"); btn_jump.setFixedWidth(35)
-        btn_jump.clicked.connect(self._pz_jump_page)
-        nav.addWidget(self.pz_jump_spin)
-        nav.addWidget(btn_jump)
-        ll.addLayout(nav)
-
-        btn_load = QPushButton("📋 Load Selected Puzzle to Board")
-        btn_load.clicked.connect(self.load_puzzle)
-        ll.addWidget(btn_load)
-        l.addWidget(list_group)
-
-        # ── 4. Export Settings ───────────────────────────────────────────
-        export_group = QGroupBox("🎬 Export Configuration")
-        eform = QFormLayout(export_group)
-        eform.setSpacing(8)
-
-        # IMPROVEMENT: add preset selector
-        self.exp_preset = QComboBox()
-        self.exp_preset.addItems(EXPORT_PRESETS.keys())
-        self.exp_preset.setCurrentText("Board Only (544×544)")
-        eform.addRow("Preset:", self.exp_preset)
-
-        self.exp_title = QLineEdit()
-        self.exp_title.setPlaceholderText("Leave blank for puzzle name")
-        eform.addRow("Title:", self.exp_title)
-
-        self.exp_end = QLineEdit("Solved!")
-        eform.addRow("End text:", self.exp_end)
-
-        row_fps = QHBoxLayout()
-        self.exp_fps = QSpinBox(); self.exp_fps.setRange(10, 120)
-        self.exp_fps.setValue(30)
-        self.exp_workers = QSpinBox(); self.exp_workers.setRange(1, 16)
-        self.exp_workers.setValue(4)
-        row_fps.addWidget(self.exp_fps)
-        row_fps.addWidget(QLabel("Workers:"))
-        row_fps.addWidget(self.exp_workers)
-        eform.addRow("FPS:", row_fps)
-
-        row_theme = QHBoxLayout()
-        self.exp_theme = QComboBox()
-        self.exp_theme.addItems(THEMES.keys())
-        self.exp_theme.setCurrentText(self.theme_cb.currentText())
-        row_theme.addWidget(self.exp_theme)
-        eform.addRow("Theme:", row_theme)
-
-        self.exp_outdir = QLineEdit()
-        self.exp_outdir.setPlaceholderText("Output directory…")
-        eform.addRow("Output:", self.exp_outdir)
-
-        # IMPROVEMENT: add GIF export option
-        row_format = QHBoxLayout()
-        self.exp_gif = QCheckBox("Export as GIF")
-        row_format.addWidget(self.exp_gif)
-        self.exp_gif_fps = QSpinBox()
-        self.exp_gif_fps.setRange(5, 30); self.exp_gif_fps.setValue(12)
-        self.exp_gif_fps.setEnabled(False)
-        self.exp_gif.toggled.connect(self.exp_gif_fps.setEnabled)
-        row_format.addWidget(QLabel("GIF FPS:"))
-        row_format.addWidget(self.exp_gif_fps)
-        eform.addRow("Format:", row_format)
-
-        self.exp_gpu = QCheckBox("GPU post-process")
-        self.exp_gpu.setChecked(HAS_CUPY); self.exp_gpu.setEnabled(HAS_CUPY)
-        eform.addRow(self.exp_gpu)
-
-        row_gpu1 = QHBoxLayout()
-        self.exp_vignette = QSlider(Qt.Horizontal)
-        self.exp_vignette.setRange(0, 100); self.exp_vignette.setValue(25)
-        self.exp_vignette_lbl = QLabel("0.25")
-        self.exp_vignette.valueChanged.connect(
-            lambda v: self.exp_vignette_lbl.setText(f"{v/100:.2f}"))
-        row_gpu1.addWidget(self.exp_vignette, 1)
-        row_gpu1.addWidget(self.exp_vignette_lbl)
-        eform.addRow("Vignette:", row_gpu1)
-
-        row_gpu2 = QHBoxLayout()
-        self.exp_contrast = QSlider(Qt.Horizontal)
-        self.exp_contrast.setRange(80, 150); self.exp_contrast.setValue(102)
-        self.exp_contrast_lbl = QLabel("1.02")
-        self.exp_contrast.valueChanged.connect(
-            lambda v: self.exp_contrast_lbl.setText(f"{v/100:.2f}"))
-        row_gpu2.addWidget(self.exp_contrast, 1)
-        row_gpu2.addWidget(self.exp_contrast_lbl)
-        eform.addRow("Contrast:", row_gpu2)
-
-        row_gpu3 = QHBoxLayout()
-        self.exp_saturation = QSlider(Qt.Horizontal)
-        self.exp_saturation.setRange(80, 150); self.exp_saturation.setValue(105)
-        self.exp_saturation_lbl = QLabel("1.05")
-        self.exp_saturation.valueChanged.connect(
-            lambda v: self.exp_saturation_lbl.setText(f"{v/100:.2f}"))
-        row_gpu3.addWidget(self.exp_saturation, 1)
-        row_gpu3.addWidget(self.exp_saturation_lbl)
-        eform.addRow("Saturation:", row_gpu3)
-
-        l.addWidget(export_group)
-
-        # ── 5. Export Actions ────────────────────────────────────────────
-        action_group = QGroupBox("🚀 Export Actions")
-        al = QVBoxLayout(action_group)
-        exp_btns = QHBoxLayout()
-        self.btn_export_current = QPushButton("Current")
-        self.btn_export_current.clicked.connect(self._export_current_puzzle)
-        self.btn_export_selected = QPushButton("Selected")
-        self.btn_export_selected.clicked.connect(self._export_selected_batch)
-        self.btn_export_all = QPushButton("All")
-        self.btn_export_all.clicked.connect(self._export_all_batch)
-        exp_btns.addWidget(self.btn_export_current)
-        exp_btns.addWidget(self.btn_export_selected)
-        exp_btns.addWidget(self.btn_export_all)
-        al.addLayout(exp_btns)
-
-        self.puzzle_progress = QProgressBar()
-        self.puzzle_progress.setRange(0, 100); self.puzzle_progress.setValue(0)
-        al.addWidget(self.puzzle_progress)
-
-        self.puzzle_status = QLabel("")
-        self.puzzle_status.setWordWrap(True)
-        al.addWidget(self.puzzle_status)
-
-        self.btn_cancel_export = QPushButton("✕ Cancel Export")
-        self.btn_cancel_export.clicked.connect(self._cancel_export)
-        self.btn_cancel_export.setEnabled(False)
-        al.addWidget(self.btn_cancel_export)
-        l.addWidget(action_group)
-
-        self.puzzle_info = QTextEdit()
-        self.puzzle_info.setReadOnly(True)
-        self.puzzle_info.setMaximumHeight(50)
-        l.addWidget(self.puzzle_info)
-
-        l.addStretch()
-        scroll.setWidget(container)
-        self.tabs.addTab(scroll, "🧩 Puzzles")
-
-    # ── Puzzle pagination helpers ─────────────────────────────────────────
-
-    def _pz_total_items(self):
-        return self.db.get_count('puzzles', self.puzzle_filter.text().strip())
-
-    def _pz_page_count(self):
-        return max(1, math.ceil(self._pz_total_items() / self._PAGE_SIZE))
-
-    def _populate_puzzle_page(self):
-        self.puzzle_list.blockSignals(True)
-        self.puzzle_list.clear()
-        filter_text = self.puzzle_filter.text().strip()
-        items = self.db.get_page('puzzles', self._pz_page,
-                                 self._PAGE_SIZE, filter_text)
-        for item in items:
-            di = item['id']
-            checked = di in self._pz_checked
-            list_item = self.puzzle_list.add_checkable_item(
-                item["name"], data=item, checked=checked)
-            list_item.setData(Qt.UserRole + 1, di)
-        self.puzzle_list.blockSignals(False)
-        self._update_puzzle_nav()
-        self._update_puzzle_sel_label()
-
-    def _update_puzzle_nav(self):
-        total = self._pz_total_items()
-        pc = max(1, math.ceil(total / self._PAGE_SIZE))
-        self.pz_page_lbl.setText(
-            f"Page {self._pz_page + 1} / {pc}  ({total:,} items)")
-        self.btn_pz_prev.setEnabled(self._pz_page > 0)
-        self.btn_pz_next.setEnabled(self._pz_page < pc - 1)
-        self.pz_jump_spin.setRange(1, pc)
-        self.pz_jump_spin.setValue(self._pz_page + 1)
-        count = self.db.get_count('puzzles')
-        self.puzzle_range_from.setRange(1, max(1, count))
-        self.puzzle_range_to.setRange(1, max(1, count))
-
-    def _update_puzzle_sel_label(self, _item=None):
-        cnt = len(self._pz_checked)
-        total = self.db.get_count('puzzles')
-        self.puzzle_sel_label.setText(f"Selected: {cnt:,} / {total:,}")
-
-    def _on_puzzle_item_changed(self, item):
-        di = item.data(Qt.UserRole + 1)
-        if di is None:
-            return
-        if item.checkState() == Qt.Checked:
-            self._pz_checked.add(di)
-        else:
-            self._pz_checked.discard(di)
-        self._update_puzzle_sel_label()
-
-    def _apply_puzzle_filter(self):
-        self._pz_page = 0
-        self._populate_puzzle_page()
-
-    def _puzzle_select_all(self):
-        filter_text = self.puzzle_filter.text().strip()
-        self._pz_checked = set(
-            self.db.get_ids_by_filter('puzzles', filter_text))
-        self._populate_puzzle_page()
-
-    def _puzzle_select_none(self):
-        self._pz_checked.clear()
-        self._populate_puzzle_page()
-
-    def _puzzle_select_invert(self):
-        filter_text = self.puzzle_filter.text().strip()
-        all_ids = set(self.db.get_ids_by_filter('puzzles', filter_text))
-        self._pz_checked = all_ids - self._pz_checked
-        self._populate_puzzle_page()
-
-    def _puzzle_select_range(self):
-        # FIX: use actual database IDs instead of raw sequential numbers
-        start = self.puzzle_range_from.value()
-        end = self.puzzle_range_to.value()
-        if start > end:
-            start, end = end, start
-        all_ids = self.db.get_ids_by_filter('puzzles')
-        # IDs are sorted; select by position range
-        for i in range(start - 1, min(end, len(all_ids))):
-            self._pz_checked.add(all_ids[i])
-        self._populate_puzzle_page()
-
-    def _pz_prev_page(self):
-        if self._pz_page > 0:
-            self._pz_page -= 1
-            self._populate_puzzle_page()
-
-    def _pz_next_page(self):
-        if self._pz_page < self._pz_page_count() - 1:
-            self._pz_page += 1
-            self._populate_puzzle_page()
-
-    def _pz_jump_page(self):
-        page = self.pz_jump_spin.value() - 1
-        if 0 <= page < self._pz_page_count():
-            self._pz_page = page
-            self._populate_puzzle_page()
-
-    # ── Build export config ──────────────────────────────────────────────────
-
-    def _build_export_config(self, puzzle_name=""):
-        cfg = ExportConfig()
-        title_text = self.exp_title.text().strip()
-        cfg.title_text = title_text if title_text else puzzle_name
-        cfg.end_text = self.exp_end.text()
-        cfg.fps = self.exp_fps.value()
-        cfg.max_workers = self.exp_workers.value()
-        cfg.theme_name = self.exp_theme.currentText()
-        cfg.output_dir = self.exp_outdir.text().strip()
-        cfg.gpu_post_process = self.exp_gpu.isChecked()
-        cfg.gpu_vignette = self.exp_vignette.value() / 100.0
-        cfg.gpu_contrast = self.exp_contrast.value() / 100.0
-        cfg.gpu_saturation = self.exp_saturation.value() / 100.0
-        # FIX: apply export preset so target dimensions are set
-        preset_name = self.exp_preset.currentText()
-        cfg.apply_preset(preset_name)
-        # IMPROVEMENT: GIF export settings
-        cfg.export_gif = self.exp_gif.isChecked()
-        cfg.gif_fps = self.exp_gif_fps.value()
-        return cfg
-
-    def _ensure_output_dir(self):
-        d = self.exp_outdir.text().strip()
-        if not d:
-            d = (self.settings_outdir.text().strip()
-                 if hasattr(self, 'settings_outdir') else "")
-        if not d:
-            d = str(Path(DATA_DIR) / "exports")
-            self.exp_outdir.setText(d)
-            if hasattr(self, 'settings_outdir'):
-                self.settings_outdir.setText(d)
-        os.makedirs(d, exist_ok=True)
-        return d
-
-    # ── Export: current puzzle ────────────────────────────────────────────────
-
-    def _export_current_puzzle(self):
-        item = self.puzzle_list.currentItem()
-        if not item:
-            self.puzzle_status.setText("No puzzle selected."); return
-        pz_slim = item.data(Qt.UserRole)
-        if not pz_slim:
-            self.puzzle_status.setText("No puzzle data."); return
-
-        # FIX: fetch full record (slim has no fen/moves)
-        full = self.db.get_items_by_ids('puzzles', [pz_slim['id']])
-        if not full:
-            self.puzzle_status.setText("Failed to load puzzle data."); return
-        pz_copy = dict(full[0])
-        pz_copy['display_title'] = f"Puzzle #{pz_copy['id']}"
-
-        out_dir = self._ensure_output_dir()
-        from constants import sanitize_filename
-        cfg = self._build_export_config(
-            pz_copy.get('display_title', pz_copy['name']))
-        ext = ".gif" if cfg.export_gif else ".mp4"
-        filename = sanitize_filename(pz_copy['name']) + ext
-        filepath = os.path.join(out_dir, filename)
-
-        if os.path.exists(filepath):
-            base = sanitize_filename(pz_copy['name'])
-            i = 2
-            while os.path.exists(os.path.join(out_dir, f"{base}_{i}{ext}")):
-                i += 1
-            filepath = os.path.join(out_dir, f"{base}_{i}{ext}")
-
-        log(f"Exporting current puzzle: {pz_copy['name']} -> {filepath}",
-            "EXPORT")
-        self._set_exporting(True)
-        self.export_worker = ExportWorker(pz_copy, filepath, cfg)
-        self.export_worker.progress.connect(self._on_single_progress)
-        self.export_worker.finished.connect(self._on_single_finished)
-        self.export_worker.start()
-
-    def _export_selected_batch(self):
-        if not self._pz_checked:
-            self.puzzle_status.setText(
-                "No puzzles checked for batch export."); return
-        puzzles = self.db.get_items_by_ids('puzzles', list(self._pz_checked))
-        for p in puzzles:
-            p['display_title'] = f"Puzzle #{p['id']}"
-        self._start_batch_export(puzzles)
-
-    def _export_all_batch(self):
-        total = self.db.get_count('puzzles')
-        if total == 0:
-            self.puzzle_status.setText("No puzzles loaded."); return
-        all_ids = self.db.get_ids_by_filter('puzzles')
-        puzzles = self.db.get_items_by_ids('puzzles', all_ids)
-        for p in puzzles:
-            p['display_title'] = f"Puzzle #{p['id']}"
-        self._start_batch_export(puzzles)
-
-    def _on_single_progress(self, pct):
-        self.puzzle_progress.setValue(pct)
-        self.puzzle_status.setText(f"Rendering… {pct}%")
-
-    def _on_single_finished(self, msg):
-        self.puzzle_status.setText(msg)
-        self.puzzle_progress.setValue(100 if "Saved" in msg else 0)
-        self._set_exporting(False)
-        if self.export_worker:
-            self.export_worker.deleteLater()
-            self.export_worker = None
-
-    # ── Export: batch ─────────────────────────────────────────────────────────
-
-    def _start_batch_export(self, puzzles):
-        out_dir = self._ensure_output_dir()
-        cfg = self._build_export_config()
-        total = len(puzzles)
-        log(f"Starting batch export: {total} puzzles -> {out_dir}", "EXPORT")
-        self._set_exporting(True, batch=True)
-        self.puzzle_progress.setValue(0)
-        self.puzzle_status.setText(f"Batch: 0 / {total}")
-
-        if self.puzzle_batch_worker and self.puzzle_batch_worker.isRunning():
-            self.puzzle_batch_worker.abort()
-            self.puzzle_batch_worker.wait(3000)
-            self.puzzle_batch_worker = BatchExportWorker(puzzles, out_dir, cfg)
-            self.puzzle_batch_worker.batch_progress.connect(self._on_batch_progress)
-            self.puzzle_batch_worker.puzzle_progress.connect(self._on_batch_puzzle_progress)
-            self.puzzle_batch_worker.puzzle_done.connect(self._on_batch_puzzle_done)
-            self.puzzle_batch_worker.puzzle_error.connect(self._on_batch_puzzle_error)
-            self.puzzle_batch_worker.all_done.connect(self._on_batch_all_done)
-            self.puzzle_batch_worker.start()
-
-    def _on_batch_progress(self, idx, total, name):
-        pct = int(100 * (idx + 1) / total) if total > 0 else 0
-        self.puzzle_progress.setValue(pct)
-        self.puzzle_status.setText(f"Batch [{idx+1}/{total}]: {name}")
-
-    def _on_batch_puzzle_progress(self, idx, pct):
-        pass
-
-    def _on_batch_puzzle_done(self, idx, filepath):
-        log(f"Batch puzzle done: {filepath}", "EXPORT")
-
-    def _on_batch_puzzle_error(self, idx, msg):
-        log(f"Batch puzzle error: {msg}", "EXPORT")
-
-    def _on_batch_all_done(self, exported, errors, out_dir):
-        self.puzzle_progress.setValue(100)
-        self.puzzle_status.setText(
-            f"Batch done: {exported} exported, {errors} errors → {out_dir}")
-        self._set_exporting(False, batch=True)
-        if self.puzzle_batch_worker:
-            self.puzzle_batch_worker.deleteLater()
-            self.puzzle_batch_worker = None
-
-    # ── Cancel / UI state ────────────────────────────────────────────────────
-
-    def _cancel_export(self):
-        if self.export_worker and self.export_worker.isRunning():
-            self.export_worker.abort()
-            self.puzzle_status.setText("Cancelling single export…")
-        if self.puzzle_batch_worker and self.puzzle_batch_worker.isRunning():
-            self.puzzle_batch_worker.abort()
-            self.puzzle_status.setText("Cancelling puzzle batch export…")
-        if self.opening_batch_worker and self.opening_batch_worker.isRunning():
-            self.opening_batch_worker.abort()
-            self.opening_status.setText("Cancelling opening batch export…")
-
-    def _set_exporting(self, busy, batch=False):
-        self.btn_export_current.setEnabled(not busy)
-        self.btn_export_selected.setEnabled(not busy)
-        self.btn_export_all.setEnabled(not busy)
-        self.btn_cancel_export.setEnabled(busy)
-
-    # ── Load puzzle DB ───────────────────────────────────────────────────────
-
-    def load_puzzle_db(self):
-        path = self.puzzle_db_path.text().strip()
-        if not path:
-            self.puzzle_db_status.setText("Enter a database path above first.")
-            return
-        if not os.path.exists(path):
-            self.puzzle_db_status.setText(f"File not found: {path}")
-            return
-        self.puzzle_db_status.setText("Loading…")
-        self._start_data_load("puzzles", single_file=path)
-
-    # ── Load puzzle to board ─────────────────────────────────────────────────
-
-    def load_puzzle(self):
-        item = self.puzzle_list.currentItem()
-        if not item:
-            return
-        pz_slim = item.data(Qt.UserRole)
-        if not pz_slim:
-            return
-        # FIX: slim record has no fen/moves — fetch full record from parquet
-        full = self.db.get_items_by_ids('puzzles', [pz_slim['id']])
-        if not full:
-            return
-        pz = full[0]
-        if pz.get("fen"):
-            self.engine.load_fen(pz["fen"])
-        else:
-            self.engine.reset()
-        self.puzzle_info.setText(pz.get("desc", ""))
-        self.board_widget.selected = None
-        self.board_widget.legal_targets = []
-        self.board_widget.update()
-        self.snd.play("start")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    #  SETTINGS TAB
-    # ══════════════════════════════════════════════════════════════════════════
+        layout = QVBoxLayout(tab)
+
+        # Preset
+        preset_group = QGroupBox("Preset")
+        preset_layout = QFormLayout(preset_group)
+        self.combo_preset = QComboBox()
+        for name in EXPORT_PRESETS:
+            self.combo_preset.addItem(name)
+        self.combo_preset.setCurrentText(self.export_config.preset_name)
+        self.combo_preset.currentTextChanged.connect(self._on_preset_changed)
+        preset_layout.addRow("Preset:", self.combo_preset)
+
+        self.spin_width = QSpinBox(); self.spin_width.setRange(128, 7680); self.spin_width.setValue(self.export_config.target_width)
+        self.spin_height = QSpinBox(); self.spin_height.setRange(128, 4320); self.spin_height.setValue(self.export_config.target_height)
+        self.spin_fps = QSpinBox(); self.spin_fps.setRange(1, 120); self.spin_fps.setValue(self.export_config.fps)
+        preset_layout.addRow("Width:", self.spin_width)
+        preset_layout.addRow("Height:", self.spin_height)
+        preset_layout.addRow("FPS:", self.spin_fps)
+        layout.addWidget(preset_group)
+
+        # Title / End
+        card_group = QGroupBox("Title / End Cards")
+        card_layout = QFormLayout(card_group)
+        self.chk_title = QCheckBox(); self.chk_title.setChecked(self.export_config.title_enabled)
+        self.edit_title = QLineEdit(self.export_config.title_text)
+        self.spin_title_dur = QSpinBox(); self.spin_title_dur.setRange(1, 30); self.spin_title_dur.setValue(int(self.export_config.title_duration))
+        self.chk_end = QCheckBox(); self.chk_end.setChecked(self.export_config.end_enabled)
+        self.edit_end = QLineEdit(self.export_config.end_text)
+        self.spin_end_dur = QSpinBox(); self.spin_end_dur.setRange(1, 30); self.spin_end_dur.setValue(int(self.export_config.end_duration))
+        card_layout.addRow("Title card:", self.chk_title); card_layout.addRow("Title text:", self.edit_title); card_layout.addRow("Title duration (s):", self.spin_title_dur)
+        card_layout.addRow("End card:", self.chk_end); card_layout.addRow("End text:", self.edit_end); card_layout.addRow("End duration (s):", self.spin_end_dur)
+        layout.addWidget(card_group)
+
+        # Animation
+        anim_group = QGroupBox("Animation")
+        anim_layout = QFormLayout(anim_group)
+        self.spin_anim_dur = QSpinBox(); self.spin_anim_dur.setRange(1, 100); self.spin_anim_dur.setValue(int(self.export_config.move_anim_duration * 10))
+        self.spin_pause = QSpinBox(); self.spin_pause.setRange(1, 100); self.spin_pause.setValue(int(self.export_config.pause_after_move * 10))
+        anim_layout.addRow("Move anim (×0.1s):", self.spin_anim_dur); anim_layout.addRow("Pause after (×0.1s):", self.spin_pause)
+        layout.addWidget(anim_group)
+
+        # FFmpeg
+        ffmpeg_group = QGroupBox("FFmpeg Encoding")
+        ffmpeg_layout = QFormLayout(ffmpeg_group)
+        self.spin_crf = QSpinBox(); self.spin_crf.setRange(0, 51); self.spin_crf.setValue(self.export_config.ffmpeg_crf)
+        self.combo_preset_ff = QComboBox(); self.combo_preset_ff.addItems(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"])
+        self.combo_preset_ff.setCurrentText(self.export_config.ffmpeg_preset)
+        self.chk_gif = QCheckBox(); self.chk_gif.setChecked(self.export_config.export_gif)
+        self.spin_gif_fps = QSpinBox(); self.spin_gif_fps.setRange(1, 30); self.spin_gif_fps.setValue(self.export_config.gif_fps)
+        ffmpeg_layout.addRow("CRF:", self.spin_crf); ffmpeg_layout.addRow("Preset:", self.combo_preset_ff)
+        ffmpeg_layout.addRow("Export as GIF:", self.chk_gif); ffmpeg_layout.addRow("GIF FPS:", self.spin_gif_fps)
+        layout.addWidget(ffmpeg_group)
+
+        # Audio
+        audio_group = QGroupBox("Audio")
+        audio_layout = QFormLayout(audio_group)
+        self.edit_audio_path = QLineEdit(self.export_config.audio_path)
+        btn_audio_browse = QPushButton("Browse…")
+        btn_audio_browse.clicked.connect(self._on_browse_audio)
+        audio_row = QHBoxLayout(); audio_row.addWidget(self.edit_audio_path); audio_row.addWidget(btn_audio_browse)
+        audio_layout.addRow("Audio file:", audio_row)
+        layout.addWidget(audio_group)
+
+        # Post-processing
+        pp_group = QGroupBox("Post-Processing")
+        pp_layout = QFormLayout(pp_group)
+        self.chk_postproc = QCheckBox(); self.chk_postproc.setChecked(self.export_config.gpu_post_process)
+        self.slider_vignette = QSlider(Qt.Horizontal); self.slider_vignette.setRange(0, 100); self.slider_vignette.setValue(int(self.export_config.gpu_vignette * 100))
+        self.slider_contrast = QSlider(Qt.Horizontal); self.slider_contrast.setRange(80, 150); self.slider_contrast.setValue(int(self.export_config.gpu_contrast * 100))
+        self.slider_saturation = QSlider(Qt.Horizontal); self.slider_saturation.setRange(50, 200); self.slider_saturation.setValue(int(self.export_config.gpu_saturation * 100))
+        pp_layout.addRow("Enable:", self.chk_postproc); pp_layout.addRow("Vignette:", self.slider_vignette)
+        pp_layout.addRow("Contrast:", self.slider_contrast); pp_layout.addRow("Saturation:", self.slider_saturation)
+        layout.addWidget(pp_group)
+
+        # Export buttons
+        btn_layout = QHBoxLayout()
+        self.btn_export = QPushButton("🎬 Export Current Puzzle"); self.btn_export.clicked.connect(self._on_export)
+        self.btn_export_batch = QPushButton("📦 Batch Export All"); self.btn_export_batch.clicked.connect(self._on_batch_export)
+        self.btn_cancel_export = QPushButton("✖ Cancel"); self.btn_cancel_export.clicked.connect(self._on_cancel_export); self.btn_cancel_export.setEnabled(False)
+        btn_layout.addWidget(self.btn_export); btn_layout.addWidget(self.btn_export_batch); btn_layout.addWidget(self.btn_cancel_export)
+        layout.addLayout(btn_layout)
+
+        self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        layout.addStretch()
+        self.tabs.addTab(scroll, "🎬 Export")
+
+    # ── Settings Tab ────────────────────────────────────────────────────
 
     def _build_settings_tab(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        container = QWidget()
-        l = QVBoxLayout(container)
-        l.setSpacing(12)
+        tab = QWidget()
+        layout = QFormLayout(tab)
+        self.combo_theme = QComboBox(); self.combo_theme.addItems(THEMES.keys()); self.combo_theme.setCurrentText("Classic")
+        self.combo_theme.currentTextChanged.connect(self._on_theme_changed)
+        layout.addRow("Board theme:", self.combo_theme)
+        self.chk_sound = QCheckBox(); self.chk_sound.setChecked(True); self.chk_sound.toggled.connect(self._on_sound_toggled)
+        layout.addRow("Sound enabled:", self.chk_sound)
+        self.slider_volume = QSlider(Qt.Horizontal); self.slider_volume.setRange(0, 100); self.slider_volume.setValue(70)
+        self.slider_volume.valueChanged.connect(self._on_volume_changed)
+        layout.addRow("Volume:", self.slider_volume)
+        self.slider_anim_speed = QSlider(Qt.Horizontal); self.slider_anim_speed.setRange(0, 500); self.slider_anim_speed.setValue(ANIM_SPEED_DEFAULT)
+        self.slider_anim_speed.valueChanged.connect(self._on_anim_speed_changed)
+        layout.addRow("Animation speed (ms):", self.slider_anim_speed)
+        self.lbl_anim_speed = QLabel(f"{ANIM_SPEED_DEFAULT} ms"); layout.addRow("", self.lbl_anim_speed)
+        ffmpeg_status = "✅ Available" if HAS_FFMPEG else "❌ Not found"
+        layout.addRow("FFmpeg:", QLabel(ffmpeg_status))
+        self.tabs.addTab(tab, "⚙ Settings")
 
-        # ── Appearance ──────────────────────────────────────────────────
-        appear_group = QGroupBox("🎨 Appearance")
-        aform = QFormLayout(appear_group)
+    # ── Signal Connections ──────────────────────────────────────────────
 
-        self.settings_theme_cb = QComboBox()
-        self.settings_theme_cb.addItems(THEMES.keys())
-        self.settings_theme_cb.currentTextChanged.connect(self._change_theme)
-        aform.addRow("Theme:", self.settings_theme_cb)
+    def _connect_signals(self):
+        self.board_widget.move_made.connect(self._on_move_made)
 
-        row_anim = QHBoxLayout()
-        self.settings_anim_slider = QSlider(Qt.Horizontal)
-        self.settings_anim_slider.setRange(0, 600)
-        self.settings_anim_slider.setValue(600 - ANIM_SPEED_DEFAULT)
-        self.settings_anim_slider.setInvertedAppearance(True)
-        self.settings_anim_lbl = QLabel(self._fmt_anim(ANIM_SPEED_DEFAULT))
-        self.settings_anim_slider.valueChanged.connect(self._update_anim_speed)
-        row_anim.addWidget(self.settings_anim_slider, 1)
-        row_anim.addWidget(self.settings_anim_lbl)
-        aform.addRow("Anim Speed:", row_anim)
+    # ── Puzzle Loading ──────────────────────────────────────────────────
 
-        l.addWidget(appear_group)
+    def _on_load_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Puzzle File", "",
+            "Puzzle files (*.csv *.json *.parquet *.pgn *.tsv);;All files (*)")
+        if not path: return
+        try:
+            puzzles = self.puzzle_loader.load_file(path)
+            self.puzzles = puzzles
+            self.puzzle_list.clear()
+            for p in puzzles:
+                item = QListWidgetItem(p['name'][:80])
+                item.setData(Qt.UserRole, p)
+                self.puzzle_list.addItem(item)
+            self.puzzle_count_label.setText(f"{len(puzzles)} puzzles")
+            if puzzles: self.puzzle_list.setCurrentRow(0)
+            self.statusBar().showMessage(f"Loaded {len(puzzles)} puzzles from {os.path.basename(path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", str(e))
 
-        # ── Export Default Path ──────────────────────────────────────────
-        path_group = QGroupBox("📁 Default Export Path")
-        pl = QHBoxLayout(path_group)
-        self.settings_outdir = QLineEdit(str(Path(DATA_DIR) / "exports"))
-        pl.addWidget(self.settings_outdir, 1)
-        l.addWidget(path_group)
+    def _on_puzzle_selected(self, row):
+        if row < 0 or row >= len(self.puzzles): return
+        self.current_puzzle_idx = row
+        self.current_puzzle = self.puzzles[row]
+        self._start_puzzle()
 
-        # ── Database Info ────────────────────────────────────────────────
-        db_info_group = QGroupBox("💾 Database Info")
-        db_info_layout = QVBoxLayout(db_info_group)
-        db_info_layout.addWidget(
-            QLabel("Cache format: Parquet (.parquet / .pq)"))
-        db_info_layout.addWidget(
-            QLabel(f"Puzzles cache: {self.db._cache_path('puzzles')}"))
-        db_info_layout.addWidget(
-            QLabel(f"Openings cache: {self.db._cache_path('openings')}"))
-        l.addWidget(db_info_group)
+    def _start_puzzle(self):
+        p = self.current_puzzle
+        if not p: return
+        fen = p.get('fen', '')
+        if fen: self.engine.load_fen(fen)
+        else: self.engine.reset()
+        self.puzzle_move_idx = 0
+        self.puzzle_mode = True
+        self.auto_play_timer.stop()
+        self.puzzle_name_label.setText(p.get('name', '—'))
+        self.puzzle_diff_label.setText(f"{p.get('difficulty', 0):.2f}")
+        self.puzzle_desc_label.setText(p.get('desc', '—'))
+        self.puzzle_status_label.setText("Your turn" if p.get('moves') else "")
+        self.history_text.clear()
+        self.fen_label.setText(f"FEN: {self.engine.board.fen()}")
+        self.board_widget.selected = None; self.board_widget.legal_targets = []; self.board_widget.update()
 
-        l.addStretch()
-        scroll.setWidget(container)
-        self.tabs.addTab(scroll, "⚙️ Settings")
+    # ── Navigation ──────────────────────────────────────────────────────
+
+    def _on_prev_puzzle(self):
+        if self.current_puzzle_idx > 0: self.puzzle_list.setCurrentRow(self.current_puzzle_idx - 1)
+    def _on_next_puzzle(self):
+        if self.current_puzzle_idx < len(self.puzzles) - 1: self.puzzle_list.setCurrentRow(self.current_puzzle_idx + 1)
+    def _on_reset_puzzle(self):
+        if self.current_puzzle: self._start_puzzle()
+
+    def _on_hint(self):
+        if not self.current_puzzle or not self.puzzle_mode: return
+        moves = self.current_puzzle.get('moves', [])
+        if self.puzzle_move_idx < len(moves):
+            next_uci = moves[self.puzzle_move_idx]
+            info = self.engine.make_move_uci(next_uci)
+            if info:
+                self.puzzle_move_idx += 1
+                self.history_text.append(f"{'White' if self.engine.board.turn == chess.BLACK else 'Black'}: {info['notation']} (Hint)")
+                self.fen_label.setText(f"FEN: {self.engine.board.fen()}")
+                self.board_widget.update()
+                if self.puzzle_move_idx < len(moves): self._schedule_auto_play()
+                else: self.puzzle_mode = False; self.puzzle_status_label.setText("Puzzle complete!")
+
+    # ── Move Handling ───────────────────────────────────────────────────
+
+    def _on_move_made(self, notation):
+        if not notation: return
+        turn_str = 'White' if self.engine.board.turn == chess.BLACK else 'Black'
+        self.history_text.append(f"{turn_str}: {notation}")
+        self.fen_label.setText(f"FEN: {self.engine.board.fen()}")
+        if self.puzzle_mode and self.current_puzzle:
+            moves = self.current_puzzle.get('moves', [])
+            if self.puzzle_move_idx < len(moves): self._schedule_auto_play()
+            else: self.puzzle_mode = False; self.puzzle_status_label.setText("Puzzle complete!")
+        if self.engine.game_over: self.puzzle_mode = False; self.puzzle_status_label.setText(f"Game Over: {self.engine.result}")
+
+    def _schedule_auto_play(self):
+        if not self.current_puzzle: return
+        moves = self.current_puzzle.get('moves', [])
+        if self.puzzle_move_idx < len(moves): self.auto_play_timer.start(600)
+
+    def _auto_play_response(self):
+        if not self.current_puzzle or not self.puzzle_mode: return
+        moves = self.current_puzzle.get('moves', [])
+        if self.puzzle_move_idx >= len(moves): return
+        next_uci = moves[self.puzzle_move_idx]
+        info = self.engine.make_move_uci(next_uci)
+        if info:
+            self.puzzle_move_idx += 1
+            turn_str = 'White' if self.engine.board.turn == chess.BLACK else 'Black'
+            self.history_text.append(f"{turn_str}: {info['notation']}")
+            self.fen_label.setText(f"FEN: {self.engine.board.fen()}")
+            if self.engine.game_over: self.puzzle_mode = False; self.puzzle_status_label.setText(f"Game Over: {self.engine.result}")
+            elif self.puzzle_move_idx >= len(moves): self.puzzle_mode = False; self.puzzle_status_label.setText("Puzzle complete!")
+            self.board_widget.update()
+        else: log(f"Failed to auto-play response: {next_uci}", "PUZZLE")
+
+    # ── Settings Handlers ───────────────────────────────────────────────
+
+    def _on_theme_changed(self, name):
+        if name in THEMES: self.board_widget.current_theme = THEMES[name]; self.export_config.theme_name = name; self.board_widget.update()
+    def _on_sound_toggled(self, checked): self.sound_mgr.set_enabled(checked)
+    def _on_volume_changed(self, val): self.sound_mgr.set_volume(val / 100.0)
+    def _on_anim_speed_changed(self, val): self.board_widget.anim_speed = val; self.lbl_anim_speed.setText(f"{val} ms")
+
+    # ── Export Handlers ─────────────────────────────────────────────────
+
+    def _on_preset_changed(self, name):
+        self.export_config.apply_preset(name)
+        self.spin_width.setValue(self.export_config.target_width); self.spin_height.setValue(self.export_config.target_height)
+        self.spin_fps.setValue(self.export_config.fps)
+
+    def _on_browse_audio(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Audio File", "", "Audio (*.mp3 *.wav *.aac *.ogg *.flac);;All files (*)")
+        if path: self.edit_audio_path.setText(path)
+
+    def _sync_export_config(self):
+        cfg = self.export_config
+        cfg.target_width = self.spin_width.value(); cfg.target_height = self.spin_height.value(); cfg.fps = self.spin_fps.value()
+        cfg.title_enabled = self.chk_title.isChecked(); cfg.title_text = self.edit_title.text(); cfg.title_duration = self.spin_title_dur.value()
+        cfg.end_enabled = self.chk_end.isChecked(); cfg.end_text = self.edit_end.text(); cfg.end_duration = self.spin_end_dur.value()
+        cfg.move_anim_duration = self.spin_anim_dur.value() / 10.0; cfg.pause_after_move = self.spin_pause.value() / 10.0
+        cfg.ffmpeg_crf = self.spin_crf.value(); cfg.ffmpeg_preset = self.combo_preset_ff.currentText()
+        cfg.export_gif = self.chk_gif.isChecked(); cfg.gif_fps = self.spin_gif_fps.value(); cfg.audio_path = self.edit_audio_path.text().strip()
+        cfg.gpu_post_process = self.chk_postproc.isChecked(); cfg.gpu_vignette = self.slider_vignette.value() / 100.0
+        cfg.gpu_contrast = self.slider_contrast.value() / 100.0; cfg.gpu_saturation = self.slider_saturation.value() / 100.0
+        cfg.theme_name = self.combo_theme.currentText()
+
+    def _create_exporter(self):
+        self._sync_export_config()
+        self.exporter = FFmpegVideoExporter(self.export_config)
+        self.exporter.progress.connect(self._on_export_progress)
+        self.exporter.finished.connect(self._on_export_finished)
+        self.exporter.error.connect(self._on_export_error)
+        self.exporter.log_msg.connect(lambda m: self.statusBar().showMessage(m))
+
+    def _on_export(self):
+        if not self.current_puzzle: QMessageBox.warning(self, "Export", "No puzzle selected."); return
+        if not HAS_FFMPEG: QMessageBox.critical(self, "Export Error", "FFmpeg not found!\nInstall ffmpeg and add it to your system PATH."); return
+        ext = '.gif' if self.export_config.export_gif else '.mp4'
+        default_name = sanitize_filename(self.current_puzzle.get('name', 'puzzle')) + ext
+        path, _ = QFileDialog.getSaveFileName(self, "Export Video", default_name, f"Video (*{ext});;All files (*)")
+        if not path: return
+        self._create_exporter()
+        self.progress_bar.setVisible(True); self.progress_bar.setValue(0)
+        self.btn_export.setEnabled(False); self.btn_export_batch.setEnabled(False); self.btn_cancel_export.setEnabled(True)
+        self.exporter.export_puzzle_threaded(self.current_puzzle, path)
+
+    def _on_batch_export(self):
+        if not self.puzzles: QMessageBox.warning(self, "Export", "No puzzles loaded."); return
+        if not HAS_FFMPEG: QMessageBox.critical(self, "Export Error", "FFmpeg not found!\nInstall ffmpeg and add it to your system PATH."); return
+        output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        if not output_dir: return
+        self._create_exporter()
+        self.progress_bar.setVisible(True); self.progress_bar.setValue(0)
+        self.btn_export.setEnabled(False); self.btn_export_batch.setEnabled(False); self.btn_cancel_export.setEnabled(True)
+        t = threading.Thread(target=self.exporter.export_batch, args=(self.puzzles, output_dir), daemon=True); t.start()
+
+    def _on_cancel_export(self):
+        if self.exporter: self.exporter.cancel()
+
+    def _on_export_progress(self, current, total):
+        if total > 0: self.progress_bar.setMaximum(total); self.progress_bar.setValue(current)
+
+    def _on_export_finished(self, path):
+        self.progress_bar.setVisible(False); self.btn_export.setEnabled(True); self.btn_export_batch.setEnabled(True); self.btn_cancel_export.setEnabled(False)
+        self.statusBar().showMessage(f"Export complete: {path}"); self.exporter = None
+
+    def _on_export_error(self, msg):
+        self.progress_bar.setVisible(False); self.btn_export.setEnabled(True); self.btn_export_batch.setEnabled(True); self.btn_cancel_export.setEnabled(False)
+        QMessageBox.critical(self, "Export Error", msg); self.exporter = None
+
+    # ── Theme & Cleanup ─────────────────────────────────────────────────
+
+    def _apply_theme(self):
+        self.setStyleSheet("""
+            QMainWindow { background: #2b2b2b; }
+            QWidget { color: #e0e0e0; font-size: 13px; }
+            QTabWidget::pane { border: 1px solid #555; background: #2b2b2b; }
+            QTabBar::tab { background: #3c3c3c; padding: 6px 12px; border: 1px solid #555; }
+            QTabBar::tab:selected { background: #4a4a4a; border-bottom: 2px solid #88c0d0; }
+            QGroupBox { border: 1px solid #555; border-radius: 4px; margin-top: 8px; padding-top: 12px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+            QPushButton { background: #3c3c3c; border: 1px solid #666; border-radius: 4px; padding: 5px 12px; }
+            QPushButton:hover { background: #4a4a4a; }
+            QPushButton:pressed { background: #555; }
+            QPushButton:disabled { background: #2a2a2a; color: #666; }
+            QComboBox, QSpinBox, QLineEdit { background: #3c3c3c; border: 1px solid #666; border-radius: 3px; padding: 3px; }
+            QListWidget { background: #1e1e1e; border: 1px solid #555; }
+            QListWidget::item:selected { background: #4a6984; }
+            QTextEdit { background: #1e1e1e; border: 1px solid #555; }
+            QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; background: #1e1e1e; }
+            QProgressBar::chunk { background: #88c0d0; }
+            QSlider::groove:horizontal { background: #3c3c3c; height: 6px; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #88c0d0; width: 14px; margin: -4px 0; border-radius: 7px; }
+            QCheckBox::indicator { width: 14px; height: 14px; }
+        """)
+
+    def closeEvent(self, event):
+        self.auto_play_timer.stop()
+        if self.exporter: self.exporter.cancel()
+        self.sound_mgr.cleanup()
+        event.accept()
