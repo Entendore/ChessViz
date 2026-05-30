@@ -41,4 +41,7 @@ __pycache__/
 MP4Files/
 *.parquet
 data/
+output/
+Output/
+export/
 # <<< AUTO DISCOVERED RULES <<<
