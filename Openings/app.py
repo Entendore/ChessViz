@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py — Entry point for Chess Openings App.
-
-Install:  pip install PySide6 numpy imageio[ffmpeg] chess
-Optional: pip install pandas pyarrow duckdb
-GPU/Accel: pip install numba cupy-cuda121
+app.py — Entry point for Chess Openings App.
 """
 
 import sys
@@ -15,11 +11,9 @@ from main_window import MainWindow
 
 def main():
     log("Chess Openings App starting…")
-
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    # Dark palette
     from PySide6.QtGui import QPalette, QColor
     palette = QPalette()
     palette.setColor(QPalette.Window, QColor(45, 45, 48))
@@ -39,7 +33,6 @@ def main():
 
     window = MainWindow()
     window.show()
-
     log("Window shown — event loop starting")
     ret = app.exec()
     log("Application exiting")

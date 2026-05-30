@@ -17,7 +17,8 @@ from PySide6.QtGui import (
 from config import (
     SQ_SIZE, BOARD_PX, PIECE_SYM, FILES_STR, RANKS_STR,
     ANIM_SPEED_DEFAULT, ANIM_FPS, THEMES, MOVE_LIST_COLORS,
-    LayoutMode,
+    LayoutMode, MIN_MOVE_PANEL_W, MAX_MOVE_PANEL_W,
+    MIN_MOVE_PANEL_H, MAX_MOVE_PANEL_H,
 )
 from utils import get_render_assets, ease_out_cubic, log
 
@@ -58,6 +59,38 @@ else:
         return raw[:, :w * 3].reshape(h, w, 3)
 
 
+# ── Helper: square ↔ (row, col) accounting for flip ────────────────────────
+
+def _sq_to_rc(sq, flipped=False):
+    """Convert a chess square to (row, col) screen coordinates."""
+    rank = chess.square_rank(sq)
+    file = chess.square_file(sq)
+    if flipped:
+        return rank, 7 - file
+    return 7 - rank, file
+
+
+def _rc_to_sq(r, c, flipped=False):
+    """Convert (row, col) screen coordinates to a chess square."""
+    if flipped:
+        return chess.square(7 - c, r)
+    return chess.square(c, 7 - r)
+
+
+# ── Coordinate conversion helpers ──────────────────────────────────────────
+
+def _engine_rc_to_screen_rc(eng_r, eng_c, flipped=False):
+    """Convert engine (non-flipped) screen coords to display screen coords."""
+    sq = chess.square(eng_c, 7 - eng_r)
+    return _sq_to_rc(sq, flipped)
+
+
+def _screen_rc_to_engine_rc(screen_r, screen_c, flipped=False):
+    """Convert display screen coords to engine (non-flipped) screen coords."""
+    sq = _rc_to_sq(screen_r, screen_c, flipped)
+    return 7 - chess.square_rank(sq), chess.square_file(sq)
+
+
 # ── Chess Board Widget ─────────────────────────────────────────────────────
 
 class ChessBoardWidget(QWidget):
@@ -71,6 +104,9 @@ class ChessBoardWidget(QWidget):
         self.legal_targets = []
         self.setFixedSize(SQ_SIZE * 8, SQ_SIZE * 8)
         self.setMouseTracking(True)
+
+        self.flipped = False
+        self.auto_playing = False
 
         self.animating = False
         self.anim_from = None
@@ -88,6 +124,25 @@ class ChessBoardWidget(QWidget):
 
         self.current_theme = THEMES["Midnight"]
         self.show_arrow = True
+
+    # ── Flip ────────────────────────────────────────────────────────────
+
+    def flip(self):
+        """Toggle the board orientation."""
+        self.flipped = not self.flipped
+        if self.selected is not None:
+            sr, sc = self.selected
+            sq = _rc_to_sq(sr, sc, not self.flipped)
+            self.selected = _sq_to_rc(sq, self.flipped)
+            eng_r, eng_c = _screen_rc_to_engine_rc(self.selected[0], self.selected[1], self.flipped)
+            eng_targets = self.engine.legal_moves(eng_r, eng_c)
+            self.legal_targets = [
+                _engine_rc_to_screen_rc(et_r, et_c, self.flipped)
+                for et_r, et_c in eng_targets
+            ]
+        else:
+            self.legal_targets = []
+        self.update()
 
     # ── Animation ───────────────────────────────────────────────────────
 
@@ -121,17 +176,30 @@ class ChessBoardWidget(QWidget):
             return None
         t_eased = ease_out_cubic(self.anim_progress)
         return {'from': self.anim_from, 'to': self.anim_to,
-                'piece_obj': self.anim_piece_obj, 'progress': t_eased}
+                'piece_obj': self.anim_piece_obj,
+                'captured': self.anim_captured,
+                'progress': t_eased}
 
     # ── Paint ───────────────────────────────────────────────────────────
 
     def paintEvent(self, e):
         chk = self.engine.check_squares()
+        screen_check = [_engine_rc_to_screen_rc(cr, cc, self.flipped) for cr, cc in chk]
+
+        screen_last_move = None
+        if self.engine.last_move:
+            (fr, fc), (tr, tc) = self.engine.last_move
+            screen_last_move = (
+                _engine_rc_to_screen_rc(fr, fc, self.flipped),
+                _engine_rc_to_screen_rc(tr, tc, self.flipped),
+            )
+
         img = self.render_frame(
-            self.engine.board, self.engine.last_move,
+            self.engine.board, screen_last_move,
             self.selected, self.legal_targets,
-            check_squares=chk, anim_state=self._get_anim_state(),
-            theme=self.current_theme, show_arrow=self.show_arrow)
+            check_squares=screen_check, anim_state=self._get_anim_state(),
+            theme=self.current_theme, show_arrow=self.show_arrow,
+            flipped=self.flipped)
         pix = QPixmap.fromImage(img)
         painter = QPainter(self)
         painter.drawPixmap(0, 0, pix)
@@ -143,7 +211,8 @@ class ChessBoardWidget(QWidget):
     def render_frame(board, last_move=None, selected=None, legal_targets=None,
                      text_overlay="", check_squares=None, anim_state=None,
                      sq_size=SQ_SIZE, show_arrow=True, theme=None,
-                     highlight_last_move=True, show_coords=True):
+                     highlight_last_move=True, show_coords=True,
+                     flipped=False):
         if theme is None:
             theme = THEMES["Midnight"]
         sz = sq_size
@@ -162,8 +231,9 @@ class ChessBoardWidget(QWidget):
             skip_sq.add(anim_state['from'])
             skip_sq.add(anim_state['to'])
 
+        # ── 1. Squares, highlights, legal targets ───────────────────────
         for sq in chess.SQUARES:
-            r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
+            r, c = _sq_to_rc(sq, flipped)
             x, y = c * sz, r * sz
             is_light = (r + c) % 2 == 0
             color = theme.light_sq if is_light else theme.dark_sq
@@ -191,6 +261,31 @@ class ChessBoardWidget(QWidget):
                     p.setBrush(QColor(0, 0, 0, 90))
                     p.drawEllipse(cx - sz // 6, cy - sz // 6, sz // 3, sz // 3)
 
+        # ── 2. Stationary pieces ────────────────────────────────────────
+        for sq in chess.SQUARES:
+            r, c = _sq_to_rc(sq, flipped)
+            if (r, c) in skip_sq:
+                continue
+            piece = board.piece_at(sq)
+            if piece:
+                ChessBoardWidget._draw_piece(p, piece, r, c, sz, font_piece)
+
+        # ── 3. Captured piece fade-out ──────────────────────────────────
+        if anim_state and anim_state.get('captured', '.') != '.':
+            tr, tc_ = anim_state['to']
+            sym = anim_state['captured']
+            is_w = sym.isupper()
+            pt_map = {'K': chess.KING, 'Q': chess.QUEEN, 'R': chess.ROOK,
+                      'B': chess.BISHOP, 'N': chess.KNIGHT, 'P': chess.PAWN}
+            pt = pt_map.get(sym.upper())
+            if pt:
+                cap_piece = chess.Piece(pt, chess.WHITE if is_w else chess.BLACK)
+                fade = max(0, int(200 * (1.0 - anim_state['progress'])))
+                p.setOpacity(fade / 255.0)
+                ChessBoardWidget._draw_piece(p, cap_piece, tr, tc_, sz, font_piece)
+                p.setOpacity(1.0)
+
+        # ── 4. Arrow (AFTER pieces, BEFORE animated piece) ──────────────
         if show_arrow and last_move:
             (fr, fc), (tr, tc) = last_move
             ChessBoardWidget._draw_arrow(
@@ -198,31 +293,7 @@ class ChessBoardWidget(QWidget):
                 tc * sz + sz // 2, tr * sz + sz // 2,
                 theme.arrow_clr, sz)
 
-        for sq in chess.SQUARES:
-            r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
-            if (r, c) in skip_sq:
-                continue
-            piece = board.piece_at(sq)
-            if piece:
-                ChessBoardWidget._draw_piece(p, piece, r, c, sz, font_piece)
-
-        if anim_state and anim_state.get('captured', '.') != '.':
-            fr, fc_ = anim_state['from']
-            tr, tc_ = anim_state['to']
-            cap_piece = board.piece_at(chess.square(tc_, 7 - tr))
-            if cap_piece is None:
-                sym = anim_state['captured']
-                is_w = sym.isupper()
-                pt_map = {'K': chess.KING, 'Q': chess.QUEEN, 'R': chess.ROOK,
-                          'B': chess.BISHOP, 'N': chess.KNIGHT, 'P': chess.PAWN}
-                pt = pt_map.get(sym.upper())
-                if pt:
-                    cap_piece = chess.Piece(pt, chess.WHITE if is_w else chess.BLACK)
-                    fade = max(0, int(200 * (1.0 - anim_state['progress'])))
-                    p.setOpacity(fade / 255.0)
-                    ChessBoardWidget._draw_piece(p, cap_piece, tr, tc_, sz, font_piece)
-                    p.setOpacity(1.0)
-
+        # ── 5. Animated piece ───────────────────────────────────────────
         if anim_state:
             fr, fc_ = anim_state['from']
             tr, tc_ = anim_state['to']
@@ -244,24 +315,29 @@ class ChessBoardWidget(QWidget):
                 ChessBoardWidget._draw_piece_at(
                     p, anim_piece_obj, y_lift / sz, ic, sz, w, h, font_piece)
 
+        # ── 6. Coordinates ──────────────────────────────────────────────
         if show_coords:
             p.setFont(font_coord)
             coord_margin = max(3, int(sz * 0.04))
             coord_sz = max(12, sz // 5)
-            for c in range(8):
-                is_light = (7 + c) % 2 == 0
+            for c_idx in range(8):
+                file_idx = (7 - c_idx) if flipped else c_idx
+                is_light = (7 + c_idx) % 2 == 0
                 col = theme.dark_sq if is_light else theme.light_sq
                 p.setPen(col)
-                p.drawText(QRect(c * sz + sz - coord_sz - coord_margin,
+                p.drawText(QRect(c_idx * sz + sz - coord_sz - coord_margin,
                                  7 * sz + coord_margin, coord_sz, coord_sz),
-                           Qt.AlignCenter, FILES_STR[c])
-            for r in range(8):
-                is_light = r % 2 == 0
+                           Qt.AlignCenter, FILES_STR[file_idx])
+            for r_idx in range(8):
+                rank_idx = r_idx if flipped else (7 - r_idx)
+                is_light = r_idx % 2 == 0
                 col = theme.dark_sq if is_light else theme.light_sq
                 p.setPen(col)
-                p.drawText(QRect(coord_margin, r * sz + coord_margin,
-                                 coord_sz, coord_sz), Qt.AlignCenter, RANKS_STR[r])
+                p.drawText(QRect(coord_margin, r_idx * sz + coord_margin,
+                                 coord_sz, coord_sz),
+                           Qt.AlignCenter, RANKS_STR[rank_idx])
 
+        # ── 7. Text overlay ─────────────────────────────────────────────
         if text_overlay:
             p.fillRect(0, sz * 4 - 28, sz * 8, 56, QColor(0, 0, 0, 200))
             p.setPen(Qt.white)
@@ -395,56 +471,70 @@ class ChessBoardWidget(QWidget):
             return board_img
 
         colors = MOVE_LIST_COLORS
+        bw, bh = sq_size * 8, sq_size * 8
 
         if layout_mode == LayoutMode.BOARD_MOVES_RIGHT:
-            bw, bh = sq_size * 8, sq_size * 8
-            panel_w = target_w - bw
+            panel_w = max(MIN_MOVE_PANEL_W, min(MAX_MOVE_PANEL_W, int(bw * 0.38)))
+            remaining_w = target_w - bw
+            if remaining_w < panel_w:
+                panel_w = max(80, remaining_w)
             if panel_w < 80:
                 return board_img
 
             panel_img = ChessBoardWidget.render_move_list(
-                moves_san, current_move_idx, panel_w, bh, puzzle_info, colors, status_text)
+                moves_san, current_move_idx, panel_w, bh,
+                puzzle_info, colors, status_text)
 
             result = QImage(target_w, target_h, QImage.Format_ARGB32_Premultiplied)
             result.fill(QColor(*bg_color[:3]))
             rp = QPainter(result)
             rp.setRenderHint(QPainter.Antialiasing)
 
-            by = (target_h - bh) // 2
-            rp.drawImage(0, by, board_img)
-            rp.drawImage(bw, by, panel_img)
+            total_w = bw + panel_w
+            offset_x = (target_w - total_w) // 2
+            offset_y = (target_h - bh) // 2
+
+            rp.drawImage(offset_x, offset_y, board_img)
+            rp.drawImage(offset_x + bw, offset_y, panel_img)
 
             rp.setPen(QPen(QColor(*colors['border'][:3]), 1))
-            rp.drawLine(bw, by, bw, by + bh)
+            rp.drawLine(offset_x + bw, offset_y, offset_x + bw, offset_y + bh)
             rp.end()
             return result
 
         elif layout_mode == LayoutMode.BOARD_MOVES_BOTTOM:
-            bw, bh = sq_size * 8, sq_size * 8
-            panel_h = target_h - bh
+            panel_h = max(MIN_MOVE_PANEL_H, min(MAX_MOVE_PANEL_H, int(bh * 0.28)))
+            remaining_h = target_h - bh
+            if remaining_h < panel_h:
+                panel_h = max(60, remaining_h)
             if panel_h < 60:
                 return board_img
 
+            panel_w = bw
             panel_img = ChessBoardWidget.render_move_list(
-                moves_san, current_move_idx, target_w, panel_h, puzzle_info, colors, status_text)
+                moves_san, current_move_idx, panel_w, panel_h,
+                puzzle_info, colors, status_text)
 
             result = QImage(target_w, target_h, QImage.Format_ARGB32_Premultiplied)
             result.fill(QColor(*bg_color[:3]))
             rp = QPainter(result)
             rp.setRenderHint(QPainter.Antialiasing)
 
-            bx = (target_w - bw) // 2
-            rp.drawImage(bx, 0, board_img)
-            rp.drawImage(0, bh, panel_img)
+            total_h = bh + panel_h
+            offset_x = (target_w - bw) // 2
+            offset_y = (target_h - total_h) // 2
+
+            rp.drawImage(offset_x, offset_y, board_img)
+            rp.drawImage(offset_x, offset_y + bh, panel_img)
 
             rp.setPen(QPen(QColor(*colors['border'][:3]), 1))
-            rp.drawLine(0, bh, target_w, bh)
+            rp.drawLine(offset_x, offset_y + bh, offset_x + bw, offset_y + bh)
             rp.end()
             return result
 
         return board_img
 
-    # ── Card rendering (title / end) ────────────────────────────────────
+    # ── Card rendering ──────────────────────────────────────────────────
 
     @staticmethod
     def render_card(text, bg="#1a1b26", fg="#c0caf5", w=544, h=544,
@@ -554,13 +644,15 @@ class ChessBoardWidget(QWidget):
         c = int(e.position().x()) // SQ_SIZE
         r = int(e.position().y()) // SQ_SIZE
         if not (0 <= r < 8 and 0 <= c < 8): return
-        sq = self.engine.rc_to_sq(r, c)
-        piece = self.engine.board.piece_at(sq)
+
+        eng_r, eng_c = _screen_rc_to_engine_rc(r, c, self.flipped)
+        piece = self.engine.board.piece_at(self.engine.rc_to_sq(eng_r, eng_c))
 
         if self.selected:
             sr, sc = self.selected
             if (r, c) in self.legal_targets:
-                info = self.engine.make_move(sr, sc, r, c)
+                sel_eng_r, sel_eng_c = _screen_rc_to_engine_rc(sr, sc, self.flipped)
+                info = self.engine.make_move(sel_eng_r, sel_eng_c, eng_r, eng_c)
                 if info:
                     is_capture = info['captured'] != '.'
                     sfx = ("capture" if is_capture else "castle" if info['castle'] else "move")
@@ -576,7 +668,11 @@ class ChessBoardWidget(QWidget):
         else:
             if piece and piece.color == self.engine.board.turn:
                 self.selected = (r, c)
-                self.legal_targets = self.engine.legal_moves(r, c)
+                eng_targets = self.engine.legal_moves(eng_r, eng_c)
+                self.legal_targets = [
+                    _engine_rc_to_screen_rc(et_r, et_c, self.flipped)
+                    for et_r, et_c in eng_targets
+                ]
                 if not self.legal_targets:
                     self.snd.play("error"); self.selected = None
         self.update()

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Constants, themes, presets, and configuration classes."""
 
+import hashlib
 import os
+import shutil
+import threading
+
 import chess
 from PySide6.QtGui import QColor
 
@@ -9,7 +13,14 @@ from PySide6.QtGui import QColor
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
+EXPORT_DIR = os.path.join(APP_DIR, "exports")
 LICHESS_PARQUET_NAME = "lichess_db_puzzle.parquet"
+LICHESS_DB_PATH = os.path.join(DATA_DIR, LICHESS_PARQUET_NAME)
+EXPORT_MANIFEST_PATH = os.path.join(DATA_DIR, "export_manifest.duckdb")
+
+# ── External Dependency Checks ──────────────────────────────────────────────
+
+HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 # ── Board / Rendering Constants ─────────────────────────────────────────────
 
@@ -45,6 +56,13 @@ LAYOUT_MODES = {
     LayoutMode.BOARD_MOVES_RIGHT:  "Board + Moves (Right)",
     LayoutMode.BOARD_MOVES_BOTTOM: "Board + Moves (Bottom)",
 }
+
+# ── Move Panel Size Constraints ─────────────────────────────────────────────
+
+MIN_MOVE_PANEL_W = 200
+MAX_MOVE_PANEL_W = 400
+MIN_MOVE_PANEL_H = 140
+MAX_MOVE_PANEL_H = 300
 
 # ── Minimalist Color Palette (Tokyo Night inspired) ────────────────────────
 
@@ -109,6 +127,7 @@ MOVE_LIST_COLORS = {
 # ── Pagination ──────────────────────────────────────────────────────────────
 
 PUZZLES_PER_PAGE = 200
+PAGE_SIZE_OPTIONS = [50, 100, 200, 500]
 
 # ── Lichess Database Exact Mapping ─────────────────────────────────────────
 
@@ -166,16 +185,12 @@ class ExportPreset:
 
     def calc_sq_size(self):
         if self.layout == LayoutMode.BOARD_MOVES_RIGHT:
-            shorter = self.height
-            board_px = int(shorter * self.board_frac)
+            max_board_px = min(self.width - MIN_MOVE_PANEL_W, self.height)
         elif self.layout == LayoutMode.BOARD_MOVES_BOTTOM:
-            board_frac = min(self.board_frac, 0.70)
-            shorter = self.width
-            board_px = int(shorter * board_frac)
+            max_board_px = min(self.width, self.height - MIN_MOVE_PANEL_H)
         else:
-            shorter = min(self.width, self.height)
-            board_px = int(shorter * self.board_frac)
-        board_px = (board_px // 8) * 8
+            max_board_px = min(self.width, self.height) * self.board_frac
+        board_px = (max(1, int(max_board_px)) // 8) * 8
         return max(8, board_px // 8)
 
 
@@ -192,47 +207,19 @@ EXPORT_PRESETS = {
     "Custom": ExportPreset("Custom", 544, 544, 30, 0.82, (26, 27, 46), "User-defined"),
 }
 
-# ── Sound Design Presets ────────────────────────────────────────────────────
+# ── Sound Effect Packs ──────────────────────────────────────────────────────
 
-SOUND_PRESETS = {
-    "None": {
-        "name": "None",
-        "description": "No background audio",
-    },
-    "Soft Ambient": {
-        "name": "Soft Ambient",
-        "description": "Gentle layered sine pads",
-        "base_freq": 174,
-        "harmonics": [1.0, 0.5, 0.25, 0.125],
-        "beat_period": 2.5,
-        "volume": 0.15,
-    },
-    "Cinematic": {
-        "name": "Cinematic",
-        "description": "Deep dramatic atmosphere",
-        "base_freq": 110,
-        "harmonics": [1.0, 0.6, 0.3],
-        "beat_period": 3.0,
-        "volume": 0.2,
-    },
-    "Retro 8-bit": {
-        "name": "Retro 8-bit",
-        "description": "Chip-tune square-wave melody",
-        "base_freq": 330,
-        "harmonics": [1.0],
-        "beat_period": 0.4,
-        "volume": 0.12,
-        "square_wave": True,
-    },
-    "Focus": {
-        "name": "Focus",
-        "description": "Minimal concentration drone",
-        "base_freq": 136,
-        "harmonics": [1.0, 0.3],
-        "beat_period": 4.0,
-        "volume": 0.1,
-    },
-}
+SOUND_PACKS = ["Classic", "Digital", "Wooden", "Arcade"]
+
+SOUND_EFFECTS = [
+    "move", "capture", "check", "checkmate",
+    "castle", "error", "promote", "start", "solved",
+]
+
+# ── YouTube Quality Constants (hardcoded) ───────────────────────────────────
+
+YOUTUBE_FFMPEG_PRESET = "slow"
+YOUTUBE_AUDIO_BITRATE = "192k"
 
 # ── Export Configuration ─────────────────────────────────────────────────────
 
@@ -282,19 +269,15 @@ class ExportConfig:
         self.target_height = 1080
         self.background_color = (26, 27, 46)
         self.board_frac = 0.75
-        self.audio_path = ""
-        self.audio_volume = 0.25
         self.export_gif = False
         self.gif_fps = 12
-        self.ffmpeg_crf = 20
-        self.ffmpeg_preset = "medium"
         self.layout_mode = LayoutMode.BOARD_MOVES_RIGHT
 
         self.move_list_visible = True
         self.coordinate_visible = True
         self.batch_size = 16
         self.show_arrow = True
-        self.sound_preset = "None"
+        self.sound_pack = "Classic"
 
     def apply_preset(self, preset_name):
         if preset_name in EXPORT_PRESETS:
@@ -335,18 +318,23 @@ class ExportConfig:
     def move_panel_width(self):
         if self.layout_mode == LayoutMode.BOARD_MOVES_RIGHT:
             sq = self.effective_sq_size
-            return self.target_width - sq * 8
+            bw = sq * 8
+            remaining = self.target_width - bw
+            panel_w = max(MIN_MOVE_PANEL_W, min(MAX_MOVE_PANEL_W, int(bw * 0.38)))
+            return min(panel_w, remaining)
         return 0
 
     @property
     def move_panel_height(self):
         if self.layout_mode == LayoutMode.BOARD_MOVES_BOTTOM:
             sq = self.effective_sq_size
-            return self.target_height - sq * 8
+            bh = sq * 8
+            remaining = self.target_height - bh
+            panel_h = max(MIN_MOVE_PANEL_H, min(MAX_MOVE_PANEL_H, int(bh * 0.28)))
+            return min(panel_h, remaining)
         return 0
 
     def estimate_duration(self, n_moves):
-        """Estimate total video duration in seconds for audio generation."""
         total = 0.0
         if self.title_enabled and self.title_text:
             total += self.title_duration
@@ -357,3 +345,231 @@ class ExportConfig:
         if self.end_enabled and self.end_text:
             total += self.end_duration
         return max(1.0, total)
+
+    # ── Serialization ───────────────────────────────────────────────────
+
+    def to_dict(self):
+        return {
+            'fps': self.fps,
+            'title_enabled': self.title_enabled,
+            'title_text': self.title_text,
+            'title_duration': self.title_duration,
+            'title_bg': self.title_bg,
+            'title_fg': self.title_fg,
+            'title_font_size': self.title_font_size,
+            'position_hold_enabled': self.position_hold_enabled,
+            'position_hold_duration': self.position_hold_duration,
+            'position_overlay_text': self.position_overlay_text,
+            'end_enabled': self.end_enabled,
+            'end_text': self.end_text,
+            'end_duration': self.end_duration,
+            'end_bg': self.end_bg,
+            'end_fg': self.end_fg,
+            'end_font_size': self.end_font_size,
+            'move_speed': self.move_speed,
+            'pause_after_move': self.pause_after_move,
+            'pause_on_key_moves': self.pause_on_key_moves,
+            'key_move_pause_multiplier': self.key_move_pause_multiplier,
+            'highlight_last_move': self.highlight_last_move,
+            'highlight_key_squares': self.highlight_key_squares,
+            'loop_count': self.loop_count,
+            'easing_curve': self.easing_curve,
+            'theme_name': self.theme_name,
+            'gpu_post_process': self.gpu_post_process,
+            'gpu_vignette': self.gpu_vignette,
+            'gpu_contrast': self.gpu_contrast,
+            'gpu_saturation': self.gpu_saturation,
+            'preset_name': self.preset_name,
+            'target_width': self.target_width,
+            'target_height': self.target_height,
+            'background_color': list(self.background_color),
+            'board_frac': self.board_frac,
+            'export_gif': self.export_gif,
+            'gif_fps': self.gif_fps,
+            'layout_mode': self.layout_mode,
+            'move_list_visible': self.move_list_visible,
+            'coordinate_visible': self.coordinate_visible,
+            'show_arrow': self.show_arrow,
+            'sound_pack': self.sound_pack,
+        }
+
+    def from_dict(self, d):
+        if not d or not isinstance(d, dict):
+            return
+        _simple = {
+            'fps', 'title_enabled', 'title_text', 'title_duration',
+            'title_bg', 'title_fg', 'title_font_size',
+            'position_hold_enabled', 'position_hold_duration',
+            'position_overlay_text', 'end_enabled', 'end_text',
+            'end_duration', 'end_bg', 'end_fg', 'end_font_size',
+            'move_speed', 'pause_after_move', 'pause_on_key_moves',
+            'key_move_pause_multiplier', 'highlight_last_move',
+            'highlight_key_squares', 'loop_count', 'easing_curve',
+            'theme_name', 'gpu_post_process', 'gpu_vignette',
+            'gpu_contrast', 'gpu_saturation', 'preset_name',
+            'export_gif', 'gif_fps',
+            'layout_mode', 'move_list_visible', 'coordinate_visible',
+            'show_arrow', 'sound_pack',
+        }
+        for key in _simple:
+            if key in d:
+                setattr(self, key, d[key])
+        if 'target_width' in d:
+            self.target_width = int(d['target_width'])
+        if 'target_height' in d:
+            self.target_height = int(d['target_height'])
+        if 'background_color' in d:
+            bc = d['background_color']
+            if isinstance(bc, (list, tuple)) and len(bc) >= 3:
+                self.background_color = tuple(bc[:3])
+        if 'board_frac' in d:
+            self.board_frac = float(d['board_frac'])
+
+# ── Puzzle ID & Export Manifest ─────────────────────────────────────────────
+
+def _get_puzzle_id(puzzle):
+    """Get or generate a consistent, unique puzzle ID."""
+    pid = puzzle.get('id', '')
+    if pid and str(pid).strip() and str(pid).strip().lower() not in ('nan', 'none', ''):
+        return str(pid).strip()
+    fen = puzzle.get('fen', '')
+    moves = ' '.join(puzzle.get('moves', []))
+    hash_input = f"{fen}|{moves}"
+    return hashlib.md5(hash_input.encode()).hexdigest()[:16]
+
+
+class ExportManifest:
+    """Tracks exported puzzles in a local DuckDB (or JSON fallback) database."""
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = None
+        self._json_data = {}
+        self._json_path = os.path.splitext(db_path)[0] + '.json'
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        try:
+            import duckdb
+            self._conn = duckdb.connect(self.db_path)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS export_manifest (
+                    puzzle_id VARCHAR PRIMARY KEY,
+                    export_time TIMESTAMP DEFAULT current_timestamp,
+                    output_path VARCHAR,
+                    preset_name VARCHAR,
+                    puzzle_name VARCHAR
+                )
+            """)
+            log("Export manifest database initialized (DuckDB)", "MANIFEST")
+            return
+        except Exception as e:
+            log(f"DuckDB manifest init failed ({e}), using JSON fallback", "MANIFEST")
+            self._conn = None
+
+        import json
+        try:
+            if os.path.exists(self._json_path):
+                with open(self._json_path, 'r') as f:
+                    self._json_data = json.load(f)
+                log(f"Export manifest loaded from JSON ({len(self._json_data)} records)", "MANIFEST")
+        except Exception:
+            self._json_data = {}
+
+    def mark_exported(self, puzzle_id, output_path='', preset_name='', puzzle_name=''):
+        with self._lock:
+            pid = str(puzzle_id)
+            if self._conn:
+                try:
+                    self._conn.execute("""
+                        INSERT OR REPLACE INTO export_manifest
+                        (puzzle_id, output_path, preset_name, puzzle_name)
+                        VALUES (?, ?, ?, ?)
+                    """, [pid, output_path, preset_name, puzzle_name])
+                    return
+                except Exception:
+                    pass
+            import json
+            from datetime import datetime
+            self._json_data[pid] = {
+                'export_time': datetime.now().isoformat(),
+                'output_path': output_path,
+                'preset_name': preset_name,
+                'puzzle_name': puzzle_name,
+            }
+            try:
+                with open(self._json_path, 'w') as f:
+                    json.dump(self._json_data, f, indent=2)
+            except Exception:
+                pass
+
+    def is_exported(self, puzzle_id):
+        pid = str(puzzle_id)
+        with self._lock:
+            if self._conn:
+                try:
+                    result = self._conn.execute(
+                        "SELECT 1 FROM export_manifest WHERE puzzle_id = ?", [pid]).fetchone()
+                    return result is not None
+                except Exception:
+                    pass
+            return pid in self._json_data
+
+    def get_exported_ids(self, puzzle_ids):
+        if not puzzle_ids:
+            return set()
+        str_ids = [str(pid) for pid in puzzle_ids]
+        with self._lock:
+            if self._conn:
+                try:
+                    placeholders = ','.join(['?'] * len(str_ids))
+                    rows = self._conn.execute(
+                        f"SELECT puzzle_id FROM export_manifest WHERE puzzle_id IN ({placeholders})",
+                        str_ids).fetchall()
+                    return {r[0] for r in rows}
+                except Exception:
+                    pass
+            return {pid for pid in str_ids if pid in self._json_data}
+
+    def get_info(self, puzzle_id):
+        """Return export metadata dict for a puzzle, or None."""
+        pid = str(puzzle_id)
+        with self._lock:
+            if self._conn:
+                try:
+                    row = self._conn.execute(
+                        "SELECT export_time, output_path, preset_name, puzzle_name "
+                        "FROM export_manifest WHERE puzzle_id = ?", [pid]).fetchone()
+                    if row:
+                        return {
+                            'timestamp': str(row[0]),
+                            'path': row[1] or '',
+                            'preset_name': row[2] or '',
+                            'puzzle_name': row[3] or '',
+                        }
+                except Exception:
+                    pass
+            if pid in self._json_data:
+                info = dict(self._json_data[pid])
+                info.setdefault('timestamp', info.get('export_time', ''))
+                info.setdefault('path', info.get('output_path', ''))
+                return info
+            return None
+
+    def close(self):
+        with self._lock:
+            if self._conn:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
+
+def log(msg, level="INFO"):
+    """Convenience logger for config module (avoids circular import from utils)."""
+    from datetime import datetime
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] [{level}] {msg}", flush=True)

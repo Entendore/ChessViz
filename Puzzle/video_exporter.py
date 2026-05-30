@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""FFmpeg-based video export with layout rendering, key-move pauses, and loops."""
+"""FFmpeg-based video export — YouTube-optimized, no background audio, batch support."""
 
 import os
 import shutil
 import subprocess
-import threading
+import wave
 
 import chess
 import numpy as np
@@ -12,9 +12,10 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtGui import QImage, QPainter, QColor
 
-from config import ExportConfig, THEMES, SQ_SIZE, LayoutMode, MOVE_LIST_COLORS
+from config import (ExportConfig, THEMES, SQ_SIZE, LayoutMode, MOVE_LIST_COLORS,
+                    YOUTUBE_FFMPEG_PRESET, YOUTUBE_AUDIO_BITRATE)
 from utils import log, ease_out_cubic, sanitize_filename
-from board_widget import ChessBoardWidget
+from board_widget import ChessBoardWidget, _sq_to_rc
 from chess_engine import ChessEngine
 
 # ── Local Dependency Check ──────────────────────────────────────────────────
@@ -60,28 +61,38 @@ def _apply_post_process(frame, config):
     return frame
 
 
+# ── Silent Audio Generator (for YouTube compatibility) ───────────────────────
+
+def _generate_silent_wav(path, duration_s, sr=44100):
+    n_samples = max(1, int(sr * duration_s))
+    with wave.open(path, 'w') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        chunk = b'\x00\x00' * min(n_samples, 44100)
+        written = 0
+        while written < n_samples:
+            frames_to_write = min(len(chunk) // 2, n_samples - written)
+            w.writeframes(chunk[:frames_to_write * 2])
+            written += frames_to_write
+
+
 # ── FFmpeg Video Exporter ───────────────────────────────────────────────────
 
 class FFmpegVideoExporter(QObject):
-    progress = Signal(int, int)
-    finished = Signal(str)
-    error = Signal(str)
+    progress = Signal(int, int)          # (frame_idx, total_frames)
+    finished = Signal(str)               # output_path
+    error = Signal(str)                  # error_message
     log_msg = Signal(str)
+    batch_puzzle_done = Signal(int, int, str)  # (completed, total, puzzle_name)
 
     def __init__(self, config: ExportConfig, parent=None):
         super().__init__(parent)
         self.config = config
         self._cancel = False
-        self._sound_mgr = None
-        self._sound_preset = "None"
 
     def cancel(self):
         self._cancel = True
-
-    def set_sound_design(self, sound_mgr, preset_name):
-        """Set the sound manager and preset for procedural background audio."""
-        self._sound_mgr = sound_mgr
-        self._sound_preset = preset_name
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -94,50 +105,61 @@ class FFmpegVideoExporter(QObject):
             actual_frames = self._export_streaming(puzzle, output_path)
             if self._cancel:
                 self.error.emit("Export cancelled."); return
-            # Merge audio (either from preset or from file path)
-            self._handle_audio_merge(output_path, actual_frames)
+            self._add_silent_audio(output_path, actual_frames)
             if not self._cancel: self.finished.emit(output_path)
         except Exception as e:
             self.error.emit(str(e))
 
     def export_puzzle_threaded(self, puzzle, output_path):
+        import threading
         t = threading.Thread(target=self.export_puzzle, args=(puzzle, output_path), daemon=True)
         t.start(); return t
 
     def export_batch(self, puzzles, output_dir):
-        if not HAS_FFMPEG: self.error.emit("ffmpeg not found."); return
+        """Export a list of puzzles sequentially, emitting batch_puzzle_done per puzzle."""
+        import threading
+        if not HAS_FFMPEG:
+            self.error.emit("ffmpeg not found."); return
         os.makedirs(output_dir, exist_ok=True)
         total = len(puzzles)
-        for i, puzzle in enumerate(puzzles):
-            if self._cancel: break
-            name = sanitize_filename(puzzle.get('name', f'puzzle_{i+1}'))
-            ext = '.gif' if self.config.export_gif else '.mp4'
-            path = os.path.join(output_dir, f"{name}{ext}")
-            try:
-                actual_frames = self._export_streaming(puzzle, path)
+
+        def _run():
+            self._cancel = False
+            for i, puzzle in enumerate(puzzles):
                 if self._cancel: break
-                self._handle_audio_merge(path, actual_frames)
-                self.log_msg.emit(f"Exported {i+1}/{total}: {name}")
-                self.progress.emit(i + 1, total)
-            except Exception as e:
-                self.log_msg.emit(f"Error on {name}: {e}")
-        if not self._cancel: self.finished.emit(output_dir)
+                name = sanitize_filename(puzzle.get('name', f'puzzle_{i+1}'))
+                ext = '.gif' if self.config.export_gif else '.mp4'
+                path = os.path.join(output_dir, f"{name}{ext}")
+                try:
+                    actual_frames = self._export_streaming(puzzle, path)
+                    if self._cancel: break
+                    self._add_silent_audio(path, actual_frames)
+                    self.batch_puzzle_done.emit(i + 1, total, name)
+                    self.log_msg.emit(f"Batch: exported {i+1}/{total}: {name}")
+                except Exception as e:
+                    self.log_msg.emit(f"Batch error on {name}: {e}")
+                    self.batch_puzzle_done.emit(i + 1, total, f"{name} (error)")
+            if not self._cancel:
+                self.finished.emit(output_dir)
+            else:
+                self.error.emit("Batch export cancelled.")
 
-    # ── Audio Handling ──────────────────────────────────────────────────
+        threading.Thread(target=_run, daemon=True).start()
 
-    def _handle_audio_merge(self, video_path, actual_frames):
-        """Merge background audio from sound preset or file path."""
-        if self._sound_preset != "None" and self._sound_mgr:
-            duration = actual_frames / self.config.fps if self.config.fps > 0 else 1.0
-            audio_tmp = os.path.join(self._sound_mgr.tmpdir, f"bg_{id(self)}_{actual_frames}.wav")
-            result = self._sound_mgr.generate_background_audio(
-                self._sound_preset, duration, audio_tmp)
-            if result:
-                self._merge_audio(video_path, audio_tmp)
-                try: os.remove(audio_tmp)
-                except OSError: pass
-        elif self.config.audio_path and os.path.isfile(self.config.audio_path):
-            self._merge_audio(video_path, self.config.audio_path)
+    # ── Audio: silent track for YouTube compatibility ───────────────────
+
+    def _add_silent_audio(self, video_path, actual_frames):
+        """Add a silent audio track so YouTube doesn't complain."""
+        duration = actual_frames / self.config.fps if self.config.fps > 0 else 1.0
+        silent_path = video_path + ".silent.wav"
+        try:
+            _generate_silent_wav(silent_path, duration)
+            self._merge_audio(video_path, silent_path)
+        except Exception as e:
+            log(f"Silent audio generation failed: {e}", "EXPORT")
+        finally:
+            try: os.remove(silent_path)
+            except OSError: pass
 
     # ── Streaming Core Logic ────────────────────────────────────────────
 
@@ -175,7 +197,7 @@ class FFmpegVideoExporter(QObject):
                     self._write_qimage_to_pipe(process, title_img, w, h)
                     frame_idx += 1; self.progress.emit(frame_idx, total_est)
 
-            # 2. Setup Moves (Auto-play opponent's first move for Lichess)
+            # 2. Setup Moves
             for i in range(setup_count):
                 if i >= len(uci_moves): break
                 frame_idx = self._execute_move_streaming(
@@ -197,9 +219,8 @@ class FFmpegVideoExporter(QObject):
             # 4. Puzzle Animation Phase (Supports Loops)
             loops = max(1, cfg.loop_count)
             for loop_idx in range(loops):
-                # Reset engine to start of solution for subsequent loops
                 if loop_idx > 0:
-                    engine.load_fen(fen)
+                    engine.load_fen(fen) if fen else engine.reset()
                     for i in range(setup_count):
                         if i < len(uci_moves): engine.make_move_uci(uci_moves[i])
 
@@ -239,14 +260,14 @@ class FFmpegVideoExporter(QObject):
     def _execute_move_streaming(self, process, engine, move_uci, san_moves, move_idx,
                                 frame_idx, total_est, sq_size, w, h, cfg, theme,
                                 puzzle_info, status_text, is_setup=False, is_key_move=False):
-        """Helper to animate, execute, and pause on a single move, writing frames to pipe."""
         move = chess.Move.from_uci(move_uci)
         if move not in engine.board.legal_moves:
             if move.promotion is None:
                 piece = engine.board.piece_at(move.from_square)
                 if piece and piece.piece_type == chess.PAWN:
-                    promo_rank = 7 if piece.color == chess.WHITE else 0
-                    if chess.square_rank(move.to_square) == promo_rank:
+                    to_rank = chess.square_rank(move.to_square)
+                    if (piece.color == chess.WHITE and to_rank == 7) or \
+                       (piece.color == chess.BLACK and to_rank == 0):
                         move = chess.Move(move.from_square, move.to_square, promotion=chess.QUEEN)
             if move not in engine.board.legal_moves:
                 self.log_msg.emit(f"Skipping illegal move: {move_uci}")
@@ -256,31 +277,42 @@ class FFmpegVideoExporter(QObject):
         tr, tc = ChessEngine.sq_to_rc(move.to_square)
         promo = chess.piece_symbol(move.promotion) if move.promotion else None
 
-        # Animation
+        is_ep = engine.board.is_en_passant(move)
+        if is_ep:
+            ep_cap_sq = chess.square(chess.square_file(move.to_square),
+                                     chess.square_rank(move.from_square))
+            cap = engine.board.piece_at(ep_cap_sq)
+        else:
+            cap = engine.board.piece_at(move.to_square)
+        captured = cap.symbol() if cap else '.'
+
         n_anim = max(1, int(cfg.fps * cfg.move_anim_duration))
         piece_obj = chess.Piece(engine.board.piece_at(move.from_square).piece_type, engine.board.turn)
-        cap = engine.board.piece_at(move.to_square)
-        captured = cap.symbol() if cap else '.'
 
         for fi in range(n_anim):
             if self._cancel: raise InterruptedError("Cancelled")
             t = fi / n_anim
-            anim_state = {'from': (fr, fc), 'to': (tr, tc), 'piece_obj': piece_obj, 'progress': ease_out_cubic(t), 'captured': captured}
+            anim_state = {
+                'from': (fr, fc), 'to': (tr, tc),
+                'piece_obj': piece_obj, 'progress': ease_out_cubic(t),
+                'captured': captured,
+            }
             frame_img = self._render_composited_frame(
-                engine.board, theme, sq_size, w, h, cfg, san_moves, move_idx, puzzle_info, status_text, anim_state=anim_state)
+                engine.board, theme, sq_size, w, h, cfg, san_moves, move_idx,
+                puzzle_info, status_text, anim_state=anim_state)
             self._write_qimage_to_pipe(process, frame_img, w, h)
             frame_idx += 1; self.progress.emit(frame_idx, total_est)
 
         info = engine.make_move(fr, fc, tr, tc, promo)
 
-        # Pause After Move (Scale for key moves)
         pause_duration = cfg.pause_after_move
         if is_key_move and cfg.pause_on_key_moves:
             pause_duration *= cfg.key_move_pause_multiplier
 
         n_pause = max(1, int(cfg.fps * pause_duration))
         pause_img = self._render_composited_frame(
-            engine.board, theme, sq_size, w, h, cfg, san_moves, move_idx, puzzle_info, status_text, last_move=((fr, fc), (tr, tc)))
+            engine.board, theme, sq_size, w, h, cfg, san_moves, move_idx,
+            puzzle_info, status_text, last_move=((fr, fc), (tr, tc)))
         for _ in range(n_pause):
             if self._cancel: raise InterruptedError("Cancelled")
             self._write_qimage_to_pipe(process, pause_img, w, h)
@@ -289,7 +321,6 @@ class FFmpegVideoExporter(QObject):
         return frame_idx
 
     def _is_key_move(self, engine, uci_str):
-        """Detects if a move is a check, capture, or promotion to trigger key move pause."""
         try:
             move = chess.Move.from_uci(uci_str)
             if engine.board.is_capture(move): return True
@@ -346,27 +377,58 @@ class FFmpegVideoExporter(QObject):
                 sans.append(uci)
         return sans
 
+    # ── YouTube-Optimized FFmpeg Command (hardcoded quality) ────────────
+
     def _build_ffmpeg_cmd(self, output_path, w, h):
         cfg = self.config
+        fps = cfg.fps
         bitrate_k = cfg.effective_bitrate
         maxrate_k = int(bitrate_k * 1.5)
         bufsize_k = bitrate_k * 2
 
+        if w >= 3840 or h >= 2160:
+            level = '5.1'
+        elif w >= 2560 or h >= 1440:
+            level = '5.0'
+        else:
+            level = '4.2'
+
+        gop = fps * 2
+
         if cfg.export_gif:
             gif_fps = cfg.gif_fps if cfg.gif_fps > 0 else 12
-            filter_str = f'fps={gif_fps},split[s0][s1];[s0]palettegen=max_colors=256:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3'
-            return ['ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', f'{w}x{h}', '-pix_fmt', 'rgb24', '-r', str(cfg.fps), '-i', '-', '-vf', filter_str, output_path]
+            filter_str = (
+                f'fps={gif_fps},'
+                f'split[s0][s1];'
+                f'[s0]palettegen=max_colors=256:stats_mode=diff[p];'
+                f'[s1][p]paletteuse=dither=bayer:bayer_scale=3'
+            )
+            return [
+                'ffmpeg', '-y',
+                '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                '-s', f'{w}x{h}', '-pix_fmt', 'rgb24',
+                '-r', str(fps), '-i', '-',
+                '-vf', filter_str,
+                output_path,
+            ]
         else:
             return [
                 'ffmpeg', '-y',
                 '-f', 'rawvideo', '-vcodec', 'rawvideo',
                 '-s', f'{w}x{h}', '-pix_fmt', 'rgb24',
-                '-r', str(cfg.fps), '-i', '-',
-                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-r', str(fps), '-i', '-',
+                '-c:v', 'libx264',
+                '-profile:v', 'high',
+                '-level', level,
+                '-pix_fmt', 'yuv420p',
                 '-b:v', f'{bitrate_k}k',
                 '-maxrate', f'{maxrate_k}k',
                 '-bufsize', f'{bufsize_k}k',
-                '-preset', cfg.ffmpeg_preset,
+                '-preset', YOUTUBE_FFMPEG_PRESET,
+                '-tune', 'stillimage',
+                '-refs', '4',
+                '-g', str(gop),
+                '-keyint_min', str(gop),
                 '-movflags', '+faststart',
                 output_path,
             ]
@@ -386,7 +448,21 @@ class FFmpegVideoExporter(QObject):
     def _merge_audio(self, video_path, audio_path):
         base, ext = os.path.splitext(video_path)
         output_path = f"{base}_with_audio{ext}"
-        cmd = ['ffmpeg', '-y', '-i', video_path, '-i', audio_path, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-map', '0:v:0', '-map', '1:a:0', output_path]
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-i', audio_path,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', YOUTUBE_AUDIO_BITRATE,
+            '-ac', '2',
+            '-ar', '44100',
+            '-shortest',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-movflags', '+faststart',
+            output_path,
+        ]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if result.returncode == 0:

@@ -28,9 +28,6 @@ class ChessEngine:
     def turn(self):
         return 'w' if self.board.turn == chess.WHITE else 'b'
 
-    def color_of(self, piece):
-        return 'w' if piece.color == chess.WHITE else 'b'
-
     def check_squares(self):
         if self.board.is_check():
             return [self.sq_to_rc(self.board.king(self.board.turn))]
@@ -99,4 +96,4 @@ class ChessEngine:
             else:
                 self.last_move = None
             return True
-        return False                              
+        return False

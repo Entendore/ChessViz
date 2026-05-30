@@ -2,7 +2,7 @@
 config.py — Constants, optional-dependency flags, logging, themes, presets, export config.
 """
 
-import os, math, shutil
+import os, shutil
 import numpy as np
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -54,8 +54,9 @@ def log(msg, level="INFO"):
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
+EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 DB_OPENINGS_PATH = os.path.join(DATA_DIR, "cache_openings.parquet")
-LICHESS_DB_PATH = os.path.join(DATA_DIR, "lichess_db_openings.parquet")   # NEW
+LICHESS_DB_PATH = os.path.join(DATA_DIR, "lichess_db_openings.parquet")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  BOARD / RENDERING CONSTANTS
@@ -94,9 +95,10 @@ class BoardTheme:
                  light=(240, 217, 181), dark=(181, 136, 99),
                  border=(48, 26, 7), highlight=(255, 255, 0, 100),
                  last_move=(155, 199, 0, 100), arrow=(220, 50, 47, 200)):
-        self.name = name; self.light_sq = QColor(*light); self.dark_sq = QColor(*dark)
-        self.border = QColor(*border); self.highlight = QColor(*highlight)
-        self.last_move = QColor(*last_move); self.arrow_clr = QColor(*arrow)
+        self.name = name; self.light_sq = QColor(*light)
+        self.dark_sq = QColor(*dark); self.border = QColor(*border)
+        self.highlight = QColor(*highlight); self.last_move = QColor(*last_move)
+        self.arrow_clr = QColor(*arrow)
         self.bg = QColor(32, 32, 36); self.coord = QColor(180, 160, 130)
 
 THEMES = {
@@ -119,32 +121,26 @@ class ExportPreset:
         self.fps = fps; self.board_frac = board_frac
         self.bg = bg; self.description = description
     @property
-    def aspect_ratio(self):
-        from math import gcd; g = gcd(self.width, self.height)
-        return self.width // g, self.height // g
-    @property
     def is_vertical(self): return self.height > self.width
     @property
     def is_square(self): return self.width == self.height
     def calc_sq_size(self):
-        shorter = min(self.width, self.height)
-        board_px = int(shorter * self.board_frac); board_px = (board_px // 8) * 8
+        if self.is_vertical:
+            board_px = int(self.width * self.board_frac)
+        else:
+            board_px = int(self.height * 0.78 * self.board_frac / 0.82)
+        board_px = (board_px // 8) * 8
         return max(8, board_px // 8)
-    def calc_board_rect(self):
-        sq = self.calc_sq_size(); bw = sq * 8; bh = sq * 8
-        return (self.width - bw) // 2, (self.height - bh) // 2, bw, bh
 
 EXPORT_PRESETS = {
-    "Board Only (544×544)": ExportPreset("Board Only", 544, 544, 30, 1.0, (26, 26, 46), "Square board-only"),
-    "YouTube 720p (1280×720)": ExportPreset("YouTube 720p", 1280, 720, 30, 0.82, (18, 18, 32), "16:9 HD"),
-    "YouTube 1080p (1920×1080)": ExportPreset("YouTube 1080p", 1920, 1080, 30, 0.78, (18, 18, 32), "16:9 Full HD"),
-    "YouTube 4K (3840×2160)": ExportPreset("YouTube 4K", 3840, 2160, 30, 0.75, (18, 18, 32), "16:9 4K"),
-    "YouTube Shorts (1080×1920)": ExportPreset("YouTube Shorts", 1080, 1920, 30, 0.50, (18, 18, 32), "9:16 vertical"),
-    "TikTok (1080×1920)": ExportPreset("TikTok", 1080, 1920, 30, 0.50, (18, 18, 32), "9:16 vertical"),
-    "Instagram Reels (1080×1920)": ExportPreset("Instagram Reels", 1080, 1920, 30, 0.50, (18, 18, 32), "9:16 vertical"),
-    "Instagram Square (1080×1080)": ExportPreset("Instagram Square", 1080, 1080, 30, 0.82, (18, 18, 32), "1:1 square"),
-    "Twitter/X (1280×720)": ExportPreset("Twitter/X", 1280, 720, 30, 0.80, (18, 18, 32), "16:9"),
-    "Custom": ExportPreset("Custom", 544, 544, 30, 0.82, (26, 26, 46), "User-defined"),
+    "YouTube 1080p":    ExportPreset("YouTube 1080p",    1920, 1080, 30, 0.60, (26, 26, 46), "16:9 Full HD"),
+    "YouTube 720p":     ExportPreset("YouTube 720p",     1280,  720, 30, 0.60, (26, 26, 46), "16:9 HD"),
+    "YouTube 4K":       ExportPreset("YouTube 4K",       3840, 2160, 30, 0.60, (26, 26, 46), "16:9 4K"),
+    "YouTube Shorts":   ExportPreset("YouTube Shorts",   1080, 1920, 30, 0.70, (26, 26, 46), "9:16 vertical"),
+    "TikTok":           ExportPreset("TikTok",           1080, 1920, 30, 0.70, (26, 26, 46), "9:16 vertical"),
+    "Instagram Reels":  ExportPreset("Instagram Reels",  1080, 1920, 30, 0.70, (26, 26, 46), "9:16 vertical"),
+    "Instagram Square": ExportPreset("Instagram Square", 1080, 1080, 30, 0.65, (26, 26, 46), "1:1 square"),
+    "Board Only":       ExportPreset("Board Only",        544,  544, 30, 1.00, (26, 26, 46), "Square board-only"),
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -153,38 +149,27 @@ EXPORT_PRESETS = {
 
 class ExportConfig:
     def __init__(self):
-        self.fps = 30; self.title_enabled = True; self.title_text = ""
-        self.title_duration = 3.0; self.title_bg = "#1a1a2e"
-        self.title_fg = "#e0e0e0"; self.title_font_size = 36
-        self.end_enabled = True; self.end_text = "Solved!"
-        self.end_duration = 3.0; self.end_bg = "#1a1a2e"
-        self.end_fg = "#e0e0e0"; self.end_font_size = 42
-        self.move_anim_duration = 0.4; self.pause_after_move = 1.0
-        self.highlight_duration = 0.3; self.max_workers = 4
-        self.sq_size = SQ_SIZE; self.theme_name = "Classic"
-        self.gpu_post_process = True; self.gpu_vignette = 0.25
-        self.gpu_contrast = 1.02; self.gpu_saturation = 1.05
-        self.output_dir = ""; self.batch_combine = False
-        self.preset_name = "Board Only (544×544)"
-        self.target_width = 544; self.target_height = 544
-        self.background_color = (26, 26, 46); self.board_frac = 0.82
-        self.audio_path = ""; self.audio_volume = 0.25
-        self.export_gif = False; self.gif_fps = 12
-        self.show_title_overlay = True; self.title_overlay_text = ""
-        self.subtitle_text = ""; self.use_ffmpeg = True
+        self.fps = 30
+        self.title_enabled = True; self.title_duration = 3.0
+        self.end_hold_enabled = True; self.end_hold_duration = 3.0
+        self.move_anim_duration = 0.5; self.pause_after_move = 0.8
+        self.preset_name = "YouTube 1080p"
+        self.theme_name = "Classic"
         self.ffmpeg_crf = 20; self.ffmpeg_preset = "medium"
-    def apply_preset(self, preset_name):
-        if preset_name in EXPORT_PRESETS:
-            p = EXPORT_PRESETS[preset_name]
-            self.preset_name = preset_name; self.target_width = p.width
-            self.target_height = p.height; self.fps = p.fps
-            self.background_color = p.bg; self.board_frac = p.board_frac
-            if preset_name != "Custom": self.sq_size = p.calc_sq_size()
+    def apply_preset(self, name):
+        if name in EXPORT_PRESETS:
+            p = EXPORT_PRESETS[name]; self.preset_name = name
+            self.fps = p.fps
     @property
-    def effective_sq_size(self):
-        if self.preset_name and self.preset_name not in ("Board Only (544×544)", "Custom"):
-            p = EXPORT_PRESETS.get(self.preset_name)
-            if p: return p.calc_sq_size()
-        return self.sq_size
+    def preset(self):
+        return EXPORT_PRESETS.get(self.preset_name, EXPORT_PRESETS["YouTube 1080p"])
     @property
-    def is_vertical(self): return self.target_height > self.target_width
+    def target_width(self): return self.preset.width
+    @property
+    def target_height(self): return self.preset.height
+    @property
+    def bg_color(self): return self.preset.bg
+    @property
+    def is_vertical(self): return self.preset.is_vertical
+    @property
+    def sq_size(self): return self.preset.calc_sq_size()

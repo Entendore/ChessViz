@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Puzzle file loading — iterative, vectorized, and lazy for large datasets."""
+"""Puzzle file loading — iterative, vectorized, lazy, with filtering and pagination."""
 
 import os
 import csv
 import json
+import re
 
 import chess
 import numpy as np
@@ -36,6 +37,18 @@ except ImportError:
     pass
 
 
+# ── Sort definitions ────────────────────────────────────────────────────────
+
+SORT_OPTIONS = {
+    "rating_desc":      ("Rating ↓",       f'"{LICHESS_COLUMNS["rating"]}" DESC'),
+    "rating_asc":       ("Rating ↑",       f'"{LICHESS_COLUMNS["rating"]}" ASC'),
+    "popularity_desc":  ("Popularity ↓",   f'"{LICHESS_COLUMNS["popularity"]}" DESC'),
+    "nb_plays_desc":    ("Most Played ↓",  f'"{LICHESS_COLUMNS["nb_plays"]}" DESC'),
+}
+
+SORT_DEFAULT = "rating_desc"
+
+
 # ── Lazy Puzzle Store for Large Parquet ─────────────────────────────────────
 
 class LazyPuzzleStore:
@@ -52,6 +65,7 @@ class LazyPuzzleStore:
         self._is_lichess = False
         self._filtered_total = 0
         self._filters = {}
+        self._sort_by = SORT_DEFAULT
         self._init_store()
 
     def _init_store(self):
@@ -109,9 +123,24 @@ class LazyPuzzleStore:
     def is_lichess(self):
         return self._is_lichess
 
+    @property
+    def sort_by(self):
+        return self._sort_by
+
+    @sort_by.setter
+    def sort_by(self, value):
+        if value in SORT_OPTIONS:
+            self._sort_by = value
+        else:
+            self._sort_by = SORT_DEFAULT
+
     def set_filters(self, filters):
         self._filters = filters or {}
         self._update_filtered_count()
+
+    def set_sort(self, sort_key):
+        self._sort_by = sort_key if sort_key in SORT_OPTIONS else SORT_DEFAULT
+        # No need to re-count, just re-order on next get_page
 
     def _update_filtered_count(self):
         if self._use_duckdb:
@@ -130,7 +159,6 @@ class LazyPuzzleStore:
     def _build_duckdb_where(self):
         f = self._filters
         conditions = []
-        # Use exact Lichess column mappings for SQL safety
         if f.get('min_rating') is not None:
             conditions.append(f'"{LICHESS_COLUMNS["rating"]}" >= {f["min_rating"]}')
         if f.get('max_rating') is not None:
@@ -170,6 +198,14 @@ class LazyPuzzleStore:
             col = LICHESS_COLUMNS['opening']
             if col in self._df.columns:
                 mask &= self._df[col].astype(str).str.contains(f['opening'], case=False, na=False)
+        if f.get('search'):
+            search = f['search'].lower()
+            combined = pd.Series('', index=self._df.index)
+            for col_key in ('id', 'themes', 'opening'):
+                col = LICHESS_COLUMNS.get(col_key, col_key)
+                if col in self._df.columns:
+                    combined = combined + ' ' + self._df[col].astype(str)
+            mask &= combined.str.lower().str.contains(search, na=False)
         return mask
 
     def get_page(self, page=0, page_size=PUZZLES_PER_PAGE):
@@ -184,8 +220,12 @@ class LazyPuzzleStore:
 
     def _get_page_duckdb(self, offset, limit):
         where = self._build_duckdb_where()
-        # Default sort by Rating descending
-        query = f'SELECT * FROM puzzles {where} ORDER BY "{LICHESS_COLUMNS["rating"]}" DESC LIMIT {limit} OFFSET {offset}'
+        order_clause = SORT_OPTIONS.get(self._sort_by, SORT_OPTIONS[SORT_DEFAULT])[1]
+        query = (
+            f'SELECT * FROM puzzles {where} '
+            f'ORDER BY {order_clause} '
+            f'LIMIT {limit} OFFSET {offset}'
+        )
         try:
             rows = self._conn.execute(query).fetchall()
             cols = [d[0] for d in self._conn.execute("SELECT * FROM puzzles LIMIT 0").description]
@@ -209,11 +249,15 @@ class LazyPuzzleStore:
             df = self._df[mask].reset_index(drop=True)
         else:
             df = self._df
-        # Sort by rating descending
-        col = LICHESS_COLUMNS['rating']
-        if col in df.columns:
-            df = df.sort_values(by=col, ascending=False).reset_index(drop=True)
-            
+
+        # Sort
+        sort_col = LICHESS_COLUMNS.get('rating', 'rating')
+        sort_asc = self._sort_by.endswith('_asc')
+        if sort_col in df.columns:
+            df = df.sort_values(
+                by=sort_col, ascending=sort_asc, na_position='last'
+            ).reset_index(drop=True)
+
         page_df = df.iloc[offset:offset + limit]
         result = []
         for i, (_, row) in enumerate(page_df.iterrows()):
@@ -320,7 +364,7 @@ def _process_rows_vectorized(rows):
 
     fen_col = 'fen' if 'fen' in df.columns else None
     fens = (df[fen_col].astype(str) if fen_col else pd.Series([''] * n, index=df.index))
-    
+
     desc_col = ('themes' if 'themes' in df.columns else 'desc' if 'desc' in df.columns else 'description' if 'description' in df.columns else None)
     descs = (df[desc_col].astype(str) if desc_col else pd.Series([''] * n, index=df.index))
 
@@ -346,13 +390,239 @@ def _process_rows_vectorized(rows):
     return puzzles
 
 
-# ── Puzzle Loader ───────────────────────────────────────────────────────────
+# ── Puzzle Loader (with filtering + pagination) ────────────────────────────
 
 class PuzzleLoader:
     def __init__(self, use_vectorized=True):
-        self.puzzles = []
+        self.puzzles = []              # current page of puzzles (what the UI shows)
+        self._all_puzzles = []         # all loaded puzzles (non-lazy mode)
         self.use_vectorized = use_vectorized and HAS_PANDAS
         self.lazy_store = None
+
+        # Filtering & pagination state
+        self._filters = {}
+        self._filtered_indices = None  # list of indices into _all_puzzles matching filters
+        self._page = 0
+        self._page_size = PUZZLES_PER_PAGE
+        self._sort_by = SORT_DEFAULT
+
+    # ── Properties ──────────────────────────────────────────────────────
+
+    @property
+    def total_count(self):
+        """Total number of loaded puzzles (unfiltered)."""
+        if self.lazy_store:
+            return self.lazy_store.total
+        return len(self._all_puzzles)
+
+    @property
+    def filtered_count(self):
+        """Number of puzzles matching current filters."""
+        if self.lazy_store:
+            return self.lazy_store.filtered_total
+        if self._filtered_indices is not None:
+            return len(self._filtered_indices)
+        return len(self._all_puzzles)
+
+    @property
+    def current_page(self):
+        return self._page
+
+    @property
+    def total_pages(self):
+        total = self.filtered_count
+        return max(1, (total + self._page_size - 1) // self._page_size)
+
+    @property
+    def page_size(self):
+        return self._page_size
+
+    @page_size.setter
+    def page_size(self, value):
+        self._page_size = max(10, min(1000, int(value)))
+        self._page = 0
+        self.refresh_page()
+
+    @property
+    def sort_by(self):
+        return self._sort_by
+
+    @sort_by.setter
+    def sort_by(self, value):
+        self._sort_by = value if value in SORT_OPTIONS else SORT_DEFAULT
+        if self.lazy_store:
+            self.lazy_store.set_sort(self._sort_by)
+        self._page = 0
+        self.refresh_page()
+
+    @property
+    def has_puzzles(self):
+        return len(self._all_puzzles) > 0 or self.lazy_store is not None
+
+    @property
+    def filters(self):
+        return dict(self._filters)
+
+    # ── Filtering ───────────────────────────────────────────────────────
+
+    def set_filters(self, filters):
+        """Apply filters and reset to page 0."""
+        self._filters = filters or {}
+        self._page = 0
+        if self.lazy_store:
+            self.lazy_store.set_filters(self._filters)
+        else:
+            self._apply_memory_filters()
+        self.refresh_page()
+
+    def clear_filters(self):
+        """Remove all filters and reset to page 0."""
+        self._filters = {}
+        self._filtered_indices = None
+        self._page = 0
+        if self.lazy_store:
+            self.lazy_store.set_filters({})
+        self.refresh_page()
+
+    def _apply_memory_filters(self):
+        """Filter _all_puzzles based on _filters, populating _filtered_indices."""
+        if not self._filters:
+            self._filtered_indices = None
+            return
+
+        indices = []
+        f = self._filters
+        min_rating = f.get('min_rating')
+        max_rating = f.get('max_rating')
+        theme = f.get('theme', '').lower()
+        opening = f.get('opening', '').lower()
+        search = f.get('search', '').lower()
+
+        for i, p in enumerate(self._all_puzzles):
+            # Rating filter
+            if min_rating is not None or max_rating is not None:
+                try:
+                    rating = float(p.get('rating', 0) or 0)
+                except (ValueError, TypeError):
+                    rating = 0
+                if min_rating is not None and rating < min_rating:
+                    continue
+                if max_rating is not None and rating > max_rating:
+                    continue
+
+            # Theme filter
+            if theme:
+                p_themes = str(p.get('themes', p.get('desc', ''))).lower()
+                if theme not in p_themes:
+                    continue
+
+            # Opening filter
+            if opening:
+                p_opening = str(p.get('opening', '')).lower()
+                if opening not in p_opening:
+                    continue
+
+            # Text search
+            if search:
+                searchable = ' '.join([
+                    str(p.get('name', '')),
+                    str(p.get('themes', p.get('desc', ''))),
+                    str(p.get('opening', '')),
+                    str(p.get('id', '')),
+                ]).lower()
+                if search not in searchable:
+                    continue
+
+            indices.append(i)
+
+        self._filtered_indices = indices
+
+    # ── Pagination ──────────────────────────────────────────────────────
+
+    def go_to_page(self, page):
+        page = max(0, min(page, self.total_pages - 1))
+        if page != self._page:
+            self._page = page
+            self.refresh_page()
+            return True
+        return False
+
+    def next_page(self):
+        if self._page < self.total_pages - 1:
+            self._page += 1
+            self.refresh_page()
+            return True
+        return False
+
+    def prev_page(self):
+        if self._page > 0:
+            self._page -= 1
+            self.refresh_page()
+            return True
+        return False
+
+    def first_page(self):
+        return self.go_to_page(0)
+
+    def last_page(self):
+        return self.go_to_page(self.total_pages - 1)
+
+    def refresh_page(self):
+        """Reload self.puzzles from the current page of results."""
+        if self.lazy_store:
+            self.puzzles = self.lazy_store.get_page(self._page, self._page_size)
+            return
+
+        # Non-lazy mode: slice from _all_puzzles (possibly filtered)
+        if self._filtered_indices is not None:
+            # Sort the filtered indices
+            sorted_indices = self._sort_memory_indices(self._filtered_indices)
+            start = self._page * self._page_size
+            page_indices = sorted_indices[start:start + self._page_size]
+            self.puzzles = [self._all_puzzles[i] for i in page_indices]
+        else:
+            # Sort all puzzles and slice
+            sorted_indices = self._sort_memory_indices(list(range(len(self._all_puzzles))))
+            start = self._page * self._page_size
+            page_indices = sorted_indices[start:start + self._page_size]
+            self.puzzles = [self._all_puzzles[i] for i in page_indices]
+
+    def _sort_memory_indices(self, indices):
+        """Sort puzzle indices based on current sort criteria."""
+        if not indices:
+            return indices
+
+        sort_key = self._sort_by
+
+        def get_sort_value(idx):
+            p = self._all_puzzles[idx]
+            if sort_key == 'rating_asc':
+                try: return float(p.get('rating', 0) or 0)
+                except: return 0
+            elif sort_key == 'popularity_desc':
+                try: return -float(p.get('popularity', 0) or 0)
+                except: return 0
+            elif sort_key == 'nb_plays_desc':
+                try: return -float(p.get('nb_plays', 0) or 0)
+                except: return 0
+            else:  # rating_desc default
+                try: return -float(p.get('rating', 0) or 0)
+                except: return 0
+
+        return sorted(indices, key=get_sort_value)
+
+    # ── Internal storage ────────────────────────────────────────────────
+
+    def _store_all_puzzles(self, puzzles):
+        """Store all puzzles and load first page."""
+        self._all_puzzles = puzzles
+        self._filtered_indices = None
+        self._page = 0
+        self._filters = {}
+        self._sort_by = SORT_DEFAULT
+        self.refresh_page()
+
+    # ── File loading ────────────────────────────────────────────────────
 
     def load_file(self, path):
         from pathlib import Path
@@ -372,8 +642,9 @@ class PuzzleLoader:
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             reader = csv.DictReader(f, delimiter=delimiter)
             for row in reader: rows.append(row)
-        self.puzzles = self._process_rows(rows)
-        return self.puzzles
+        all_puzzles = self._process_rows(rows)
+        self._store_all_puzzles(all_puzzles)
+        return all_puzzles
 
     def load_json(self, path):
         with open(path, 'r', encoding='utf-8') as f:
@@ -385,16 +656,20 @@ class PuzzleLoader:
                     rows = data[key]; break
             else: rows = [data]
         else: rows = []
-        self.puzzles = self._process_rows(rows)
-        return self.puzzles
+        all_puzzles = self._process_rows(rows)
+        self._store_all_puzzles(all_puzzles)
+        return all_puzzles
 
     def load_parquet(self, path):
         file_size = os.path.getsize(path)
-        if file_size > 50 * 1024 * 1024: # > 50MB triggers lazy load
+        if file_size > 50 * 1024 * 1024:  # > 50MB triggers lazy load
             log(f"Large parquet detected ({file_size / 1024 / 1024:.0f} MB), using lazy loading", "PUZZLE")
             if self.lazy_store: self.lazy_store.close()
+            self._all_puzzles = []
             self.lazy_store = LazyPuzzleStore(path)
-            self.puzzles = self.lazy_store.get_page(0)
+            self.lazy_store.set_sort(self._sort_by)
+            self._page = 0
+            self.refresh_page()
             return self.puzzles
 
         if HAS_PANDAS:
@@ -408,8 +683,9 @@ class PuzzleLoader:
             rows = [dict(zip(cols, r)) for r in result.fetchall()]
         else:
             raise ImportError("Need pandas, pyarrow, or duckdb for Parquet")
-        self.puzzles = self._process_rows(rows)
-        return self.puzzles
+        all_puzzles = self._process_rows(rows)
+        self._store_all_puzzles(all_puzzles)
+        return all_puzzles
 
     def load_pgn(self, path):
         rows = []
@@ -426,8 +702,9 @@ class PuzzleLoader:
                     'eco': headers.get('ECO', ''), 'opening': headers.get('Opening', ''),
                 }
                 rows.append(row)
-        self.puzzles = self._process_rows(rows)
-        return self.puzzles
+        all_puzzles = self._process_rows(rows)
+        self._store_all_puzzles(all_puzzles)
+        return all_puzzles
 
     def _process_rows(self, rows):
         if not rows: return []
