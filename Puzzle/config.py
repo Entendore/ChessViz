@@ -3,11 +3,12 @@
 
 import hashlib
 import os
-import shutil
 import threading
 
 import chess
 from PySide6.QtGui import QColor
+
+from utils import log, HAS_FFMPEG
 
 # ── File Paths ──────────────────────────────────────────────────────────────
 
@@ -18,9 +19,17 @@ LICHESS_PARQUET_NAME = "lichess_db_puzzle.parquet"
 LICHESS_DB_PATH = os.path.join(DATA_DIR, LICHESS_PARQUET_NAME)
 EXPORT_MANIFEST_PATH = os.path.join(DATA_DIR, "export_manifest.duckdb")
 
-# ── External Dependency Checks ──────────────────────────────────────────────
+# ── Auto-Save Paths ─────────────────────────────────────────────────────────
 
-HAS_FFMPEG = shutil.which("ffmpeg") is not None
+AUTOSAVE_DIR = os.path.join(os.path.expanduser("~"), ".chess_puzzle_studio")
+AUTOSAVE_PATH = os.path.join(AUTOSAVE_DIR, "state.json")
+AUTOSAVE_INTERVAL_MS = 30000  # 30 seconds
+
+# ── Random Generation Defaults ──────────────────────────────────────────────
+
+RANDOM_POSITION_MIN_MOVES = 10
+RANDOM_POSITION_MAX_MOVES = 80
+RANDOM_POSITION_DEFAULT_MOVES = 30
 
 # ── Board / Rendering Constants ─────────────────────────────────────────────
 
@@ -224,6 +233,8 @@ YOUTUBE_AUDIO_BITRATE = "192k"
 # ── Export Configuration ─────────────────────────────────────────────────────
 
 class ExportConfig:
+    """Stores all export-related settings. Synced from UI before each export."""
+
     def __init__(self):
         self.fps = 30
         self.title_enabled = True
@@ -232,28 +243,23 @@ class ExportConfig:
         self.title_bg = "#1a1b26"
         self.title_fg = "#c0caf5"
         self.title_font_size = 36
-
         self.position_hold_enabled = True
         self.position_hold_duration = 3.0
         self.position_overlay_text = "White to play"
-
         self.end_enabled = True
         self.end_text = "Solved!"
         self.end_duration = 3.0
         self.end_bg = "#1a1b26"
         self.end_fg = "#c0caf5"
         self.end_font_size = 42
-
         self.move_speed = 1.0
         self.pause_after_move = 0.5
         self.pause_on_key_moves = True
         self.key_move_pause_multiplier = 2.0
         self.highlight_last_move = True
         self.highlight_key_squares = False
-
         self.loop_count = 1
         self.easing_curve = "ease_out"
-
         self.max_workers = 4
         self.sq_size = SQ_SIZE
         self.theme_name = "Midnight"
@@ -261,7 +267,6 @@ class ExportConfig:
         self.gpu_vignette = 0.25
         self.gpu_contrast = 1.02
         self.gpu_saturation = 1.05
-
         self.output_dir = ""
         self.batch_combine = False
         self.preset_name = "YouTube 1080p (1920×1080)"
@@ -269,10 +274,7 @@ class ExportConfig:
         self.target_height = 1080
         self.background_color = (26, 27, 46)
         self.board_frac = 0.75
-        self.export_gif = False
-        self.gif_fps = 12
         self.layout_mode = LayoutMode.BOARD_MOVES_RIGHT
-
         self.move_list_visible = True
         self.coordinate_visible = True
         self.batch_size = 16
@@ -307,7 +309,8 @@ class ExportConfig:
     @property
     def effective_bitrate(self):
         p = EXPORT_PRESETS.get(self.preset_name)
-        if p: return p.bitrate
+        if p:
+            return p.bitrate
         return RESOLUTION_BITRATES.get((self.target_width, self.target_height), 8000)
 
     @property
@@ -346,72 +349,33 @@ class ExportConfig:
             total += self.end_duration
         return max(1.0, total)
 
-    # ── Serialization ───────────────────────────────────────────────────
+    _SERIAL_SIMPLE = frozenset({
+        'fps', 'title_enabled', 'title_text', 'title_duration',
+        'title_bg', 'title_fg', 'title_font_size',
+        'position_hold_enabled', 'position_hold_duration',
+        'position_overlay_text', 'end_enabled', 'end_text',
+        'end_duration', 'end_bg', 'end_fg', 'end_font_size',
+        'move_speed', 'pause_after_move', 'pause_on_key_moves',
+        'key_move_pause_multiplier', 'highlight_last_move',
+        'highlight_key_squares', 'loop_count', 'easing_curve',
+        'theme_name', 'gpu_post_process', 'gpu_vignette',
+        'gpu_contrast', 'gpu_saturation', 'preset_name',
+        'layout_mode', 'move_list_visible', 'coordinate_visible',
+        'show_arrow', 'sound_pack',
+    })
 
     def to_dict(self):
-        return {
-            'fps': self.fps,
-            'title_enabled': self.title_enabled,
-            'title_text': self.title_text,
-            'title_duration': self.title_duration,
-            'title_bg': self.title_bg,
-            'title_fg': self.title_fg,
-            'title_font_size': self.title_font_size,
-            'position_hold_enabled': self.position_hold_enabled,
-            'position_hold_duration': self.position_hold_duration,
-            'position_overlay_text': self.position_overlay_text,
-            'end_enabled': self.end_enabled,
-            'end_text': self.end_text,
-            'end_duration': self.end_duration,
-            'end_bg': self.end_bg,
-            'end_fg': self.end_fg,
-            'end_font_size': self.end_font_size,
-            'move_speed': self.move_speed,
-            'pause_after_move': self.pause_after_move,
-            'pause_on_key_moves': self.pause_on_key_moves,
-            'key_move_pause_multiplier': self.key_move_pause_multiplier,
-            'highlight_last_move': self.highlight_last_move,
-            'highlight_key_squares': self.highlight_key_squares,
-            'loop_count': self.loop_count,
-            'easing_curve': self.easing_curve,
-            'theme_name': self.theme_name,
-            'gpu_post_process': self.gpu_post_process,
-            'gpu_vignette': self.gpu_vignette,
-            'gpu_contrast': self.gpu_contrast,
-            'gpu_saturation': self.gpu_saturation,
-            'preset_name': self.preset_name,
-            'target_width': self.target_width,
-            'target_height': self.target_height,
-            'background_color': list(self.background_color),
-            'board_frac': self.board_frac,
-            'export_gif': self.export_gif,
-            'gif_fps': self.gif_fps,
-            'layout_mode': self.layout_mode,
-            'move_list_visible': self.move_list_visible,
-            'coordinate_visible': self.coordinate_visible,
-            'show_arrow': self.show_arrow,
-            'sound_pack': self.sound_pack,
-        }
+        d = {k: getattr(self, k) for k in self._SERIAL_SIMPLE}
+        d['target_width'] = self.target_width
+        d['target_height'] = self.target_height
+        d['background_color'] = list(self.background_color)
+        d['board_frac'] = self.board_frac
+        return d
 
-    def from_dict(self, d):
+    def load_dict(self, d):
         if not d or not isinstance(d, dict):
             return
-        _simple = {
-            'fps', 'title_enabled', 'title_text', 'title_duration',
-            'title_bg', 'title_fg', 'title_font_size',
-            'position_hold_enabled', 'position_hold_duration',
-            'position_overlay_text', 'end_enabled', 'end_text',
-            'end_duration', 'end_bg', 'end_fg', 'end_font_size',
-            'move_speed', 'pause_after_move', 'pause_on_key_moves',
-            'key_move_pause_multiplier', 'highlight_last_move',
-            'highlight_key_squares', 'loop_count', 'easing_curve',
-            'theme_name', 'gpu_post_process', 'gpu_vignette',
-            'gpu_contrast', 'gpu_saturation', 'preset_name',
-            'export_gif', 'gif_fps',
-            'layout_mode', 'move_list_visible', 'coordinate_visible',
-            'show_arrow', 'sound_pack',
-        }
-        for key in _simple:
+        for key in self._SERIAL_SIMPLE:
             if key in d:
                 setattr(self, key, d[key])
         if 'target_width' in d:
@@ -425,10 +389,10 @@ class ExportConfig:
         if 'board_frac' in d:
             self.board_frac = float(d['board_frac'])
 
+
 # ── Puzzle ID & Export Manifest ─────────────────────────────────────────────
 
 def _get_puzzle_id(puzzle):
-    """Get or generate a consistent, unique puzzle ID."""
     pid = puzzle.get('id', '')
     if pid and str(pid).strip() and str(pid).strip().lower() not in ('nan', 'none', ''):
         return str(pid).strip()
@@ -468,7 +432,6 @@ class ExportManifest:
         except Exception as e:
             log(f"DuckDB manifest init failed ({e}), using JSON fallback", "MANIFEST")
             self._conn = None
-
         import json
         try:
             if os.path.exists(self._json_path):
@@ -534,7 +497,6 @@ class ExportManifest:
             return {pid for pid in str_ids if pid in self._json_data}
 
     def get_info(self, puzzle_id):
-        """Return export metadata dict for a puzzle, or None."""
         pid = str(puzzle_id)
         with self._lock:
             if self._conn:
@@ -566,10 +528,3 @@ class ExportManifest:
                 except Exception:
                     pass
                 self._conn = None
-
-
-def log(msg, level="INFO"):
-    """Convenience logger for config module (avoids circular import from utils)."""
-    from datetime import datetime
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print(f"[{ts}] [{level}] {msg}", flush=True)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chess board widget — rendering, animation, mouse interaction, move list."""
+"""Chess board widget — rendering, animation, move list."""
 
 import math
 import time
@@ -20,46 +20,9 @@ from config import (
     LayoutMode, MIN_MOVE_PANEL_W, MAX_MOVE_PANEL_W,
     MIN_MOVE_PANEL_H, MAX_MOVE_PANEL_H,
 )
-from utils import get_render_assets, ease_out_cubic, log
+from utils import get_render_assets, ease_out_cubic, log, fix_stride, HAS_CUPY
 
-# ── Local Dependency Check ──────────────────────────────────────────────────
-
-HAS_NUMBA = False
-try:
-    import numba
-    HAS_NUMBA = True
-except ImportError:
-    pass
-
-HAS_CUPY = False
-try:
-    import cupy as cp
-    HAS_CUPY = True
-except Exception:
-    pass
-
-# ── Stride fixer (Numba-optional) ──────────────────────────────────────────
-
-if HAS_NUMBA:
-    from numba import njit as _njit2
-
-    @_njit2(cache=True, nogil=True)
-    def _fix_stride_nb(raw, w, h, bpl):
-        out = np.empty((h, w, 3), dtype=np.uint8)
-        w3 = w * 3
-        for i in range(h):
-            src = i * bpl
-            dst = i * w3
-            for j in range(w3):
-                out.flat[dst + j] = raw.flat[src + j]
-        return out
-    log("Numba JIT stride-fixer loaded", "BOARD")
-else:
-    def _fix_stride_nb(raw, w, h, bpl):
-        return raw[:, :w * 3].reshape(h, w, 3)
-
-
-# ── Helper: square ↔ (row, col) accounting for flip ────────────────────────
+# ── Coordinate conversion helpers ──────────────────────────────────────────
 
 def _sq_to_rc(sq, flipped=False):
     """Convert a chess square to (row, col) screen coordinates."""
@@ -76,8 +39,6 @@ def _rc_to_sq(r, c, flipped=False):
         return chess.square(7 - c, r)
     return chess.square(c, 7 - r)
 
-
-# ── Coordinate conversion helpers ──────────────────────────────────────────
 
 def _engine_rc_to_screen_rc(eng_r, eng_c, flipped=False):
     """Convert engine (non-flipped) screen coords to display screen coords."""
@@ -102,8 +63,8 @@ class ChessBoardWidget(QWidget):
         self.snd = sound_mgr
         self.selected = None
         self.legal_targets = []
+        self.legal_targets_set = set()
         self.setFixedSize(SQ_SIZE * 8, SQ_SIZE * 8)
-        self.setMouseTracking(True)
 
         self.flipped = False
         self.auto_playing = False
@@ -125,23 +86,31 @@ class ChessBoardWidget(QWidget):
         self.current_theme = THEMES["Midnight"]
         self.show_arrow = True
 
+    # ── Legal targets sync ──────────────────────────────────────────────
+
+    def _set_legal_targets(self, targets):
+        """Set legal targets list and keep the set in sync for O(1) lookup."""
+        self.legal_targets = targets
+        self.legal_targets_set = set(targets)
+
     # ── Flip ────────────────────────────────────────────────────────────
 
     def flip(self):
         """Toggle the board orientation."""
         self.flipped = not self.flipped
+        # If a square is programmatically selected, update its screen coords
         if self.selected is not None:
             sr, sc = self.selected
             sq = _rc_to_sq(sr, sc, not self.flipped)
             self.selected = _sq_to_rc(sq, self.flipped)
             eng_r, eng_c = _screen_rc_to_engine_rc(self.selected[0], self.selected[1], self.flipped)
             eng_targets = self.engine.legal_moves(eng_r, eng_c)
-            self.legal_targets = [
+            self._set_legal_targets([
                 _engine_rc_to_screen_rc(et_r, et_c, self.flipped)
                 for et_r, et_c in eng_targets
-            ]
+            ])
         else:
-            self.legal_targets = []
+            self._set_legal_targets([])
         self.update()
 
     # ── Animation ───────────────────────────────────────────────────────
@@ -196,7 +165,7 @@ class ChessBoardWidget(QWidget):
 
         img = self.render_frame(
             self.engine.board, screen_last_move,
-            self.selected, self.legal_targets,
+            self.selected, self.legal_targets_set,
             check_squares=screen_check, anim_state=self._get_anim_state(),
             theme=self.current_theme, show_arrow=self.show_arrow,
             flipped=self.flipped)
@@ -626,7 +595,7 @@ class ChessBoardWidget(QWidget):
         w = img2.width(); h = img2.height(); bpl = img2.bytesPerLine()
         raw = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl)).copy()
         if bpl == w * 3: return raw.reshape((h, w, 3))
-        return _fix_stride_nb(raw, w, h, bpl)
+        return fix_stride(raw, w, h, bpl)
 
     @staticmethod
     def qimage_to_np_batch(images, use_gpu=False):
@@ -636,43 +605,3 @@ class ChessBoardWidget(QWidget):
         if use_gpu and HAS_CUPY:
             import cupy as _cp; return _cp.asarray(stack)
         return stack
-
-    # ── Mouse ───────────────────────────────────────────────────────────
-
-    def mousePressEvent(self, e):
-        if self.animating or self.engine.game_over: return
-        c = int(e.position().x()) // SQ_SIZE
-        r = int(e.position().y()) // SQ_SIZE
-        if not (0 <= r < 8 and 0 <= c < 8): return
-
-        eng_r, eng_c = _screen_rc_to_engine_rc(r, c, self.flipped)
-        piece = self.engine.board.piece_at(self.engine.rc_to_sq(eng_r, eng_c))
-
-        if self.selected:
-            sr, sc = self.selected
-            if (r, c) in self.legal_targets:
-                sel_eng_r, sel_eng_c = _screen_rc_to_engine_rc(sr, sc, self.flipped)
-                info = self.engine.make_move(sel_eng_r, sel_eng_c, eng_r, eng_c)
-                if info:
-                    is_capture = info['captured'] != '.'
-                    sfx = ("capture" if is_capture else "castle" if info['castle'] else "move")
-                    if info['mate']: sfx = "checkmate"
-                    elif info['check']: sfx = "check"
-                    self.snd.play(sfx)
-                    if self.anim_speed > 0:
-                        self.start_animation(sr, sc, r, c, info['piece_obj'],
-                                             info['captured'], info['notation'])
-                    else:
-                        self.move_made.emit(info['notation'])
-            self.selected = None; self.legal_targets = []
-        else:
-            if piece and piece.color == self.engine.board.turn:
-                self.selected = (r, c)
-                eng_targets = self.engine.legal_moves(eng_r, eng_c)
-                self.legal_targets = [
-                    _engine_rc_to_screen_rc(et_r, et_c, self.flipped)
-                    for et_r, et_c in eng_targets
-                ]
-                if not self.legal_targets:
-                    self.snd.play("error"); self.selected = None
-        self.update()

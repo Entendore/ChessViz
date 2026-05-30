@@ -19,18 +19,17 @@ class ChessEngine:
 
     @staticmethod
     def sq_to_rc(sq):
+        """Chess square → (row, col) where row 0 = rank 8 (top of screen)."""
         return 7 - chess.square_rank(sq), chess.square_file(sq)
 
     @staticmethod
     def rc_to_sq(r, c):
+        """(row, col) → chess square. Inverse of sq_to_rc."""
         return chess.square(c, 7 - r)
 
     @property
     def turn(self):
         return 'w' if self.board.turn == chess.WHITE else 'b'
-
-    def color_of(self, piece):
-        return 'w' if piece.color == chess.WHITE else 'b'
 
     def check_squares(self):
         if self.board.is_check():

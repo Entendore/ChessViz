@@ -5,6 +5,7 @@ import os
 import math
 import wave
 import shutil
+import tempfile
 
 import numpy as np
 
@@ -12,16 +13,7 @@ from PySide6.QtCore import QUrl
 from PySide6.QtMultimedia import QSoundEffect
 
 from config import SOUND_PACKS, SOUND_EFFECTS
-from utils import log
-
-# ── Local Dependency Check ──────────────────────────────────────────────────
-
-HAS_NUMBA = False
-try:
-    import numba
-    HAS_NUMBA = True
-except ImportError:
-    pass
+from utils import log, HAS_NUMBA
 
 # ── Numba-accelerated audio primitives ──────────────────────────────────────
 
@@ -166,14 +158,14 @@ def _to_i16(samples):
 
 
 # ── Sound Pack Definitions ──────────────────────────────────────────────────
-# Each pack defines a _gen_pack_X method that writes WAVs for all effects.
 
 class SoundManager:
     PACKS = SOUND_PACKS
     EFFECTS = SOUND_EFFECTS
 
     def __init__(self, pack="Classic"):
-        self.tmpdir = os.path.join(os.getcwd(), ".chess_sfx_tmp")
+        # Use system temp dir instead of CWD (survives directory changes)
+        self.tmpdir = os.path.join(tempfile.gettempdir(), "chess_puzzle_studio_sfx")
         os.makedirs(self.tmpdir, exist_ok=True)
         self.sounds = {}
         self._enabled = True
@@ -282,7 +274,6 @@ class SoundManager:
 
     def _gen_pack_wooden(self):
         sr = 44100; d = self.tmpdir
-        # Warm thock sound — low freq + fast decay
         self._wav(os.path.join(d, "move.wav"),
                   _env(_sin(220, 0.08, 0.40), 0.002, 0.05))
         self._wav(os.path.join(d, "capture.wav"),
@@ -355,7 +346,6 @@ class SoundManager:
     # ── Load / Play ─────────────────────────────────────────────────────
 
     def _load_all(self):
-        # Stop and clear old effects
         for s in self.sounds.values():
             s.stop()
         self.sounds.clear()

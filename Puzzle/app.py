@@ -15,9 +15,6 @@ from main_window import MainWindow
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Chess Puzzle Studio")
-    
-    # High DPI scaling is enabled by default in PySide6 >= 6.4
-    # but we can enforce it if needed
     app.setStyle("Fusion")
 
     window = MainWindow()

@@ -6,30 +6,7 @@ import csv
 import chess
 import numpy as np
 
-from utils import log
-
-# ── Local Dependency Check ──────────────────────────────────────────────────
-
-HAS_NUMBA = False
-try:
-    import numba
-    HAS_NUMBA = True
-except ImportError:
-    pass
-
-HAS_CUPY = False
-try:
-    import cupy as _cp_gpu
-    HAS_CUPY = True
-except Exception:
-    pass
-
-HAS_PANDAS = False
-try:
-    import pandas as pd
-    HAS_PANDAS = True
-except ImportError:
-    pass
+from utils import log, HAS_NUMBA, HAS_CUPY, HAS_PANDAS, compute_difficulty
 
 csv.field_size_limit(2**31 - 1)
 
@@ -73,6 +50,7 @@ LICHESS_THEME_LIST = sorted({
 # ── Move helpers ────────────────────────────────────────────────────────────
 
 def _clean_move_tokens(tokens):
+    """Remove move numbers, result strings, and trailing dots from token list."""
     out = []
     for t in tokens:
         t = t.strip()
@@ -86,6 +64,7 @@ def _clean_move_tokens(tokens):
 
 
 def _detect_move_format(tokens):
+    """Detect whether tokens are UCI or SAN format by inspecting the first few."""
     checked = 0
     for t in tokens:
         if _UCI_RE.match(t):
@@ -99,6 +78,7 @@ def _detect_move_format(tokens):
 
 
 def _san_to_uci(tokens, fen=''):
+    """Convert a list of SAN move tokens to UCI strings."""
     board = chess.Board(fen) if fen else chess.Board()
     result = []
     for t in tokens:
@@ -122,6 +102,7 @@ def _san_to_uci(tokens, fen=''):
 
 
 def _parse_uci_value(val):
+    """Parse a moves value that may be a list, string, or other type into a flat list of tokens."""
     if isinstance(val, list):
         flat = []
         for item in val:
@@ -137,6 +118,7 @@ def _parse_uci_value(val):
 
 
 def _extract_uci_moves(row):
+    """Extract UCI moves from a row dict, handling various column names and formats."""
     raw_val = ''
     for col in ('uci', 'moves', 'pgn'):
         v = row.get(col, '')
@@ -219,6 +201,7 @@ def _rating_category(rating):
 
 
 def _generate_name(row, uci_moves, idx):
+    """Generate a human-readable puzzle name from row data."""
     number = idx + 1
     attrs = []
     name = str(row.get('name', '')).strip()
@@ -262,6 +245,7 @@ def _generate_name(row, uci_moves, idx):
 
 
 def _generate_name_fallback(row, uci_moves, idx):
+    """Generate a fallback name when no useful metadata is available."""
     number = idx + 1
     ignore = frozenset({
         'fen', 'moves', 'uci', 'pgn', 'id', 'name', 'img',
@@ -325,49 +309,51 @@ if HAS_NUMBA:
                     break
         return valid
 
-    @_njit3(cache=True, nogil=True)
-    def _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals):
-        n = len(move_counts)
-        out = np.empty(n, dtype=np.float64)
-        for i in range(n):
-            base = min(1.0, max(0.0, float(move_counts[i]) / 8.0))
-            fen_b = 0.15 if has_fen[i] else 0.0
-            if has_rating[i]:
-                rating = min(1.0, max(0.0, rating_vals[i] / 3000.0))
-            else:
-                rating = 0.5
-            out[i] = 0.4 * base + 0.2 * fen_b + 0.4 * rating
-        return out
-
     log("Numba JIT puzzle helpers ready", "PUZZLE")
 else:
     def _count_moves_nb(data, offsets, lengths):
         out = np.empty(len(offsets), dtype=np.int64)
         for i in range(len(offsets)):
-            if lengths[i] == 0: out[i] = 0
+            if lengths[i] == 0:
+                out[i] = 0
             else:
                 seg = data[offsets[i]:offsets[i] + lengths[i]].tobytes()
-                out[i] = seg.count(32) + 1 # Space separated
+                out[i] = seg.count(32) + 1
         return out
 
     def _validate_uci_first_nb(data, offsets, lengths):
         valid = np.ones(len(offsets), dtype=np.bool_)
         for i in range(len(offsets)):
-            if lengths[i] < 4: valid[i] = lengths[i] > 0
+            if lengths[i] < 4:
+                valid[i] = lengths[i] > 0
         return valid
 
-    def _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals):
-        n = len(move_counts)
-        out = np.empty(n, dtype=np.float64)
-        for i in range(n):
-            base = min(1.0, max(0.0, float(move_counts[i]) / 8.0))
-            fen_b = 0.15 if has_fen[i] else 0.0
-            rating = (min(1.0, max(0.0, rating_vals[i] / 3000.0)) if has_rating[i] else 0.5)
-            out[i] = 0.4 * base + 0.2 * fen_b + 0.4 * rating
-        return out
 
+# ── Unified difficulty (delegates to utils.compute_difficulty) ──────────────
+
+def _compute_iterative_difficulty(row, uci_moves):
+    """Compute difficulty for a single row using the unified formula."""
+    move_count = len(uci_moves)
+    fen = str(row.get('fen', '')).strip()
+    has_fen = bool(fen)
+    has_rating = False
+    rating_val = 0.0
+    for rkey in ('rating', 'elo', 'difficulty', 'score'):
+        rval = str(row.get(rkey, '')).strip()
+        if rval and rval.lower() not in ('nan', 'none', ''):
+            try:
+                rating_val = float(rval)
+                has_rating = True
+                break
+            except ValueError:
+                pass
+    return compute_difficulty(move_count, has_fen, has_rating, rating_val)
+
+
+# ── Batch helpers ───────────────────────────────────────────────────────────
 
 def _pack_strings(strings):
+    """Pack a list of strings into a flat uint8 buffer with offsets and lengths."""
     encoded = [s.encode('utf-8') if s else b'' for s in strings]
     lengths = np.array([len(e) for e in encoded], dtype=np.int64)
     offsets = np.empty(len(encoded), dtype=np.int64)
@@ -376,17 +362,23 @@ def _pack_strings(strings):
         offsets[i] = total
         total += lengths[i]
     buf = b''.join(encoded)
-    data = (np.frombuffer(buf, dtype=np.uint8).copy() if buf else np.empty(0, dtype=np.uint8))
+    data = (np.frombuffer(buf, dtype=np.uint8).copy()
+            if buf else np.empty(0, dtype=np.uint8))
     return data, offsets, lengths
 
 
 def batch_count_moves(move_strings):
-    if not move_strings: return np.array([], dtype=np.int64)
+    """Count the number of space-separated moves in each string."""
+    if not move_strings:
+        return np.array([], dtype=np.int64)
     data, offsets, lengths = _pack_strings(move_strings)
     return _count_moves_nb(data, offsets, lengths)
 
+
 def batch_validate_uci(move_strings):
-    if not move_strings: return np.array([], dtype=np.bool_)
+    """Validate that the first token in each string looks like a UCI move."""
+    if not move_strings:
+        return np.array([], dtype=np.bool_)
     data, offsets, lengths = _pack_strings(move_strings)
     return _validate_uci_first_nb(data, offsets, lengths)
 
@@ -394,34 +386,28 @@ def batch_validate_uci(move_strings):
 # ── GPU difficulty ──────────────────────────────────────────────────────────
 
 if HAS_CUPY:
+    import cupy as _cp_gpu
+
     def gpu_difficulty_scores(move_counts, has_fen, has_rating, rating_vals):
+        """CuPy-accelerated vectorized difficulty computation on GPU."""
         mc_gpu = _cp_gpu.asarray(move_counts.astype(np.float64))
         hf_gpu = _cp_gpu.asarray(has_fen.astype(np.float64))
         hr_gpu = _cp_gpu.asarray(has_rating.astype(np.float64))
         rv_gpu = _cp_gpu.asarray(rating_vals.astype(np.float64))
         base = _cp_gpu.clip(mc_gpu / 8.0, 0.0, 1.0)
         fen_b = 0.15 * hf_gpu
-        rating = _cp_gpu.where(hr_gpu > 0, _cp_gpu.clip(rv_gpu / 3000.0, 0.0, 1.0), 0.5)
+        rating = _cp_gpu.where(hr_gpu > 0,
+                               _cp_gpu.clip(rv_gpu / 3000.0, 0.0, 1.0), 0.5)
         return _cp_gpu.asnumpy(0.4 * base + 0.2 * fen_b + 0.4 * rating)
+
     log("CuPy GPU puzzle helpers ready", "PUZZLE")
 else:
     def gpu_difficulty_scores(move_counts, has_fen, has_rating, rating_vals):
-        return _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals)
-
-
-def _compute_iterative_difficulty(row, uci_moves):
-    move_count = len(uci_moves)
-    base = min(1.0, max(0.0, move_count / 8.0))
-    fen = str(row.get('fen', '')).strip()
-    fen_b = 0.15 if fen else 0.0
-    rating = 0.5
-    for rkey in ('rating', 'elo', 'difficulty', 'score'):
-        rval = str(row.get(rkey, '')).strip()
-        if rval and rval.lower() not in ('nan', 'none', ''):
-            try:
-                rv = float(rval)
-                rating = min(1.0, max(0.0, rv / 3000.0))
-                break
-            except ValueError:
-                pass
-    return 0.4 * base + 0.2 * fen_b + 0.4 * rating
+        """Fallback: vectorized NumPy difficulty (same formula as compute_difficulty)."""
+        mc = move_counts.astype(np.float64)
+        base = np.clip(mc / 8.0, 0.0, 1.0)
+        fen_b = 0.15 * has_fen.astype(np.float64)
+        hr = has_rating.astype(np.float64)
+        rv = rating_vals.astype(np.float64)
+        rating = np.where(hr > 0, np.clip(rv / 3000.0, 0.0, 1.0), 0.5)
+        return 0.4 * base + 0.2 * fen_b + 0.4 * rating
