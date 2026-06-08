@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QSlider, QComboBox, QCheckBox, QGroupBox, QSplitter,
     QStatusBar, QLineEdit, QApplication, QProgressBar, QSpinBox,
     QFileDialog, QFrame, QTabWidget, QScrollArea, QMessageBox,
-    QDialog, QDialogButtonBox, QInputDialog,
+    QDialog, QDialogButtonBox,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
@@ -200,7 +200,7 @@ class MainWindow(QMainWindow):
         self.move_index = 0
         self._uci_sequence = []
         self._notations = []
-        self._practice_mode = False
+        self._practice_mode = False  # Unused, kept for state compatibility
 
         # ── Export state ────────────────────────────────────────────────
         self._exporter = None
@@ -569,36 +569,34 @@ class MainWindow(QMainWindow):
         sl_layout.setContentsMargins(8, 8, 8, 8)
         sl_layout.setSpacing(10)
 
-        # ── Board Appearance ──
-        board_grp = QGroupBox("Board Appearance")
+        # Board settings
+        board_grp = QGroupBox("Board")
         bl = QVBoxLayout(board_grp)
         bl.setContentsMargins(8, 14, 8, 6)
         bl.setSpacing(6)
-
-        theme_row = QHBoxLayout()
-        theme_row.setSpacing(6)
-        theme_row.addWidget(QLabel("Theme:"))
+        bl.addWidget(QLabel("Theme:"))
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(THEMES.keys())
         self.theme_combo.currentTextChanged.connect(self._on_theme)
-        theme_row.addWidget(self.theme_combo, 1)
-        bl.addLayout(theme_row)
-
-        self.show_coords_check = QCheckBox("Show coordinates")
+        bl.addWidget(self.theme_combo)
+        self.show_coords_check = QCheckBox("Coordinates")
         self.show_coords_check.setChecked(True)
         self.show_coords_check.toggled.connect(
             lambda v: setattr(self.board_widget, 'show_coords', v))
         bl.addWidget(self.show_coords_check)
-
+        self.show_arrow_check = QCheckBox("Move arrows")
+        self.show_arrow_check.setChecked(True)
+        self.show_arrow_check.toggled.connect(
+            lambda v: setattr(self.board_widget, 'show_arrow', v))
+        bl.addWidget(self.show_arrow_check)
         sl_layout.addWidget(board_grp)
 
-        # ── Sound ──
-        sound_grp = QGroupBox("Sound")
+        # Sound settings
+        sound_grp = QGroupBox("Sound Effects")
         sbl = QVBoxLayout(sound_grp)
         sbl.setContentsMargins(8, 14, 8, 6)
         sbl.setSpacing(6)
-
-        self.sound_check = QCheckBox("Enable sound effects")
+        self.sound_check = QCheckBox("Sound effects")
         self.sound_check.setChecked(True)
         self.sound_check.setStyleSheet("font-weight: bold;")
         self.sound_check.toggled.connect(self.sound_mgr.set_enabled)
@@ -618,61 +616,45 @@ class MainWindow(QMainWindow):
         vol_row.addWidget(self._vol_label)
         sbl.addLayout(vol_row)
 
-        pack_row = QHBoxLayout()
-        pack_row.setSpacing(6)
-        pack_row.addWidget(QLabel("Pack:"))
+        sbl.addWidget(QLabel("Sound pack:"))
         self.sound_pack_combo = QComboBox()
         for pack_name in SOUND_PACKS:
             self.sound_pack_combo.addItem(pack_name, pack_name)
         self.sound_pack_combo.currentTextChanged.connect(self._on_sound_pack_changed)
-        pack_row.addWidget(self.sound_pack_combo, 1)
-        sbl.addLayout(pack_row)
-
-        # Compact 2-column effect toggles
-        effect_label = QLabel("Individual effects:")
-        effect_label.setStyleSheet("color: #565f89; font-size: 10px; margin-top: 2px;")
-        sbl.addWidget(effect_label)
+        sbl.addWidget(self.sound_pack_combo)
 
         self._effect_checks = {}
-        effect_items = [
-            ("move", "Move"), ("capture", "Capture"),
-            ("check", "Check"), ("checkmate", "Mate"),
-            ("castle", "Castle"), ("promote", "Promote"),
-            ("start", "Start"), ("solved", "Solved"),
-            ("error", "Error"),
-        ]
-        col1_l = QVBoxLayout()
-        col2_l = QVBoxLayout()
-        mid = (len(effect_items) + 1) // 2
-        for i, (effect_key, effect_label_text) in enumerate(effect_items):
-            cb = QCheckBox(effect_label_text)
+        effect_row1 = QHBoxLayout()
+        effect_row1.setSpacing(4)
+        effect_row2 = QHBoxLayout()
+        effect_row2.setSpacing(4)
+        for effect_key, effect_label in [("move", "Move"), ("capture", "Capture"),
+                                          ("check", "Check"), ("checkmate", "Mate"),
+                                          ("castle", "Castle")]:
+            cb = QCheckBox(effect_label)
             cb.setChecked(True)
             cb.toggled.connect(
                 lambda v, k=effect_key: self.sound_mgr.set_effect_enabled(k, v))
             self._effect_checks[effect_key] = cb
-            if i < mid:
-                col1_l.addWidget(cb)
-            else:
-                col2_l.addWidget(cb)
-        effects_row = QHBoxLayout()
-        effects_row.addLayout(col1_l)
-        effects_row.addLayout(col2_l)
-        sbl.addLayout(effects_row)
+            effect_row1.addWidget(cb)
+        for effect_key, effect_label in [("promote", "Promote"), ("start", "Start"),
+                                          ("solved", "Solved"), ("error", "Error")]:
+            cb = QCheckBox(effect_label)
+            cb.setChecked(True)
+            cb.toggled.connect(
+                lambda v, k=effect_key: self.sound_mgr.set_effect_enabled(k, v))
+            self._effect_checks[effect_key] = cb
+            effect_row2.addWidget(cb)
+        sbl.addLayout(effect_row1)
+        sbl.addLayout(effect_row2)
 
-        sl_layout.addWidget(sound_grp)
-
-        # ── General ──
-        general_grp = QGroupBox("General")
-        gl = QVBoxLayout(general_grp)
-        gl.setContentsMargins(8, 14, 8, 6)
-        gl.setSpacing(6)
-
-        self.autosave_check = QCheckBox("Auto-save state on exit")
+        # Auto-save option
+        self.autosave_check = QCheckBox("Auto-save state")
         self.autosave_check.setChecked(True)
         self.autosave_check.setToolTip("Automatically save window state and settings")
-        gl.addWidget(self.autosave_check)
+        sbl.addWidget(self.autosave_check)
 
-        sl_layout.addWidget(general_grp)
+        sl_layout.addWidget(sound_grp)
         sl_layout.addStretch()
 
         settings_scroll.setWidget(settings_content)
@@ -1040,6 +1022,7 @@ class MainWindow(QMainWindow):
             self._update_scrubber()
             self.board_widget.update()
 
+            # Sound
             if info.get('mate'):
                 self.sound_mgr.play('checkmate')
             elif info.get('check'):
@@ -1074,6 +1057,7 @@ class MainWindow(QMainWindow):
             self.engine.reset()
         self._notations = []
         self.move_index = 0
+        # Replay setup moves
         setup_count = self.current_puzzle.get('setup_count', 0)
         for i in range(setup_count):
             if i < len(self._uci_sequence):
@@ -1089,6 +1073,7 @@ class MainWindow(QMainWindow):
         if not self.current_puzzle:
             return
         self._stop_auto_play()
+        # Play all remaining moves
         while self.move_index < len(self._uci_sequence):
             info = self.engine.make_move_uci(self._uci_sequence[self.move_index])
             if info:
@@ -1104,6 +1089,7 @@ class MainWindow(QMainWindow):
         if not self.current_puzzle or self.move_index <= 0:
             return
         self._stop_auto_play()
+        # Rewind: restart and replay up to move_index - 1
         target = self.move_index - 1
         self._go_start()
         for i in range(target):
@@ -1144,6 +1130,7 @@ class MainWindow(QMainWindow):
         if value == self.move_index:
             return
         self._stop_auto_play()
+        # Rewind to start, then replay to target
         fen = self.current_puzzle.get('fen', '')
         if fen:
             self.engine.load_fen(fen)
@@ -1152,11 +1139,13 @@ class MainWindow(QMainWindow):
         self._notations = []
         setup_count = self.current_puzzle.get('setup_count', 0)
         start_idx = setup_count
+        # Always replay setup
         for i in range(setup_count):
             if i < len(self._uci_sequence):
                 info = self.engine.make_move_uci(self._uci_sequence[i])
                 if info:
                     self._notations.append(info['notation'])
+        # Replay up to value
         for i in range(start_idx, min(value, len(self._uci_sequence))):
             info = self.engine.make_move_uci(self._uci_sequence[i])
             if info:
@@ -1182,6 +1171,7 @@ class MainWindow(QMainWindow):
         else:
             self.engine.reset()
 
+        # Play setup moves (e.g. Lichess first move)
         setup_count = puzzle.get('setup_count', 0)
         for i in range(setup_count):
             if i < len(self._uci_sequence):
@@ -1204,6 +1194,7 @@ class MainWindow(QMainWindow):
         self.lbl_themes.setText(puzzle.get('themes', ''))
         self.lbl_fen.setText(puzzle.get('fen', ''))
 
+        # Export status
         pid = puzzle.get('id', '')
         if pid and self.export_manifest.is_exported(pid):
             info = self.export_manifest.get_info(pid)
@@ -1294,43 +1285,50 @@ class MainWindow(QMainWindow):
         self.puzzle_loader.clear_filters()
         self._refresh_puzzle_list()
 
-    def _on_search_changed(self, text):
-        self._search_timer.start()
-
     def _apply_search_filter(self):
         self._apply_filters()
 
+    def _on_search_changed(self, text):
+        self._search_timer.start()
+
     def _on_sort_changed(self, index):
-        key = self.sort_combo.currentData()
-        self.puzzle_loader.sort_by = key
+        sort_key = self.sort_combo.currentData()
+        self.puzzle_loader.sort_by = sort_key
         self._refresh_puzzle_list()
 
     def _on_per_page_changed(self, text):
         try:
             val = int(text)
             self.puzzle_loader.page_size = val
-            self._refresh_puzzle_list()
         except ValueError:
             pass
+        self._refresh_puzzle_list()
 
     def _refresh_puzzle_list(self):
+        self.puzzle_list.blockSignals(True)
+        current_row = self.puzzle_list.currentRow()
         self.puzzle_list.clear()
+
         for puzzle in self.puzzle_loader.puzzles:
-            item = QListWidgetItem(puzzle.get('name', 'Puzzle'))
+            name = puzzle.get('name', 'Puzzle')
+            rating = puzzle.get('rating', 0)
+            label = f"{name}  ({rating})" if rating else name
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
-            item.setData(Qt.UserRole, puzzle)
             self.puzzle_list.addItem(item)
+
+        if 0 <= current_row < self.puzzle_list.count():
+            self.puzzle_list.setCurrentRow(current_row)
+
+        self.puzzle_list.blockSignals(False)
         self._update_pagination()
 
     def _update_pagination(self):
         page = self.puzzle_loader.current_page
-        total = self.puzzle_loader.total_pages
-        self.page_label.setText(f"{page + 1} / {total}")
+        total_pages = self.puzzle_loader.total_pages
+        self.page_label.setText(f"{page + 1} / {total_pages}")
         self.total_label.setText(f"{self.puzzle_loader.filtered_count} puzzles")
-        self.prev_page_btn.setEnabled(page > 0)
-        self.first_page_btn.setEnabled(page > 0)
-        self.next_page_btn.setEnabled(page < total - 1)
-        self.last_page_btn.setEnabled(page < total - 1)
 
     def _go_first_page(self):
         self.puzzle_loader.first_page()
@@ -1348,186 +1346,99 @@ class MainWindow(QMainWindow):
         self.puzzle_loader.last_page()
         self._refresh_puzzle_list()
 
+    # ══════════════════════════════════════════════════════════════════════════
+    #  IMPORT
+    # ══════════════════════════════════════════════════════════════════════════
+
     def _on_import(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Import Puzzles", DATA_DIR,
-            "Puzzle Files (*.csv *.json *.parquet *.pgn *.tsv)")
-        if path:
+            "Puzzle Files (*.csv *.json *.parquet *.pgn *.tsv *.txt);;All Files (*)")
+        if not path:
+            return
+        try:
+            self.puzzle_loader.load_file(path)
+            self._refresh_puzzle_list()
+            self.status.showMessage(f"Loaded {self.puzzle_loader.total_count} puzzles")
+        except Exception as e:
+            QMessageBox.warning(self, "Import Error", str(e))
+
+    def _auto_load_bundled(self):
+        """Attempt to load the bundled Lichess database on startup."""
+        if os.path.exists(LICHESS_DB_PATH):
             try:
-                self.puzzle_loader.load_file(path)
+                self.puzzle_loader.load_parquet(LICHESS_DB_PATH)
                 self._refresh_puzzle_list()
-                self.status.showMessage(f"Loaded {self.puzzle_loader.total_count} puzzles")
+                self.status.showMessage(
+                    f"Loaded {self.puzzle_loader.total_count} puzzles from database")
+                self._restore_pending_puzzle()
             except Exception as e:
-                QMessageBox.warning(self, "Import Error", str(e))
+                log(f"Auto-load bundled DB error: {e}", "INIT")
+        else:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            self.status.showMessage("No puzzle database found. Import one to get started.")
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  SETTINGS & EXPORT TAB SLOTS
+    #  SETTINGS CALLBACKS
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_theme(self, name):
         if name in THEMES:
             self.board_widget.current_theme = THEMES[name]
+            self.export_cfg.theme_name = name
             self.board_widget.update()
 
-    def _on_sound_pack_changed(self, pack_name):
-        self.sound_mgr.switch_pack(pack_name)
-
-    def _on_preset(self, name):
-        self.export_cfg.apply_preset(name)
-
-    def _sync_export_config(self):
-        cfg = self.export_cfg
-        cfg.title_enabled = self.title_check.isChecked()
-        cfg.title_text = self.current_puzzle.get('name', '') if cfg.title_enabled and self.current_puzzle else ""
-        cfg.title_duration = self.title_spin.value()
-        cfg.end_enabled = self.end_check.isChecked()
-        cfg.end_duration = self.end_spin.value()
-        cfg.move_speed = self.anim_dur_slider.value() / 10.0
-        cfg.pause_after_move = self.pause_slider.value() / 10.0
-        cfg.coordinate_visible = self.show_coords_check.isChecked()
-
-    def _on_export(self):
-        if not self.current_puzzle:
-            self.status.showMessage("No puzzle selected")
-            return
-        if not HAS_FFMPEG:
-            QMessageBox.warning(self, "Export Error", "FFmpeg not found. Install ffmpeg and add to PATH.")
-            return
-
-        self._sync_export_config()
-        name = sanitize_filename(self.current_puzzle.get('name', 'puzzle'))
-        default_path = os.path.join(EXPORT_DIR, f"{name}.mp4")
-        path, _ = QFileDialog.getSaveFileName(self, "Export Video", default_path, "MP4 (*.mp4)")
-        if not path:
-            return
-
-        self.export_progress.setVisible(True)
-        self.export_btn.setEnabled(False)
-        self._single_exporting = True
-
-        self._exporter = FFmpegVideoExporter(self.export_cfg)
-        self._exporter.progress.connect(self._on_export_progress)
-        self._exporter.finished.connect(self._on_export_finished)
-        self._exporter.error.connect(self._on_export_error)
-        self._exporter.export_puzzle_threaded(self.current_puzzle, path)
-
-    def _on_export_progress(self, current, total):
-        self.export_progress.setMaximum(total)
-        self.export_progress.setValue(current)
-
-    def _on_export_finished(self, path):
-        self.export_progress.setVisible(False)
-        self.export_btn.setEnabled(True)
-        self._single_exporting = False
-        self.export_status.setText(f"✅ Exported: {os.path.basename(path)}")
-        self.status.showMessage(f"Export complete: {path}")
-        if self.current_puzzle:
-            pid = self.current_puzzle.get('id', '')
-            self.export_manifest.mark_exported(pid, path, self.export_cfg.preset_name, self.current_puzzle.get('name', ''))
-            self._update_puzzle_info(self.current_puzzle)
-
-    def _on_export_error(self, msg):
-        self.export_progress.setVisible(False)
-        self.export_btn.setEnabled(True)
-        self._single_exporting = False
-        self.export_status.setText(f"❌ Error: {msg}")
-        self.status.showMessage(f"Export error: {msg}")
-
-    def _on_batch_export_selected(self):
-        puzzles = self._get_selected_puzzles()
-        if not puzzles:
-            self.status.showMessage("No puzzles selected for batch export")
-            return
-        self._start_batch_export(puzzles)
-
-    def _on_batch_export_page(self):
-        self._start_batch_export(self.puzzle_loader.puzzles)
-
-    def _start_batch_export(self, puzzles):
-        if not HAS_FFMPEG:
-            QMessageBox.warning(self, "Export Error", "FFmpeg not found.")
-            return
-        self._sync_export_config()
-        self._batch_exporting = True
-        self._batch_total = len(puzzles)
-        self._batch_completed = 0
-        self.batch_progress.setVisible(True)
-        self.batch_progress.setMaximum(self._batch_total)
-        self.batch_progress.setValue(0)
-        self.batch_cancel_btn.setVisible(True)
-        self.batch_selected_btn.setEnabled(False)
-        self.batch_page_btn.setEnabled(False)
-
-        self._batch_exporter = FFmpegVideoExporter(self.export_cfg)
-        self._batch_exporter.batch_puzzle_done.connect(self._on_batch_puzzle_done)
-        self._batch_exporter.finished.connect(self._on_batch_finished)
-        self._batch_exporter.error.connect(self._on_batch_error)
-        self._batch_exporter.log_msg.connect(lambda m: self.status.showMessage(m))
-        self._batch_exporter.export_batch(puzzles, EXPORT_DIR)
-
-    def _on_batch_puzzle_done(self, idx, total, name):
-        self.batch_progress.setValue(idx)
-        self.batch_status.setText(f"Exported {idx}/{total}: {name}")
-
-    def _on_batch_finished(self, path):
-        self._cleanup_batch_ui()
-        self.batch_status.setText("✅ Batch export complete!")
-        self.status.showMessage("Batch export complete")
-
-    def _on_batch_error(self, msg):
-        self._cleanup_batch_ui()
-        self.batch_status.setText(f"❌ Batch error: {msg}")
-
-    def _on_batch_cancel(self):
-        if self._batch_exporter:
-            self._batch_exporter.cancel()
-        self._cleanup_batch_ui()
-        self.batch_status.setText("Batch export cancelled")
-
-    def _cleanup_batch_ui(self):
-        self._batch_exporting = False
-        self.batch_progress.setVisible(False)
-        self.batch_cancel_btn.setVisible(False)
-        self.batch_selected_btn.setEnabled(True)
-        self.batch_page_btn.setEnabled(True)
+    def _on_sound_pack_changed(self, name):
+        self.sound_mgr.switch_pack(name)
+        self.export_cfg.sound_pack = name
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  RANDOM TAB SLOTS
+    #  RANDOM TAB
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_random_puzzle(self):
+        # Apply random tab filters
         filters = {}
         min_r = self.random_min_rating.value()
         max_r = self.random_max_rating.value()
-        if min_r > 0: filters['min_rating'] = min_r
-        if max_r > 0: filters['max_rating'] = max_r
+        if min_r > 0:
+            filters['min_rating'] = min_r
+        if max_r > 0:
+            filters['max_rating'] = max_r
         theme = self.random_theme_combo.currentData()
-        if theme: filters['theme'] = theme
+        if theme:
+            filters['theme'] = theme
 
+        # Temporarily apply filters to get a random puzzle
         old_filters = self.puzzle_loader.filters
         self.puzzle_loader.set_filters(filters)
         puzzle = self.puzzle_loader.get_random_puzzle()
+        if not puzzle:
+            # Try without filters
+            self.puzzle_loader.set_filters({})
+            puzzle = self.puzzle_loader.get_random_puzzle()
+        # Restore original filters
         self.puzzle_loader.set_filters(old_filters)
 
         if puzzle:
             self._display_puzzle(puzzle)
-            self.sound_mgr.play('start')
+            self.status.showMessage("Random puzzle loaded")
         else:
-            self.status.showMessage("No puzzles match random filters")
+            self.status.showMessage("No puzzles available for random selection")
 
     def _on_generate_position(self):
         n_moves = self.gen_moves_spin.value()
-        self.engine.reset()
+        board = chess.Board()
         for _ in range(n_moves):
-            legal = list(self.engine.board.legal_moves)
+            legal = list(board.legal_moves)
             if not legal:
                 break
-            move = random.choice(legal)
-            self.engine.make_move_uci(move.uci())
-
+            board.push(random.choice(legal))
+        fen = board.fen()
+        self.engine.load_fen(fen)
         self.current_puzzle = {
-            'name': 'Generated Position',
-            'fen': self.engine.board.fen(),
+            'name': f'Generated Position ({n_moves} half-moves)',
+            'fen': fen,
             'moves': [],
             'setup_count': 0,
         }
@@ -1538,15 +1449,18 @@ class MainWindow(QMainWindow):
         self._update_scrubber()
         self._update_puzzle_info(self.current_puzzle)
         self.board_widget.update()
+        self.sound_mgr.play('start')
+        self._stop_auto_play()
 
     def _on_load_fen(self):
-        text, ok = QInputDialog.getText(self, "Load FEN", "Enter FEN string:")
-        if ok and text:
+        from PySide6.QtWidgets import QInputDialog
+        fen, ok = QInputDialog.getText(self, "Load FEN", "Enter FEN string:")
+        if ok and fen.strip():
             try:
-                self.engine.load_fen(text)
+                self.engine.load_fen(fen.strip())
                 self.current_puzzle = {
-                    'name': 'Custom Position',
-                    'fen': text,
+                    'name': 'Custom FEN Position',
+                    'fen': fen.strip(),
                     'moves': [],
                     'setup_count': 0,
                 }
@@ -1557,56 +1471,338 @@ class MainWindow(QMainWindow):
                 self._update_scrubber()
                 self._update_puzzle_info(self.current_puzzle)
                 self.board_widget.update()
+                self.sound_mgr.play('start')
+                self._stop_auto_play()
             except Exception as e:
                 QMessageBox.warning(self, "Invalid FEN", str(e))
 
     def _on_copy_fen(self):
         if self.engine.board:
-            QApplication.clipboard().setText(self.engine.board.fen())
-            self.status.showMessage("FEN copied to clipboard")
+            fen = self.engine.board.fen()
+            QApplication.clipboard().setText(fen)
+            self.status.showMessage(f"FEN copied: {fen}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  EXPORT TAB
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _on_preset(self, name):
+        self.export_cfg.apply_preset(name)
+
+    def _sync_export_config(self):
+        """Sync UI values into export config before exporting."""
+        cfg = self.export_cfg
+        cfg.title_enabled = self.title_check.isChecked()
+        cfg.title_text = self.current_puzzle.get('name', '') if self.current_puzzle else ''
+        cfg.title_duration = self.title_spin.value()
+        cfg.end_enabled = self.end_check.isChecked()
+        cfg.end_duration = self.end_spin.value()
+        cfg.move_speed = self.anim_dur_slider.value() / 10.0
+        cfg.pause_after_move = self.pause_slider.value() / 10.0
+        cfg.loop_count = 1
+
+    def _on_export(self):
+        if not HAS_FFMPEG:
+            QMessageBox.warning(self, "FFmpeg Not Found",
+                                "FFmpeg is required for video export.\n"
+                                "Install it and add to your system PATH.")
+            return
+        if not self.current_puzzle:
+            QMessageBox.information(self, "No Puzzle", "Select a puzzle first.")
+            return
+        if self._single_exporting:
+            return
+
+        self._sync_export_config()
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        name = sanitize_filename(self.current_puzzle.get('name', 'puzzle'))
+        output_path = os.path.join(EXPORT_DIR, f"{name}.mp4")
+
+        self._single_exporting = True
+        self.export_btn.setEnabled(False)
+        self.export_progress.setVisible(True)
+        self.export_progress.setRange(0, 100)
+        self.export_progress.setValue(0)
+        self.export_status.setText("Exporting…")
+
+        self._exporter = FFmpegVideoExporter(self.export_cfg)
+        self._exporter.progress.connect(self._on_export_progress)
+        self._exporter.finished.connect(self._on_export_finished)
+        self._exporter.error.connect(self._on_export_error)
+        self._exporter.log_msg.connect(lambda msg: log(msg, "EXPORT"))
+
+        self._export_thread = self._exporter.export_puzzle_threaded(
+            self.current_puzzle, output_path)
+
+    def _on_export_progress(self, current, total):
+        if total > 0:
+            pct = int(100 * current / total)
+            self.export_progress.setValue(pct)
+
+    def _on_export_finished(self, path):
+        self._single_exporting = False
+        self.export_btn.setEnabled(True)
+        self.export_progress.setVisible(False)
+        self.export_status.setText(f"✅ Exported: {os.path.basename(path)}")
+        self.status.showMessage(f"Export complete: {path}")
+        # Mark as exported
+        if self.current_puzzle:
+            pid = self.current_puzzle.get('id', '')
+            if pid:
+                self.export_manifest.mark_exported(
+                    pid, path, self.export_cfg.preset_name,
+                    self.current_puzzle.get('name', ''))
+                self._update_puzzle_info(self.current_puzzle)
+
+    def _on_export_error(self, msg):
+        self._single_exporting = False
+        self.export_btn.setEnabled(True)
+        self.export_progress.setVisible(False)
+        self.export_status.setText(f"❌ Error: {msg[:100]}")
+        self.status.showMessage(f"Export error: {msg}")
+
+    def _on_batch_export_selected(self):
+        puzzles = self._get_selected_puzzles()
+        if not puzzles:
+            QMessageBox.information(self, "No Selection",
+                                    "Check some puzzles in the list first.")
+            return
+        self._start_batch_export(puzzles)
+
+    def _on_batch_export_page(self):
+        puzzles = list(self.puzzle_loader.puzzles)
+        if not puzzles:
+            QMessageBox.information(self, "No Puzzles", "No puzzles on this page.")
+            return
+        self._start_batch_export(puzzles)
+
+    def _start_batch_export(self, puzzles):
+        if not HAS_FFMPEG:
+            QMessageBox.warning(self, "FFmpeg Not Found",
+                                "FFmpeg is required for video export.")
+            return
+        if self._batch_exporting:
+            return
+
+        self._sync_export_config()
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        self._batch_exporting = True
+        self._batch_cancelled = False
+        self._batch_total = len(puzzles)
+        self._batch_completed = 0
+
+        self.batch_selected_btn.setEnabled(False)
+        self.batch_page_btn.setEnabled(False)
+        self.batch_cancel_btn.setVisible(True)
+        self.batch_progress.setVisible(True)
+        self.batch_progress.setRange(0, self._batch_total)
+        self.batch_progress.setValue(0)
+        self.batch_status.setText(f"Exporting 0 / {self._batch_total}…")
+
+        self._batch_exporter = FFmpegVideoExporter(self.export_cfg)
+        self._batch_exporter.batch_puzzle_done.connect(self._on_batch_puzzle_done)
+        self._batch_exporter.finished.connect(self._on_batch_finished)
+        self._batch_exporter.error.connect(self._on_batch_error)
+        self._batch_exporter.log_msg.connect(lambda msg: log(msg, "BATCH"))
+
+        self._batch_exporter.export_batch(puzzles, EXPORT_DIR)
+
+    def _on_batch_puzzle_done(self, idx, total, name):
+        self._batch_completed = idx
+        self.batch_progress.setValue(idx)
+        self.batch_status.setText(f"Exported {idx} / {total}: {name}")
+
+    def _on_batch_finished(self, output_dir):
+        self._finish_batch()
+        self.batch_status.setText(
+            f"✅ Batch complete: {self._batch_completed} puzzles exported")
+        self.status.showMessage("Batch export complete")
+
+    def _on_batch_error(self, msg):
+        self._finish_batch()
+        self.batch_status.setText(f"❌ Batch error: {msg[:100]}")
+
+    def _on_batch_cancel(self):
+        if self._batch_exporting and self._batch_exporter:
+            self._batch_cancelled = True
+            self._batch_exporter.cancel()
+        self._finish_batch()
+
+    def _finish_batch(self):
+        self._batch_exporting = False
+        self.batch_selected_btn.setEnabled(True)
+        self.batch_page_btn.setEnabled(True)
+        self.batch_cancel_btn.setVisible(False)
+        self.batch_progress.setVisible(False)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  AUTO-SAVE / AUTO-LOAD
     # ══════════════════════════════════════════════════════════════════════════
 
     def _auto_save(self):
+        """Save current application state to disk."""
         if not self.autosave_check.isChecked():
             return
         try:
             os.makedirs(AUTOSAVE_DIR, exist_ok=True)
             state = {
-                'preset': self.preset_combo.currentText(),
-                'theme': self.theme_combo.currentText(),
+                'version': 1,
+                'window_geometry': self.saveGeometry().toBase64().data().decode(),
+                'window_state': self.saveState().toBase64().data().decode(),
+                'splitter_state': self.findChild(QSplitter).saveState().toBase64().data().decode(),
+                'board_theme': self.theme_combo.currentText(),
+                'show_coords': self.show_coords_check.isChecked(),
+                'show_arrow': self.show_arrow_check.isChecked(),
+                'sound_enabled': self.sound_check.isChecked(),
+                'sound_volume': self.vol_slider.value(),
                 'sound_pack': self.sound_pack_combo.currentText(),
-                'volume': self.vol_slider.value(),
+                'anim_speed': self.anim_slider.value(),
+                'auto_delay': self.gap_slider.value(),
+                'loop_enabled': self.loop_btn.isChecked(),
+                'flipped': self.board_widget.flipped,
+                'export_config': self.export_cfg.to_dict(),
+                'min_rating_filter': self.min_rating_spin.value(),
+                'max_rating_filter': self.max_rating_spin.value(),
+                'theme_filter': self.theme_filter_combo.currentData(),
+                'sort_by': self.sort_combo.currentData(),
+                'per_page': self.per_page_combo.currentText(),
+                'random_min_rating': self.random_min_rating.value(),
+                'random_max_rating': self.random_max_rating.value(),
+                'random_theme': self.random_theme_combo.currentData(),
+                'random_auto_advance': self.random_auto_check.isChecked(),
+                'gen_moves': self.gen_moves_spin.value(),
+                'streak': self._streak,
+                'best_streak': self._best_streak,
             }
-            with open(AUTOSAVE_PATH, 'w') as f:
+            if self.current_puzzle:
+                state['current_puzzle_id'] = str(self.current_puzzle.get('id', ''))
+                state['current_move_index'] = self.move_index
+
+            with open(AUTOSAVE_PATH, 'w', encoding='utf-8') as f:
                 json.dump(state, f, indent=2)
-        except Exception:
-            pass
+            self._autosave_dirty = False
+        except Exception as e:
+            log(f"Auto-save error: {e}", "AUTOSAVE")
 
     def _auto_load_state(self):
+        """Load saved application state from disk."""
         if not os.path.exists(AUTOSAVE_PATH):
             return
         try:
-            with open(AUTOSAVE_PATH, 'r') as f:
+            with open(AUTOSAVE_PATH, 'r', encoding='utf-8') as f:
                 state = json.load(f)
-            if 'theme' in state and state['theme'] in THEMES:
-                self.theme_combo.setCurrentText(state['theme'])
-            if 'preset' in state and state['preset'] in EXPORT_PRESETS:
-                self.preset_combo.setCurrentText(state['preset'])
-            if 'sound_pack' in state and state['sound_pack'] in SOUND_PACKS:
-                self.sound_pack_combo.setCurrentText(state['sound_pack'])
-            if 'volume' in state:
-                self.vol_slider.setValue(int(state['volume']))
-        except Exception:
-            pass
 
-    def _auto_load_bundled(self):
-        if os.path.exists(LICHESS_DB_PATH):
-            try:
-                self.puzzle_loader.load_parquet(LICHESS_DB_PATH)
-                self._refresh_puzzle_list()
-                self.status.showMessage(f"Loaded {self.puzzle_loader.total_count} puzzles from database")
-            except Exception as e:
-                self.status.showMessage(f"Failed to load database: {e}")
+            if 'window_geometry' in state:
+                from PySide6.QtCore import QByteArray
+                self.restoreGeometry(QByteArray.fromBase64(state['window_geometry'].encode()))
+            if 'window_state' in state:
+                from PySide6.QtCore import QByteArray
+                self.restoreState(QByteArray.fromBase64(state['window_state'].encode()))
+
+            if 'splitter_state' in state:
+                from PySide6.QtCore import QByteArray
+                splitter = self.findChild(QSplitter)
+                if splitter:
+                    splitter.restoreState(QByteArray.fromBase64(state['splitter_state'].encode()))
+
+            if 'board_theme' in state:
+                idx = self.theme_combo.findText(state['board_theme'])
+                if idx >= 0:
+                    self.theme_combo.setCurrentIndex(idx)
+
+            if 'show_coords' in state:
+                self.show_coords_check.setChecked(state['show_coords'])
+            if 'show_arrow' in state:
+                self.show_arrow_check.setChecked(state['show_arrow'])
+
+            if 'sound_enabled' in state:
+                self.sound_check.setChecked(state['sound_enabled'])
+            if 'sound_volume' in state:
+                self.vol_slider.setValue(state['sound_volume'])
+            if 'sound_pack' in state:
+                idx = self.sound_pack_combo.findText(state['sound_pack'])
+                if idx >= 0:
+                    self.sound_pack_combo.setCurrentIndex(idx)
+
+            if 'anim_speed' in state:
+                self.anim_slider.setValue(state['anim_speed'])
+            if 'auto_delay' in state:
+                self.gap_slider.setValue(state['auto_delay'])
+            if 'loop_enabled' in state:
+                self.loop_btn.setChecked(state['loop_enabled'])
+            if 'flipped' in state:
+                if state['flipped'] != self.board_widget.flipped:
+                    self.board_widget.flip()
+
+            if 'export_config' in state:
+                self.export_cfg.load_dict(state['export_config'])
+                if 'preset_name' in state['export_config']:
+                    idx = self.preset_combo.findText(state['export_config']['preset_name'])
+                    if idx >= 0:
+                        self.preset_combo.setCurrentIndex(idx)
+
+            if 'min_rating_filter' in state:
+                self.min_rating_spin.setValue(state['min_rating_filter'])
+            if 'max_rating_filter' in state:
+                self.max_rating_spin.setValue(state['max_rating_filter'])
+            if 'theme_filter' in state and state['theme_filter']:
+                idx = self.theme_filter_combo.findData(state['theme_filter'])
+                if idx >= 0:
+                    self.theme_filter_combo.setCurrentIndex(idx)
+            if 'sort_by' in state:
+                idx = self.sort_combo.findData(state['sort_by'])
+                if idx >= 0:
+                    self.sort_combo.setCurrentIndex(idx)
+            if 'per_page' in state:
+                idx = self.per_page_combo.findText(state['per_page'])
+                if idx >= 0:
+                    self.per_page_combo.setCurrentIndex(idx)
+
+            if 'random_min_rating' in state:
+                self.random_min_rating.setValue(state['random_min_rating'])
+            if 'random_max_rating' in state:
+                self.random_max_rating.setValue(state['random_max_rating'])
+            if 'random_theme' in state and state['random_theme']:
+                idx = self.random_theme_combo.findData(state['random_theme'])
+                if idx >= 0:
+                    self.random_theme_combo.setCurrentIndex(idx)
+            if 'random_auto_advance' in state:
+                self.random_auto_check.setChecked(state['random_auto_advance'])
+            if 'gen_moves' in state:
+                self.gen_moves_spin.setValue(state['gen_moves'])
+
+            if 'streak' in state:
+                self._streak = state['streak']
+                self.lbl_streak.setText(f"Streak: {self._streak}")
+            if 'best_streak' in state:
+                self._best_streak = state['best_streak']
+                self.lbl_streak_val.setText(f"Best: {self._best_streak}")
+
+            self._pending_puzzle_id = state.get('current_puzzle_id', '')
+            self._pending_move_index = state.get('current_move_index', 0)
+
+            log("Auto-saved state restored", "AUTOSAVE")
+        except Exception as e:
+            log(f"Auto-load error: {e}", "AUTOSAVE")
+
+    def _restore_pending_puzzle(self):
+        """Restore the puzzle that was active when the app was last closed."""
+        pid = getattr(self, '_pending_puzzle_id', '')
+        if not pid:
+            return
+        puzzle = self.puzzle_loader.get_puzzle_by_id(pid)
+        if puzzle:
+            self._display_puzzle(puzzle)
+            target_idx = getattr(self, '_pending_move_index', 0)
+            if target_idx > 0 and target_idx <= len(self._uci_sequence):
+                self._stop_auto_play()
+                for i in range(target_idx):
+                    info = self.engine.make_move_uci(self._uci_sequence[i])
+                    if not info:
+                        break
+                    self.move_index = i + 1
+                self._update_moves_display()
+                self._update_scrubber()
+                self.board_widget.update()
+        self._pending_puzzle_id = ''
+        self._pending_move_index = 0

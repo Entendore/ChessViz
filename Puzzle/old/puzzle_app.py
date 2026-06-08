@@ -1,27 +1,46 @@
 #!/usr/bin/env python3
 """
-Chess Puzzle App — Single-file PySide6 Application
+Chess Puzzle App — Modular single-file PySide6 Application
+
+Architecture:
+  DATA       → Puzzle, FilterCriteria, PuzzleIndex, PuzzleCollection
+  ALGORITHM  → Trie, binary search, inverted index, filter pipeline
+  DOMAIN     → ChessEngine, BoardRenderer, SoundManager, PuzzleLoader
+  UI         → ChessBoardWidget, FilterPanel, MainWindow
+
 Install:  pip install PySide6 numpy imageio[ffmpeg] chess
-Optional: pip install pandas pyarrow duckdb
-GPU/Accel: pip install numba cupy-cuda121
+Optional: pip install pandas pyarrow duckdb numba cupy-cuda121
 """
 
-import sys, os, math, time, csv, re, ast, base64, threading, shutil, tempfile, gc, wave, subprocess
-import chess
-import json
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from __future__ import annotations
+
+import sys, os, math, time, csv, re, ast, base64, threading, shutil
+import tempfile, wave, subprocess, json
+from abc import ABC, abstractmethod
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
+from enum import Enum, auto
+from functools import lru_cache, cached_property
 from pathlib import Path
+from typing import (
+    Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Sequence,
+    Set, Tuple, TypeVar, Union,
+)
+
+import chess
+import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QPushButton, QTextEdit, QFrame, QListWidget,
     QListWidgetItem, QSlider, QSpinBox, QLineEdit, QFormLayout, QComboBox,
-    QProgressBar, QGroupBox, QCheckBox, QScrollArea
+    QProgressBar, QCheckBox, QFileDialog, QDialog, QMessageBox,
+    QSizePolicy, QGridLayout,
 )
 from PySide6.QtCore import Qt, QRect, QRectF, Signal, QTimer, QPointF, QUrl
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush, QRadialGradient,
-    QImage, QPixmap, QPolygonF, QPainterPath, QTransform
+    QImage, QPixmap, QPolygonF, QPainterPath, QTransform, QPalette,
 )
 from PySide6.QtMultimedia import QSoundEffect
 
@@ -31,352 +50,834 @@ csv.field_size_limit(2**31 - 1)
 #  OPTIONAL DEPENDENCIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-HAS_NUMPY = True
 HAS_IMAGEIO = False
 try:
-    import imageio.v3 as iio
-    HAS_IMAGEIO = True
-except Exception:
-    pass
-HAS_PANDAS = False; HAS_PYARROW = False; HAS_DUCKDB = False
+    import imageio.v3 as iio; HAS_IMAGEIO = True
+except Exception: pass
+
+HAS_PANDAS = False
 try:
     import pandas as pd; HAS_PANDAS = True
-except ImportError:
-    pass
-if not HAS_PANDAS:
-    try:
-        import pyarrow.parquet as pq; HAS_PYARROW = True
-    except ImportError:
-        pass
+except ImportError: pass
+
+HAS_PYARROW = False
+try:
+    import pyarrow.parquet as pq; HAS_PYARROW = True
+except ImportError: pass
+
+HAS_DUCKDB = False
 try:
     import duckdb; HAS_DUCKDB = True
-except ImportError:
-    pass
+except ImportError: pass
+
 HAS_NUMBA = False
 try:
     import numba; HAS_NUMBA = True
-except ImportError:
-    pass
-HAS_CUPY = False; _cp = None
+except ImportError: pass
+
+HAS_CUPY = False
 try:
     import cupy as cp; HAS_CUPY = True
-except Exception:
-    pass
+except Exception: pass
+
 HAS_FFMPEG = shutil.which('ffmpeg') is not None
-HAS_MOVIEPY = False
-try:
-    import moviepy; HAS_MOVIEPY = True
-except ImportError:
-    pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def log(msg, level="INFO"):
+def log(msg: str, level: str = "INFO") -> None:
     from datetime import datetime
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FILE PATHS
+#  CONSTANTS & PATHS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
+SETTINGS_PATH = os.path.join(APP_DIR, "puzzle_app_settings.json")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BOARD / RENDERING CONSTANTS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-SQ_SIZE   = 68
-BOARD_PX  = SQ_SIZE * 8
+SQ_SIZE = 68
+BOARD_PX = SQ_SIZE * 8
+ANIM_FPS = 60
+ANIM_SPEED_DEFAULT = 250
 
 PIECE_SYM = {
-    (chess.PAWN, chess.WHITE):   "♟", (chess.PAWN, chess.BLACK):   "♟",
+    (chess.PAWN, chess.WHITE): "♟", (chess.PAWN, chess.BLACK): "♟",
     (chess.KNIGHT, chess.WHITE): "♞", (chess.KNIGHT, chess.BLACK): "♞",
     (chess.BISHOP, chess.WHITE): "♝", (chess.BISHOP, chess.BLACK): "♝",
-    (chess.ROOK, chess.WHITE):   "♜", (chess.ROOK, chess.BLACK):   "♜",
-    (chess.QUEEN, chess.WHITE):  "♛", (chess.QUEEN, chess.BLACK):  "♛",
-    (chess.KING, chess.WHITE):   "♚", (chess.KING, chess.BLACK):   "♚",
+    (chess.ROOK, chess.WHITE): "♜", (chess.ROOK, chess.BLACK): "♜",
+    (chess.QUEEN, chess.WHITE): "♛", (chess.QUEEN, chess.BLACK): "♛",
+    (chess.KING, chess.WHITE): "♚", (chess.KING, chess.BLACK): "♚",
 }
 
 FILES_STR = 'abcdefgh'
 RANKS_STR = '87654321'
 
-ANIM_SPEED_SLOW    = 500
-ANIM_SPEED_DEFAULT = 250
-ANIM_SPEED_FAST    = 100
-ANIM_FPS           = 60
+UCI_RE = re.compile(r'^[a-h][1-8][a-h][1-8][qrbn]?$')
+MVNUM_RE = re.compile(r'^\d+\.+$')
+RESULT_RE = frozenset({'1-0', '0-1', '1/2-1/2', '*'})
+SAFE_FS_RE = re.compile(r'[\\/*?:"<>|]')
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BOARD THEMES
+#  ENUMS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class SortMode(Enum):
+    DEFAULT = auto()
+    NAME_ASC = auto()
+    NAME_DESC = auto()
+    DIFFICULTY_ASC = auto()
+    DIFFICULTY_DESC = auto()
+    RATING_ASC = auto()
+    RATING_DESC = auto()
+    MOVES_ASC = auto()
+    MOVES_DESC = auto()
+
+class DifficultyTier(Enum):
+    BEGINNER = (0.0, 0.2, "Beginner", "#66BB6A")
+    EASY = (0.2, 0.4, "Easy", "#AED581")
+    MEDIUM = (0.4, 0.6, "Medium", "#FFD54F")
+    HARD = (0.6, 0.8, "Hard", "#FF8A65")
+    EXPERT = (0.8, 1.01, "Expert", "#EF5350")
+
+    def __init__(self, lo: float, hi: float, label: str, color: str):
+        self.lo = lo; self.hi = hi; self.label = label; self.color = color
+
+    @classmethod
+    def from_score(cls, score: float) -> "DifficultyTier":
+        for tier in cls:
+            if tier.lo <= score < tier.hi:
+                return tier
+        return cls.EXPERT
+
+    @classmethod
+    def from_rating(cls, rating: int) -> "DifficultyTier":
+        if rating < 800: return cls.BEGINNER
+        if rating < 1200: return cls.EASY
+        if rating < 1600: return cls.MEDIUM
+        if rating < 2000: return cls.HARD
+        return cls.EXPERT
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATA MODELS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True, slots=True)
+class Puzzle:
+    """Immutable puzzle record — the core data unit."""
+    id: int
+    name: str
+    fen: str
+    moves: Tuple[str, ...]
+    desc: str
+    difficulty: float
+    themes: FrozenSet[str]
+    rating: Optional[int]
+    move_count: int
+    opening: str = ""
+    eco: str = ""
+    raw_row: Optional[Dict[str, Any]] = field(default=None, repr=False, hash=False)
+
+    @property
+    def tier(self) -> DifficultyTier:
+        return DifficultyTier.from_score(self.difficulty)
+
+    @property
+    def tier_color(self) -> str:
+        return self.tier.color
+
+    @property
+    def tier_label(self) -> str:
+        return self.tier.label
+
+    @property
+    def search_text(self) -> str:
+        """Pre-computed lowercase text for full-text search."""
+        parts = [self.name, self.desc, self.opening, ' '.join(self.themes)]
+        return ' '.join(parts).lower()
+
+    @property
+    def search_tokens(self) -> Tuple[str, ...]:
+        """Tokenized search text for indexing."""
+        text = self.search_text
+        return tuple(re.findall(r'[a-z0-9]+', text))
+
+
+@dataclass(frozen=True, slots=True)
+class FilterCriteria:
+    """Immutable filter specification — describes what to filter."""
+    text_query: str = ""
+    difficulty_range: Tuple[float, float] = (0.0, 1.0)
+    rating_range: Tuple[int, int] = (0, 3500)
+    move_count_range: Tuple[int, int] = (1, 50)
+    theme_tags: FrozenSet[str] = frozenset()
+    sort_mode: SortMode = SortMode.DEFAULT
+    require_rating: bool = False
+
+    @property
+    def is_trivial(self) -> bool:
+        """True if no filters are active (everything passes)."""
+        return (
+            not self.text_query
+            and self.difficulty_range == (0.0, 1.0)
+            and self.rating_range == (0, 3500)
+            and self.move_count_range == (1, 50)
+            and not self.theme_tags
+            and self.sort_mode == SortMode.DEFAULT
+            and not self.require_rating
+        )
+
+    @property
+    def active_count(self) -> int:
+        """Number of non-default filter dimensions active."""
+        count = 0
+        if self.text_query: count += 1
+        if self.difficulty_range != (0.0, 1.0): count += 1
+        if self.rating_range != (0, 3500): count += 1
+        if self.move_count_range != (1, 50): count += 1
+        if self.theme_tags: count += 1
+        if self.sort_mode != SortMode.DEFAULT: count += 1
+        if self.require_rating: count += 1
+        return count
+
+
+@dataclass(frozen=True, slots=True)
+class MoveInfo:
+    """Result of making a move on the board."""
+    from_rc: Tuple[int, int]
+    to_rc: Tuple[int, int]
+    piece_symbol: str
+    piece_obj: chess.Piece
+    captured: str
+    is_castle: bool
+    is_ep: bool
+    promo: Optional[int]
+    is_check: bool
+    is_mate: bool
+    notation: str
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TRIE — Prefix search for autocomplete
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TrieNode:
+    __slots__ = ('children', 'is_end', 'count')
+
+    def __init__(self):
+        self.children: Dict[str, "TrieNode"] = {}
+        self.is_end: bool = False
+        self.count: int = 0
+
+
+class Trie:
+    """Compressed trie for prefix-based search and autocomplete."""
+
+    def __init__(self) -> None:
+        self.root = TrieNode()
+        self._size = 0
+
+    def insert(self, word: str) -> None:
+        node = self.root
+        for ch in word.lower():
+            if ch not in node.children:
+                node.children[ch] = TrieNode()
+            node = node.children[ch]
+            node.count += 1
+        node.is_end = True
+        self._size += 1
+
+    def search(self, prefix: str, limit: int = 20) -> List[str]:
+        """Return all words with the given prefix, up to limit."""
+        node = self.root
+        for ch in prefix.lower():
+            if ch not in node.children:
+                return []
+            node = node.children[ch]
+        results: List[str] = []
+        self._collect(node, prefix.lower(), results, limit)
+        return results
+
+    def _collect(self, node: TrieNode, prefix: str,
+                 results: List[str], limit: int) -> None:
+        if len(results) >= limit:
+            return
+        if node.is_end:
+            results.append(prefix)
+        for ch, child in sorted(node.children.items()):
+            self._collect(child, prefix + ch, results, limit)
+            if len(results) >= limit:
+                return
+
+    def has_prefix(self, prefix: str) -> bool:
+        node = self.root
+        for ch in prefix.lower():
+            if ch not in node.children:
+                return False
+            node = node.children[ch]
+        return True
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PUZZLE INDEX — Inverted index + sorted arrays
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PuzzleIndex:
+    """
+    Pre-built index structures for O(log n) range queries and O(1) tag lookups.
+
+    Structures:
+      _tag_index:      tag → set of puzzle ids       (inverted index)
+      _token_index:    token → set of puzzle ids      (full-text)
+      _diff_sorted:    [(difficulty, id)] sorted       (binary search)
+      _rating_sorted:  [(rating, id)] sorted           (binary search)
+      _moves_sorted:   [(move_count, id)] sorted       (binary search)
+      _name_sorted:    [(name_lower, id)] sorted       (binary search)
+      _theme_trie:     Trie for theme autocomplete
+    """
+
+    def __init__(self, puzzles: Sequence[Puzzle]) -> None:
+        self._puzzles: Dict[int, Puzzle] = {}
+        self._tag_index: Dict[str, Set[int]] = defaultdict(set)
+        self._token_index: Dict[str, Set[int]] = defaultdict(set)
+        self._diff_sorted: List[Tuple[float, int]] = []
+        self._rating_sorted: List[Tuple[float, int]] = []
+        self._moves_sorted: List[Tuple[int, int]] = []
+        self._name_sorted: List[Tuple[str, int]] = []
+        self._theme_trie = Trie()
+        self._build(puzzles)
+
+    def _build(self, puzzles: Sequence[Puzzle]) -> None:
+        for p in puzzles:
+            pid = p.id
+            self._puzzles[pid] = p
+
+            # Tag inverted index
+            for tag in p.themes:
+                self._tag_index[tag].add(pid)
+
+            # Full-text token index
+            for token in p.search_tokens:
+                self._token_index[token].add(pid)
+
+            # Sorted arrays for range queries
+            self._diff_sorted.append((p.difficulty, pid))
+            if p.rating is not None:
+                self._rating_sorted.append((float(p.rating), pid))
+            self._moves_sorted.append((p.move_count, pid))
+            self._name_sorted.append((p.name.lower(), pid))
+
+        # Sort all arrays
+        self._diff_sorted.sort()
+        self._rating_sorted.sort()
+        self._moves_sorted.sort()
+        self._name_sorted.sort()
+
+        # Build theme trie
+        for tag in self._tag_index:
+            self._theme_trie.insert(tag)
+
+    # ── Point lookups ──
+
+    def get(self, pid: int) -> Optional[Puzzle]:
+        return self._puzzles.get(pid)
+
+    def __len__(self) -> int:
+        return len(self._puzzles)
+
+    def __contains__(self, pid: int) -> bool:
+        return pid in self._puzzles
+
+    @property
+    def all_ids(self) -> Set[int]:
+        return set(self._puzzles.keys())
+
+    @property
+    def all_themes(self) -> List[str]:
+        return sorted(self._tag_index.keys())
+
+    @property
+    def theme_trie(self) -> Trie:
+        return self._theme_trie
+
+    # ── Range queries via binary search ──
+
+    def ids_in_difficulty_range(self, lo: float, hi: float) -> Set[int]:
+        """O(log n + k) difficulty range query."""
+        arr = self._diff_sorted
+        left = bisect_left(arr, (lo, -1))
+        right = bisect_right(arr, (hi, float('inf')))
+        return {arr[i][1] for i in range(left, right)}
+
+    def ids_in_rating_range(self, lo: int, hi: int) -> Set[int]:
+        """O(log n + k) rating range query."""
+        arr = self._rating_sorted
+        left = bisect_left(arr, (float(lo), -1))
+        right = bisect_right(arr, (float(hi), float('inf')))
+        return {arr[i][1] for i in range(left, right)}
+
+    def ids_in_move_range(self, lo: int, hi: int) -> Set[int]:
+        """O(log n + k) move count range query."""
+        arr = self._moves_sorted
+        left = bisect_left(arr, (lo, -1))
+        right = bisect_right(arr, (hi, 0x7FFFFFFF))
+        return {arr[i][1] for i in range(left, right)}
+
+    # ── Tag lookup ──
+
+    def ids_with_tag(self, tag: str) -> Set[int]:
+        """O(1) tag lookup via inverted index."""
+        return self._tag_index.get(tag.lower(), set())
+
+    def ids_with_any_tag(self, tags: Iterable[str]) -> Set[int]:
+        """Union of all ids matching any of the given tags."""
+        result: Set[int] = set()
+        for tag in tags:
+            result |= self.ids_with_tag(tag)
+        return result
+
+    # ── Full-text search ──
+
+    def ids_matching_text(self, query: str) -> Set[int]:
+        """Tokenized full-text search — all tokens must match (AND)."""
+        tokens = re.findall(r'[a-z0-9]+', query.lower())
+        if not tokens:
+            return self.all_ids
+        # Start with least common token for efficiency
+        token_sets = []
+        for t in tokens:
+            s = self._token_index.get(t, set())
+            if not s:
+                return set()  # Early exit if any token matches nothing
+            token_sets.append(s)
+        token_sets.sort(key=len)  # Process rarest first
+        result = token_sets[0].copy()
+        for s in token_sets[1:]:
+            result &= s
+            if not result:
+                return set()
+        return result
+
+    # ── Combined filter pipeline ──
+
+    def filter(self, criteria: FilterCriteria) -> List[int]:
+        """
+        Multi-predicate filter using set intersection.
+        Applies most selective filters first for early pruning.
+        Returns sorted list of puzzle IDs.
+        """
+        if criteria.is_trivial:
+            return sorted(self._puzzles.keys())
+
+        # Build candidate sets for each active filter
+        candidates: List[Set[int]] = []
+
+        # Text search — typically most selective
+        if criteria.text_query:
+            candidates.append(self.ids_matching_text(criteria.text_query))
+
+        # Difficulty range
+        if criteria.difficulty_range != (0.0, 1.0):
+            candidates.append(
+                self.ids_in_difficulty_range(*criteria.difficulty_range))
+
+        # Rating range
+        if criteria.rating_range != (0, 3500) or criteria.require_rating:
+            lo, hi = criteria.rating_range
+            rated = self.ids_in_rating_range(lo, hi)
+            if criteria.require_rating:
+                # Exclude puzzles without a rating
+                rated &= {pid for pid, p in self._puzzles.items()
+                          if p.rating is not None}
+            candidates.append(rated)
+
+        # Move count range
+        if criteria.move_count_range != (1, 50):
+            candidates.append(
+                self.ids_in_move_range(*criteria.move_count_range))
+
+        # Theme tags (OR semantics — match any)
+        if criteria.theme_tags:
+            candidates.append(self.ids_with_any_tag(criteria.theme_tags))
+
+        # Intersect all candidate sets, smallest first
+        if not candidates:
+            result = self.all_ids
+        else:
+            candidates.sort(key=len)
+            result = candidates[0]
+            for s in candidates[1:]:
+                result = result & s
+                if not result:
+                    return []
+
+        # Sort results
+        return self._sort(result, criteria.sort_mode)
+
+    def _sort(self, ids: Set[int], mode: SortMode) -> List[int]:
+        """Sort filtered IDs by the given mode."""
+        if mode == SortMode.DEFAULT:
+            return sorted(ids)
+
+        key_fn: Callable[[int], Any]
+        reverse = False
+
+        if mode == SortMode.NAME_ASC:
+            key_fn = lambda pid: self._puzzles[pid].name.lower()
+        elif mode == SortMode.NAME_DESC:
+            key_fn = lambda pid: self._puzzles[pid].name.lower()
+            reverse = True
+        elif mode == SortMode.DIFFICULTY_ASC:
+            key_fn = lambda pid: self._puzzles[pid].difficulty
+        elif mode == SortMode.DIFFICULTY_DESC:
+            key_fn = lambda pid: self._puzzles[pid].difficulty
+            reverse = True
+        elif mode == SortMode.RATING_ASC:
+            key_fn = lambda pid: self._puzzles[pid].rating or 0
+        elif mode == SortMode.RATING_DESC:
+            key_fn = lambda pid: self._puzzles[pid].rating or 0
+            reverse = True
+        elif mode == SortMode.MOVES_ASC:
+            key_fn = lambda pid: self._puzzles[pid].move_count
+        elif mode == SortMode.MOVES_DESC:
+            key_fn = lambda pid: self._puzzles[pid].move_count
+            reverse = True
+        else:
+            return sorted(ids)
+
+        return sorted(ids, key=key_fn, reverse=reverse)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PUZZLE COLLECTION — High-level data manager
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PuzzleCollection:
+    """
+    Manages a collection of puzzles with an efficient index.
+    Provides filtering, sorting, and CRUD operations.
+    """
+
+    def __init__(self) -> None:
+        self._puzzles: List[Puzzle] = []
+        self._index: Optional[PuzzleIndex] = None
+        self._next_id: int = 0
+
+    @property
+    def index(self) -> Optional[PuzzleIndex]:
+        return self._index
+
+    @property
+    def puzzles(self) -> List[Puzzle]:
+        return self._puzzles
+
+    @property
+    def count(self) -> int:
+        return len(self._puzzles)
+
+    def add(self, puzzle: Puzzle) -> None:
+        self._puzzles.append(puzzle)
+        self._next_id = max(self._next_id, puzzle.id + 1)
+
+    def add_many(self, puzzles: Sequence[Puzzle]) -> None:
+        for p in puzzles:
+            self._puzzles.append(p)
+            self._next_id = max(self._next_id, p.id + 1)
+
+    def build_index(self) -> None:
+        """Build search index — call after adding all puzzles."""
+        self._index = PuzzleIndex(self._puzzles)
+        log(f"Index built: {len(self._puzzles)} puzzles, "
+            f"{len(self._index.all_themes)} themes", "INDEX")
+
+    def filter(self, criteria: FilterCriteria) -> List[int]:
+        """Filter using the index. Returns puzzle IDs."""
+        if self._index is None:
+            self.build_index()
+        return self._index.filter(criteria)
+
+    def get(self, pid: int) -> Optional[Puzzle]:
+        if self._index:
+            return self._index.get(pid)
+        for p in self._puzzles:
+            if p.id == pid:
+                return p
+        return None
+
+    def clear(self) -> None:
+        self._puzzles.clear()
+        self._index = None
+        self._next_id = 0
+
+    def next_id(self) -> int:
+        nid = self._next_id
+        self._next_id += 1
+        return nid
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BOARD THEME
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True, slots=True)
 class BoardTheme:
-    def __init__(self, name="Classic",
-                 light=(240, 217, 181), dark=(181, 136, 99),
-                 border=(48, 26, 7), highlight=(255, 255, 0, 100),
-                 last_move=(155, 199, 0, 100), arrow=(220, 50, 47, 200)):
-        self.name = name
-        self.light_sq = QColor(*light); self.dark_sq = QColor(*dark)
-        self.border = QColor(*border); self.highlight = QColor(*highlight)
-        self.last_move = QColor(*last_move); self.arrow_clr = QColor(*arrow)
-        self.bg = QColor(32, 32, 36); self.coord = QColor(180, 160, 130)
+    name: str
+    light_sq: Tuple[int, int, int]
+    dark_sq: Tuple[int, int, int]
+    border: Tuple[int, int, int] = (180, 180, 180)
+    highlight: Tuple[int, int, int, int] = (45, 125, 154, 70)
+    last_move: Tuple[int, int, int, int] = (45, 125, 154, 50)
+    arrow: Tuple[int, int, int, int] = (45, 125, 154, 180)
+    bg: Tuple[int, int, int] = (250, 250, 250)
+    coord: Tuple[int, int, int] = (160, 160, 160)
 
-THEMES = {
-    "Classic": BoardTheme(),
-    "Blue":    BoardTheme("Blue", (208, 224, 243), (116, 150, 194), (40, 50, 70)),
-    "Green":   BoardTheme("Green", (238, 238, 210), (118, 150, 86), (50, 60, 40)),
-    "Brown":   BoardTheme("Brown", (222, 197, 165), (170, 120, 70), (60, 35, 15)),
-    "Purple":  BoardTheme("Purple", (220, 210, 230), (150, 130, 170), (50, 40, 60)),
-    "Ice":     BoardTheme("Ice", (230, 240, 250), (160, 190, 220), (50, 60, 80)),
+    def qcolor(self, attr: str) -> QColor:
+        val = getattr(self, attr)
+        return QColor(*val)
+
+
+THEMES: Dict[str, BoardTheme] = {
+    "Minimal": BoardTheme("Minimal", (240, 240, 240), (213, 213, 213)),
+    "Classic": BoardTheme("Classic", (240, 217, 181), (181, 136, 99),
+                          border=(48, 26, 7), highlight=(255, 255, 0, 100),
+                          last_move=(155, 199, 0, 100), arrow=(220, 50, 47, 200),
+                          bg=(32, 32, 36), coord=(180, 160, 130)),
+    "Blue": BoardTheme("Blue", (208, 224, 243), (116, 150, 194),
+                       border=(40, 50, 70)),
+    "Green": BoardTheme("Green", (238, 238, 210), (118, 150, 86),
+                        border=(50, 60, 40)),
+    "Brown": BoardTheme("Brown", (222, 197, 165), (170, 120, 70),
+                        border=(60, 35, 15)),
+    "Ice": BoardTheme("Ice", (230, 240, 250), (160, 190, 220),
+                      border=(50, 60, 80)),
 }
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  EXPORT PRESETS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@dataclass(frozen=True, slots=True)
 class ExportPreset:
-    def __init__(self, name, width, height, fps=30, board_frac=0.82,
-                 bg=(26, 26, 46), description=""):
-        self.name = name; self.width = width; self.height = height
-        self.fps = fps; self.board_frac = board_frac
-        self.bg = bg; self.description = description
+    name: str
+    width: int
+    height: int
+    fps: int = 30
+    board_frac: float = 0.82
+    bg: Tuple[int, int, int] = (250, 250, 250)
+    description: str = ""
 
-    @property
-    def aspect_ratio(self):
-        from math import gcd; g = gcd(self.width, self.height)
-        return self.width // g, self.height // g
-
-    @property
-    def is_vertical(self):
-        return self.height > self.width
-
-    @property
-    def is_square(self):
-        return self.width == self.height
-
-    def calc_sq_size(self):
+    def calc_sq_size(self) -> int:
         shorter = min(self.width, self.height)
-        board_px = int(shorter * self.board_frac)
-        board_px = (board_px // 8) * 8
-        return max(8, board_px // 8)
+        bpx = (int(shorter * self.board_frac) // 8) * 8
+        return max(8, bpx // 8)
 
-    def calc_board_rect(self):
+    def calc_board_rect(self) -> Tuple[int, int, int, int]:
         sq = self.calc_sq_size(); bw = sq * 8; bh = sq * 8
-        x = (self.width - bw) // 2; y = (self.height - bh) // 2
-        return x, y, bw, bh
+        return (self.width - bw) // 2, (self.height - bh) // 2, bw, bh
 
-EXPORT_PRESETS = {
-    "Board Only (544×544)": ExportPreset("Board Only", 544, 544, 30, 1.0, (26, 26, 46), "Square board-only"),
-    "YouTube 720p (1280×720)": ExportPreset("YouTube 720p", 1280, 720, 30, 0.82, (18, 18, 32), "16:9 HD"),
-    "YouTube 1080p (1920×1080)": ExportPreset("YouTube 1080p", 1920, 1080, 30, 0.78, (18, 18, 32), "16:9 Full HD"),
-    "YouTube 4K (3840×2160)": ExportPreset("YouTube 4K", 3840, 2160, 30, 0.75, (18, 18, 32), "16:9 4K"),
-    "YouTube Shorts (1080×1920)": ExportPreset("YouTube Shorts", 1080, 1920, 30, 0.50, (18, 18, 32), "9:16 vertical"),
-    "TikTok (1080×1920)": ExportPreset("TikTok", 1080, 1920, 30, 0.50, (18, 18, 32), "9:16 vertical"),
-    "Instagram Reels (1080×1920)": ExportPreset("Instagram Reels", 1080, 1920, 30, 0.50, (18, 18, 32), "9:16 vertical"),
-    "Instagram Square (1080×1080)": ExportPreset("Instagram Square", 1080, 1080, 30, 0.82, (18, 18, 32), "1:1 square"),
-    "Twitter/X (1280×720)": ExportPreset("Twitter/X", 1280, 720, 30, 0.80, (18, 18, 32), "16:9"),
-    "Custom": ExportPreset("Custom", 544, 544, 30, 0.82, (26, 26, 46), "User-defined"),
+
+EXPORT_PRESETS: Dict[str, ExportPreset] = {
+    "Board Only (544×544)": ExportPreset("Board Only", 544, 544, 30, 1.0),
+    "YouTube 1080p": ExportPreset("YouTube 1080p", 1920, 1080, 30, 0.78),
+    "YouTube Shorts": ExportPreset("YouTube Shorts", 1080, 1920, 30, 0.50),
+    "TikTok": ExportPreset("TikTok", 1080, 1920, 30, 0.50),
+    "Instagram Square": ExportPreset("Instagram Square", 1080, 1080, 30, 0.82),
+    "Custom": ExportPreset("Custom", 544, 544, 30, 0.82),
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  EXPORT CONFIG
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class ExportConfig:
-    def __init__(self):
-        self.fps = 30; self.title_enabled = True; self.title_text = ""
-        self.title_duration = 3.0; self.title_bg = "#1a1a2e"
-        self.title_fg = "#e0e0e0"; self.title_font_size = 36
-        self.end_enabled = True; self.end_text = "Solved!"
-        self.end_duration = 3.0; self.end_bg = "#1a1a2e"
-        self.end_fg = "#e0e0e0"; self.end_font_size = 42
-        self.move_anim_duration = 0.4; self.pause_after_move = 1.0
-        self.highlight_duration = 0.3; self.max_workers = 4
-        self.sq_size = SQ_SIZE; self.theme_name = "Classic"
-        self.gpu_post_process = True; self.gpu_vignette = 0.25
-        self.gpu_contrast = 1.02; self.gpu_saturation = 1.05
-        self.output_dir = ""; self.batch_combine = False
-        self.preset_name = "Board Only (544×544)"
-        self.target_width = 544; self.target_height = 544
-        self.background_color = (26, 26, 46); self.board_frac = 0.82
-        self.audio_path = ""; self.audio_volume = 0.25
-        self.export_gif = False; self.gif_fps = 12
-        self.show_title_overlay = True; self.title_overlay_text = ""
-        self.subtitle_text = ""; self.use_ffmpeg = True
-        self.ffmpeg_crf = 20; self.ffmpeg_preset = "medium"
-
-    def apply_preset(self, preset_name):
-        if preset_name in EXPORT_PRESETS:
-            p = EXPORT_PRESETS[preset_name]
-            self.preset_name = preset_name; self.target_width = p.width
-            self.target_height = p.height; self.fps = p.fps
-            self.background_color = p.bg; self.board_frac = p.board_frac
-            if preset_name != "Custom":
-                self.sq_size = p.calc_sq_size()
-
-    @property
-    def effective_sq_size(self):
-        if self.preset_name and self.preset_name not in ("Board Only (544×544)", "Custom"):
-            p = EXPORT_PRESETS.get(self.preset_name)
-            if p: return p.calc_sq_size()
-        return self.sq_size
-
-    @property
-    def is_vertical(self):
-        return self.target_height > self.target_width
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
+#  MINIMALIST COLOR SCHEME
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_SAFE_FS = re.compile(r'[\\/*?:"<>|]')
+class Palette:
+    BG = "#FAFAFA"; BG2 = "#F5F5F5"; BG3 = "#EEEEEE"; CARD = "#FFFFFF"
+    TEXT = "#1A1A1A"; TEXT2 = "#757575"; TEXT3 = "#BDBDBD"; INV = "#FFFFFF"
+    ACCENT = "#2D7D9A"; ACCENT_H = "#23697F"; ACCENT_L = "#E0F0F5"
+    BORDER = "#E0E0E0"; BORDER_L = "#F0F0F0"
+    ERROR = "#E53935"; SUCCESS = "#4CAF50"
 
-def sanitize_filename(name, max_len=120):
-    s = _SAFE_FS.sub('_', name).strip('. ')
-    return s[:max_len] if s else "untitled"
+    @classmethod
+    def apply(cls, app: QApplication) -> None:
+        p = QPalette()
+        p.setColor(QPalette.Window, QColor(cls.BG))
+        p.setColor(QPalette.WindowText, QColor(cls.TEXT))
+        p.setColor(QPalette.Base, QColor(cls.CARD))
+        p.setColor(QPalette.AlternateBase, QColor(cls.BG2))
+        p.setColor(QPalette.Text, QColor(cls.TEXT))
+        p.setColor(QPalette.Button, QColor(cls.BG2))
+        p.setColor(QPalette.ButtonText, QColor(cls.TEXT))
+        p.setColor(QPalette.Highlight, QColor(cls.ACCENT))
+        p.setColor(QPalette.HighlightedText, QColor(cls.INV))
+        p.setColor(QPalette.Link, QColor(cls.ACCENT))
+        app.setPalette(p)
 
-def parse_opening_image(img_val):
-    img_dict = None
-    if isinstance(img_val, dict):
-        img_dict = img_val
-    elif isinstance(img_val, str) and img_val.strip().startswith("{"):
-        try:
-            safe = img_val
-            safe = re.sub(r'\bnull\b', 'None', safe)
-            safe = re.sub(r'\btrue\b', 'True', safe)
-            safe = re.sub(r'\bfalse\b', 'False', safe)
-            safe = re.sub(r'\bNaN\b', 'None', safe)
-            safe = re.sub(r'\bundefined\b', 'None', safe)
-            img_dict = ast.literal_eval(safe)
-        except Exception:
-            pass
-    if img_dict:
-        try:
-            bytes_val = img_dict.get('bytes'); actual_bytes = None
-            if isinstance(bytes_val, bytes):
-                actual_bytes = bytes_val
-            elif isinstance(bytes_val, str):
-                try:
-                    actual_bytes = base64.b64decode(bytes_val)
-                except Exception:
-                    pass
-                if actual_bytes is None:
-                    try:
-                        actual_bytes = bytes(bytes_val, "utf-8").decode("unicode_escape").encode("latin1")
-                    except Exception:
-                        pass
-            if actual_bytes:
-                img = QImage(); img.loadFromData(actual_bytes); return img
-        except Exception:
-            pass
-    return None
 
-_thread_local = threading.local()
+STYLESHEET = """
+QMainWindow, QWidget { background:#FAFAFA; color:#1A1A1A;
+    font-family:"Inter","Segoe UI","SF Pro",sans-serif; font-size:13px; }
+QLabel { color:#1A1A1A; background:transparent; }
+QPushButton { background:#FFF; border:1px solid #E0E0E0; border-radius:6px;
+    padding:6px 14px; color:#1A1A1A; font-weight:500; }
+QPushButton:hover { background:#F5F5F5; border-color:#BDBDBD; }
+QPushButton:pressed { background:#EEE; }
+QPushButton[accent="true"] { background:#2D7D9A; color:#FFF; border:1px solid #23697F; }
+QPushButton[accent="true"]:hover { background:#23697F; }
+QLineEdit { background:#FFF; border:1px solid #E0E0E0; border-radius:6px;
+    padding:6px 10px; selection-background-color:#2D7D9A; selection-color:#FFF; }
+QLineEdit:focus { border-color:#2D7D9A; }
+QComboBox { background:#FFF; border:1px solid #E0E0E0; border-radius:6px; padding:5px 10px; }
+QSpinBox { background:#FFF; border:1px solid #E0E0E0; border-radius:6px; padding:4px 8px; }
+QSlider::groove:horizontal { height:4px; background:#E0E0E0; border-radius:2px; }
+QSlider::handle:horizontal { background:#2D7D9A; width:14px; height:14px;
+    margin:-5px 0; border-radius:7px; }
+QSlider::sub-page:horizontal { background:#2D7D9A; border-radius:2px; }
+QListWidget { background:#FFF; border:1px solid #E0E0E0; border-radius:6px;
+    outline:none; padding:2px; }
+QListWidget::item { padding:8px 10px; border-bottom:1px solid #F5F5F5; border-radius:4px; }
+QListWidget::item:selected { background:#E0F0F5; color:#1A1A1A; }
+QListWidget::item:hover { background:#F5F5F5; }
+QTextEdit { background:#FFF; border:1px solid #E0E0E0; border-radius:6px; padding:6px; }
+QTabWidget::pane { border:1px solid #E0E0E0; border-radius:6px; background:#FFF; }
+QTabBar::tab { background:#F5F5F5; border:1px solid #E0E0E0; border-bottom:none;
+    border-top-left-radius:6px; border-top-right-radius:6px;
+    padding:7px 16px; margin-right:2px; color:#757575; font-weight:500; }
+QTabBar::tab:selected { background:#FFF; color:#2D7D9A; border-bottom:2px solid #2D7D9A; }
+QProgressBar { border:1px solid #E0E0E0; border-radius:4px; text-align:center;
+    background:#F5F5F5; height:18px; color:#757575; font-size:11px; }
+QProgressBar::chunk { background:#2D7D9A; border-radius:3px; }
+QCheckBox { spacing:8px; }
+QCheckBox::indicator { width:16px; height:16px; border:1px solid #BDBDBD;
+    border-radius:4px; background:#FFF; }
+QCheckBox::indicator:checked { background:#2D7D9A; border-color:#2D7D9A; }
+QGroupBox { border:1px solid #E0E0E0; border-radius:6px; margin-top:12px;
+    padding-top:16px; font-weight:600; }
+QGroupBox::title { subcontrol-origin:margin; left:12px; padding:0 6px; color:#2D7D9A; }
+QStatusBar { background:#FFF; border-top:1px solid #E0E0E0; color:#757575;
+    font-size:12px; padding:4px 8px; }
+QToolTip { background:#1A1A1A; color:#FFF; border:none; border-radius:4px;
+    padding:6px 10px; font-size:12px; }
+"""
 
-def get_render_assets(sz):
-    isz = int(sz * 100)
-    if getattr(_thread_local, 'cache_sz', -1) == isz:
-        return _thread_local.assets
-    font_piece = QFont("Segoe UI Emoji", sz * 0.9)
-    font_piece.setStyleStrategy(QFont.PreferAntialias)
-    font_coord = QFont("Sans", max(7, int(sz * 0.13)), QFont.Bold)
-    font_badge_normal = QFont("Sans", max(6, int(sz * 0.19 * 0.95)), QFont.Bold)
-    font_badge_symbol = QFont("Segoe UI Emoji", max(7, int(sz * 0.19 * 1.15)), QFont.Bold)
-    pen_badge_outline = QPen(QColor(255, 255, 255, 120), max(0.8, sz * 0.008))
-    assets = (font_piece, font_coord, font_badge_normal, font_badge_symbol, pen_badge_outline)
-    _thread_local.cache_sz = isz; _thread_local.assets = assets
-    return assets
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CHESS ENGINE
+#  CHESS ENGINE — Domain logic
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ChessEngine:
-    def __init__(self):
-        self.board = chess.Board(); self.game_over = False
-        self.result = ""; self.last_move = None
+    """Wraps python-chess Board with row/col coordinate helpers."""
 
-    def reset(self):
+    def __init__(self) -> None:
+        self.board = chess.Board()
+        self.game_over = False
+        self.result = ""
+        self.last_move: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+        self.initial_fen: Optional[str] = None
+
+    def reset(self) -> None:
         self.board.reset(); self.game_over = False
-        self.result = ""; self.last_move = None
+        self.result = ""; self.last_move = None; self.initial_fen = None
+
+    def reset_to_initial(self) -> None:
+        if self.initial_fen:
+            self.load_fen(self.initial_fen)
+        else:
+            self.reset()
 
     @staticmethod
-    def sq_to_rc(sq):
+    def sq_to_rc(sq: int) -> Tuple[int, int]:
         return 7 - chess.square_rank(sq), chess.square_file(sq)
 
     @staticmethod
-    def rc_to_sq(r, c):
+    def rc_to_sq(r: int, c: int) -> int:
         return chess.square(c, 7 - r)
 
     @property
-    def turn(self):
+    def turn(self) -> str:
         return 'w' if self.board.turn == chess.WHITE else 'b'
 
-    def color_of(self, piece):
-        return 'w' if piece.color == chess.WHITE else 'b'
-
-    def check_squares(self):
+    def check_squares(self) -> List[Tuple[int, int]]:
         if self.board.is_check():
             return [self.sq_to_rc(self.board.king(self.board.turn))]
         return []
 
-    def legal_moves(self, r, c):
+    def legal_targets(self, r: int, c: int) -> List[Tuple[int, int]]:
         sq = self.rc_to_sq(r, c)
         return [self.sq_to_rc(m.to_square) for m in self.board.legal_moves
                 if m.from_square == sq]
 
-    def make_move(self, fr, fc, tr, tc, promo=None):
-        from_sq = self.rc_to_sq(fr, fc); to_sq = self.rc_to_sq(tr, tc)
+    def is_promotion(self, fr: int, fc: int, tr: int, tc: int) -> bool:
+        from_sq = self.rc_to_sq(fr, fc)
+        piece = self.board.piece_at(from_sq)
+        if piece and piece.piece_type == chess.PAWN:
+            if (piece.color == chess.WHITE and tr == 0) or \
+               (piece.color == chess.BLACK and tr == 7):
+                return True
+        return False
+
+    def make_move(self, fr: int, fc: int, tr: int, tc: int,
+                  promo: Optional[int] = None) -> Optional[MoveInfo]:
+        from_sq = self.rc_to_sq(fr, fc)
+        to_sq = self.rc_to_sq(tr, tc)
         piece = self.board.piece_at(from_sq)
         if not piece:
             return None
+
         promotion = None
         if piece.piece_type == chess.PAWN:
             if (piece.color == chess.WHITE and tr == 0) or \
                (piece.color == chess.BLACK and tr == 7):
-                if promo:
-                    promotion = chess.PIECE_SYMBOLS.index(promo.lower()) + 1
-                else:
-                    promotion = chess.QUEEN
+                promotion = promo if promo else chess.QUEEN
+
         move = chess.Move(from_sq, to_sq, promotion=promotion)
         if move not in self.board.legal_moves:
             return None
+
         is_castle = self.board.is_castling(move)
         is_ep = self.board.is_en_passant(move)
         if is_ep:
-            ep_cap_sq = chess.square(chess.square_file(to_sq), chess.square_rank(from_sq))
-            cap = self.board.piece_at(ep_cap_sq)
+            ep_sq = chess.square(chess.square_file(to_sq),
+                                 chess.square_rank(from_sq))
+            cap = self.board.piece_at(ep_sq)
         else:
             cap = self.board.piece_at(to_sq)
         captured = cap.symbol() if cap else '.'
         notation = self.board.san(move)
         piece_obj = chess.Piece(piece.piece_type, piece.color)
+
         self.board.push(move)
         self.last_move = ((fr, fc), (tr, tc))
         self.game_over = self.board.is_game_over()
         self.result = self.board.result() if self.game_over else ""
-        return {
-            'from': (fr, fc), 'to': (tr, tc), 'piece': piece.symbol(),
-            'piece_obj': piece_obj, 'captured': captured,
-            'castle': is_castle, 'ep': is_ep, 'promo': promo,
-            'check': self.board.is_check(), 'mate': self.board.is_checkmate(),
-            'notation': notation,
-        }
 
-    def make_move_uci(self, uci_str):
+        return MoveInfo(
+            from_rc=(fr, fc), to_rc=(tr, tc), piece_symbol=piece.symbol(),
+            piece_obj=piece_obj, captured=captured, is_castle=is_castle,
+            is_ep=is_ep, promo=promo, is_check=self.board.is_check(),
+            is_mate=self.board.is_checkmate(), notation=notation,
+        )
+
+    def make_move_uci(self, uci_str: str) -> Optional[MoveInfo]:
         move = chess.Move.from_uci(uci_str)
         if move in self.board.legal_moves:
             fr, fc = self.sq_to_rc(move.from_square)
             tr, tc = self.sq_to_rc(move.to_square)
-            promo = chess.piece_symbol(move.promotion) if move.promotion else None
+            promo = move.promotion
             return self.make_move(fr, fc, tr, tc, promo)
         return None
 
-    def undo(self):
-        if len(self.board.move_stack) > 0:
+    def undo(self) -> bool:
+        if self.board.move_stack:
             self.board.pop()
             self.game_over = self.board.is_game_over()
             self.result = self.board.result() if self.game_over else ""
@@ -389,236 +890,181 @@ class ChessEngine:
             return True
         return False
 
-    def load_fen(self, fen):
-        self.board.set_fen(fen)
+    def load_fen(self, fen: str) -> bool:
+        try:
+            self.board.set_fen(fen)
+        except ValueError:
+            log(f"Invalid FEN: {fen}", "ERROR")
+            return False
         self.game_over = self.board.is_game_over()
         self.result = self.board.result() if self.game_over else ""
         self.last_move = None
+        self.initial_fen = fen
+        return True
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SOUND MANAGER
+#  SOUND MANAGER — Procedural audio
 # ═══════════════════════════════════════════════════════════════════════════════
-
-if HAS_NUMBA:
-    from numba import njit
-    @njit(cache=True, nogil=True)
-    def _nb_sin(freq, n_samples, volume, sr):
-        out = np.empty(n_samples, dtype=np.float64)
-        two_pi = 2.0 * math.pi
-        for i in range(n_samples):
-            out[i] = 32767.0 * volume * math.sin(two_pi * freq * i / sr)
-        return out
-    @njit(cache=True, nogil=True)
-    def _nb_sweep(start_freq, end_freq, n_samples, volume, sr):
-        out = np.empty(n_samples, dtype=np.float64)
-        two_pi = 2.0 * math.pi
-        for i in range(n_samples):
-            f = start_freq + (end_freq - start_freq) * float(i) / n_samples
-            out[i] = 32767.0 * volume * math.sin(two_pi * f * i / sr)
-        return out
-    @njit(cache=True, nogil=True)
-    def _nb_env(samples, attack_s, release_s, sr):
-        out = samples.copy(); n = len(out)
-        ai = min(int(sr * attack_s), n); ri = min(int(sr * release_s), n)
-        for i in range(ai): out[i] *= float(i) / float(ai)
-        for i in range(ri): out[-(i + 1)] *= float(i) / float(ri)
-        return out
-    @njit(cache=True, nogil=True)
-    def _nb_mix(a, b):
-        na, nb = len(a), len(b); n = max(na, nb)
-        out = np.zeros(n, dtype=np.float64)
-        for i in range(na): out[i] += a[i]
-        for i in range(nb): out[i] += b[i]
-        return out
-    @njit(cache=True, nogil=True)
-    def _nb_clip_i16(samples):
-        n = len(samples); out = np.empty(n, dtype=np.int16)
-        for i in range(n):
-            v = samples[i]
-            if v > 32767.0: v = 32767.0
-            elif v < -32768.0: v = -32768.0
-            out[i] = np.int16(v)
-        return out
-    log("Numba JIT audio primitives loaded", "SOUND")
-else:
-    def _nb_sin(freq, n_samples, volume, sr):
-        t = np.arange(n_samples, dtype=np.float64)
-        return 32767.0 * volume * np.sin(2.0 * np.pi * freq * t / sr)
-    def _nb_sweep(start_freq, end_freq, n_samples, volume, sr):
-        i = np.arange(n_samples, dtype=np.float64)
-        f = start_freq + (end_freq - start_freq) * i / n_samples
-        return 32767.0 * volume * np.sin(2.0 * np.pi * f * i / sr)
-    def _nb_env(samples, attack_s, release_s, sr):
-        out = samples.copy(); n = len(out)
-        ai = min(int(sr * attack_s), n); ri = min(int(sr * release_s), n)
-        if ai > 1: out[:ai] *= np.linspace(0, 1, ai)
-        if ri > 1: out[-ri:] *= np.linspace(0, 1, ri)[::-1]
-        return out
-    def _nb_mix(a, b):
-        na, nb = len(a), len(b); n = max(na, nb)
-        out = np.zeros(n, dtype=np.float64); out[:na] += a; out[:nb] += b
-        return out
-    def _nb_clip_i16(samples):
-        return np.clip(samples, -32768, 32767).astype(np.int16)
-
-def _sin(freq, duration, volume=0.5, sr=44100):
-    return _nb_sin(freq, int(sr * duration), volume, sr)
-def _sweep(start_freq, end_freq, duration, volume=0.5, sr=44100):
-    return _nb_sweep(start_freq, end_freq, int(sr * duration), volume, sr)
-def _env(samples, attack=0.01, release=0.02, sr=44100):
-    return _nb_env(samples, attack, release, sr)
-def _mix(a, b): return _nb_mix(a, b)
-def _to_i16(samples): return _nb_clip_i16(samples)
 
 class SoundManager:
-    def __init__(self):
-        self.tmpdir = tempfile.mkdtemp(prefix="chess_sfx_")
-        self.sounds = {}; self._enabled = True; self._volume = 0.7
-        self._gen_all(); self._load_all()
+    """Generates and plays procedural chess sound effects."""
+
+    def __init__(self) -> None:
+        self._tmpdir = tempfile.mkdtemp(prefix="chess_sfx_")
+        self._sounds: Dict[str, QSoundEffect] = {}
+        self._enabled = True
+        self._volume = 0.7
+        self._generate()
+        self._load()
 
     @staticmethod
-    def _wav(path, samples, sr=44100):
-        int_samples = _to_i16(samples)
+    def _to_wav(path: str, samples: np.ndarray, sr: int = 44100) -> None:
+        int_data = np.clip(samples, -32768, 32767).astype(np.int16)
         with wave.open(path, 'w') as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
-            w.writeframes(int_samples.tobytes())
-
-    def _gen_all(self):
-        sr = 44100; d = self.tmpdir
-        self._wav(os.path.join(d, "move.wav"), _env(_sin(800, 0.06, 0.4), 0.005, 0.03))
-        self._wav(os.path.join(d, "capture.wav"), _env(_mix(_sin(300, 0.10, 0.5), _sin(600, 0.08, 0.3)), 0.005, 0.04))
-        self._wav(os.path.join(d, "check.wav"), _env(_mix(_sin(1000, 0.12, 0.5), _sin(1250, 0.10, 0.3)), 0.005, 0.04))
-        cm = np.concatenate([_sin(800, 0.15, 0.5), _sin(600, 0.15, 0.5), _sin(400, 0.25, 0.5)])
-        self._wav(os.path.join(d, "checkmate.wav"), _env(cm, 0.01, 0.08))
-        self._wav(os.path.join(d, "castle.wav"), _env(_sweep(400, 800, 0.15, 0.4), 0.005, 0.03))
-        self._wav(os.path.join(d, "error.wav"), _env(_sin(200, 0.10, 0.4), 0.005, 0.03))
-        self._wav(os.path.join(d, "promote.wav"), _env(_sweep(400, 800, 0.2, 0.4), 0.01, 0.05))
-        start_tone = np.concatenate([_sin(523, 0.12, 0.4), np.zeros(int(sr * 0.03), dtype=np.float64), _sin(659, 0.18, 0.4)])
-        self._wav(os.path.join(d, "start.wav"), _env(start_tone, 0.005, 0.04))
-
-    def _load_all(self):
-        for n in ("move", "capture", "check", "checkmate", "castle", "error", "promote", "start"):
-            e = QSoundEffect()
-            e.setSource(QUrl.fromLocalFile(os.path.join(self.tmpdir, f"{n}.wav")))
-            e.setVolume(self._volume); self.sounds[n] = e
-
-    def set_volume(self, vol):
-        self._volume = max(0.0, min(1.0, vol))
-        for s in self.sounds.values(): s.setVolume(self._volume)
-
-    def set_enabled(self, enabled): self._enabled = enabled
-
-    def play(self, name):
-        if not self._enabled: return
-        s = self.sounds.get(name)
-        if s: s.stop(); s.play()
-
-    def cleanup(self):
-        try:
-            shutil.rmtree(self.tmpdir, ignore_errors=True)
-            log("Sound temp directory cleaned up", "SOUND")
-        except Exception as e:
-            log(f"Sound cleanup error: {e}", "SOUND")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BOARD WIDGET
-# ═══════════════════════════════════════════════════════════════════════════════
-
-if HAS_NUMBA:
-    from numba import njit as _njit2
-    @_njit2(cache=True, nogil=True)
-    def _fix_stride_nb(raw, w, h, bpl):
-        out = np.empty((h, w, 3), dtype=np.uint8); w3 = w * 3
-        for i in range(h):
-            src = i * bpl; dst = i * w3
-            for j in range(w3): out.flat[dst + j] = raw.flat[src + j]
-        return out
-    log("Numba JIT stride-fixer loaded", "BOARD")
-else:
-    def _fix_stride_nb(raw, w, h, bpl):
-        return raw[:, :w * 3].reshape(h, w, 3)
-
-def _ease_out_cubic(t):
-    return 1.0 - (1.0 - t) ** 3
-
-class ChessBoardWidget(QWidget):
-    move_made = Signal(str)
-
-    def __init__(self, engine, sound_mgr, parent=None):
-        super().__init__(parent)
-        self.engine = engine; self.snd = sound_mgr
-        self.selected = None; self.legal_targets = []
-        self.setFixedSize(SQ_SIZE * 8, SQ_SIZE * 8); self.setMouseTracking(True)
-        self.animating = False; self.anim_from = None; self.anim_to = None
-        self.anim_piece_obj = None; self.anim_captured = '.'
-        self.anim_progress = 0.0; self.anim_speed = ANIM_SPEED_DEFAULT
-        self.anim_start_time = 0.0; self.pending_notation = None
-        self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(1000 // ANIM_FPS)
-        self._anim_timer.timeout.connect(self._anim_tick)
-        self.current_theme = THEMES["Classic"]
-
-    def start_animation(self, fr, fc, tr, tc, piece_obj, captured='.', notation=''):
-        self.animating = True; self.anim_from = (fr, fc); self.anim_to = (tr, tc)
-        self.anim_piece_obj = piece_obj; self.anim_captured = captured
-        self.anim_progress = 0.0; self.anim_start_time = time.perf_counter()
-        self.pending_notation = notation; self._anim_timer.start()
-
-    def _anim_tick(self):
-        elapsed = time.perf_counter() - self.anim_start_time
-        duration = self.anim_speed / 1000.0
-        self.anim_progress = min(1.0, elapsed / duration) if duration > 0 else 1.0
-        self.update()
-        if self.anim_progress >= 1.0:
-            self._anim_timer.stop(); self.animating = False
-            self.anim_piece_obj = None; self.update()
-            if self.pending_notation:
-                self.move_made.emit(self.pending_notation)
-                self.pending_notation = None
-
-    def _get_anim_state(self):
-        if not self.animating: return None
-        t_eased = _ease_out_cubic(self.anim_progress)
-        return {'from': self.anim_from, 'to': self.anim_to,
-                'piece_obj': self.anim_piece_obj, 'progress': t_eased}
-
-    def paintEvent(self, e):
-        chk = self.engine.check_squares()
-        img = self.render_frame(self.engine.board, self.engine.last_move,
-                                self.selected, self.legal_targets,
-                                check_squares=chk, anim_state=self._get_anim_state(),
-                                theme=self.current_theme)
-        pix = QPixmap.fromImage(img)
-        painter = QPainter(self)
-        painter.drawPixmap(0, 0, pix)
-        painter.end()
+            w.writeframes(int_data.tobytes())
 
     @staticmethod
-    def render_frame(board, last_move=None, selected=None, legal_targets=None,
-                     text_overlay="", check_squares=None, anim_state=None,
-                     sq_size=SQ_SIZE, show_arrow=True, theme=None):
-        if theme is None: theme = THEMES["Classic"]
+    def _tone(freq: float, dur: float, vol: float = 0.4,
+              sr: int = 44100) -> np.ndarray:
+        t = np.arange(int(sr * dur), dtype=np.float64)
+        return 32767.0 * vol * np.sin(2.0 * np.pi * freq * t / sr)
+
+    @staticmethod
+    def _envelope(samples: np.ndarray, attack: float = 0.005,
+                  release: float = 0.03, sr: int = 44100) -> np.ndarray:
+        out = samples.copy(); n = len(out)
+        ai = min(int(sr * attack), n)
+        ri = min(int(sr * release), n)
+        if ai > 1: out[:ai] *= np.linspace(0, 1, ai)
+        if ri > 1: out[-ri:] *= np.linspace(1, 0, ri)
+        return out
+
+    def _generate(self) -> None:
+        sr = 44100; d = self._tmpdir
+        self._to_wav(os.path.join(d, "move.wav"),
+                     self._envelope(self._tone(800, 0.06)))
+        self._to_wav(os.path.join(d, "capture.wav"),
+                     self._envelope(self._tone(300, 0.10, 0.5) +
+                                    self._tone(600, 0.08, 0.3)))
+        self._to_wav(os.path.join(d, "check.wav"),
+                     self._envelope(self._tone(1000, 0.12, 0.5) +
+                                    self._tone(1250, 0.10, 0.3)))
+        self._to_wav(os.path.join(d, "checkmate.wav"),
+                     self._envelope(np.concatenate([
+                         self._tone(800, 0.15, 0.5),
+                         self._tone(600, 0.15, 0.5),
+                         self._tone(400, 0.25, 0.5)]), 0.01, 0.08))
+        self._to_wav(os.path.join(d, "castle.wav"),
+                     self._envelope(self._tone(400, 0.15) * 0.4 +
+                                    self._tone(800, 0.15, 0.3)))
+        self._to_wav(os.path.join(d, "error.wav"),
+                     self._envelope(self._tone(200, 0.10, 0.4)))
+        self._to_wav(os.path.join(d, "promote.wav"),
+                     self._envelope(np.concatenate([
+                         self._tone(400, 0.10, 0.4),
+                         self._tone(600, 0.10, 0.4),
+                         self._tone(800, 0.12, 0.4)]), 0.01, 0.05))
+        self._to_wav(os.path.join(d, "start.wav"),
+                     self._envelope(np.concatenate([
+                         self._tone(523, 0.12, 0.4),
+                         np.zeros(int(sr * 0.03)),
+                         self._tone(659, 0.18, 0.4)])))
+
+    def _load(self) -> None:
+        for name in ("move", "capture", "check", "checkmate",
+                     "castle", "error", "promote", "start"):
+            fx = QSoundEffect()
+            fx.setSource(QUrl.fromLocalFile(
+                os.path.join(self._tmpdir, f"{name}.wav")))
+            fx.setVolume(self._volume)
+            self._sounds[name] = fx
+
+    def set_volume(self, vol: float) -> None:
+        self._volume = max(0.0, min(1.0, vol))
+        for s in self._sounds.values():
+            s.setVolume(self._volume)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = enabled
+
+    def play(self, name: str) -> None:
+        if not self._enabled:
+            return
+        s = self._sounds.get(name)
+        if s:
+            s.stop(); s.play()
+
+    def cleanup(self) -> None:
+        for s in self._sounds.values():
+            s.stop()
+        self._sounds.clear()
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BOARD RENDERER — Pure rendering, no widget dependency
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BoardRenderer:
+    """Stateless board rendering — produces QImage frames."""
+
+    _thread_local = threading.local()
+
+    @staticmethod
+    def _assets(sz: int):
+        isz = int(sz * 100)
+        if getattr(BoardRenderer._thread_local, 'cache_sz', -1) == isz:
+            return BoardRenderer._thread_local.assets
+        font_piece = QFont("Segoe UI Emoji", sz * 0.9)
+        font_piece.setStyleStrategy(QFont.PreferAntialias)
+        font_coord = QFont("Sans", max(7, int(sz * 0.13)), QFont.Bold)
+        assets = (font_piece, font_coord)
+        BoardRenderer._thread_local.cache_sz = isz
+        BoardRenderer._thread_local.assets = assets
+        return assets
+
+    @staticmethod
+    def render(board: chess.Board,
+               last_move: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None,
+               selected: Optional[Tuple[int, int]] = None,
+               legal_targets: Optional[List[Tuple[int, int]]] = None,
+               check_squares: Optional[List[Tuple[int, int]]] = None,
+               anim_state: Optional[Dict] = None,
+               sq_size: int = SQ_SIZE,
+               theme: BoardTheme = THEMES["Minimal"],
+               flipped: bool = False,
+               text_overlay: str = "") -> QImage:
         sz = sq_size
         img = QImage(sz * 8, sz * 8, QImage.Format_ARGB32_Premultiplied)
         img.fill(Qt.transparent)
-        p = QPainter(img); p.setRenderHint(QPainter.Antialiasing)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        (font_piece, font_coord, font_badge_normal, font_badge_symbol,
-         pen_badge_outline) = get_render_assets(sz)
-        check_set = set(check_squares or []); skip_sq = set()
-        if anim_state:
-            skip_sq.add(anim_state['from']); skip_sq.add(anim_state['to'])
 
+        font_piece, font_coord = BoardRenderer._assets(sz)
+        check_set = set(check_squares or [])
+        skip_sq: Set[Tuple[int, int]] = set()
+        if anim_state:
+            skip_sq.add(anim_state['from'])
+            skip_sq.add(anim_state['to'])
+
+        def src(r: int, c: int) -> Tuple[int, int]:
+            return (7 - r, 7 - c) if flipped else (r, c)
+
+        # Squares
         for sq in chess.SQUARES:
             r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
-            x, y = c * sz, r * sz
+            sr, sc = src(r, c)
+            x, y = sc * sz, sr * sz
             is_light = (r + c) % 2 == 0
-            color = theme.light_sq if is_light else theme.dark_sq
-            p.fillRect(x, y, sz, sz, color)
+            p.fillRect(x, y, sz, sz,
+                       theme.qcolor('light_sq' if is_light else 'dark_sq'))
             if last_move and (r, c) in last_move:
-                p.fillRect(x, y, sz, sz, theme.last_move)
+                p.fillRect(x, y, sz, sz, theme.qcolor('last_move'))
             if selected and (r, c) == selected:
-                p.fillRect(x, y, sz, sz, theme.highlight)
+                p.fillRect(x, y, sz, sz, theme.qcolor('highlight'))
             if (r, c) in check_set:
                 grad = QRadialGradient(x + sz / 2, y + sz / 2, sz * 0.7)
                 grad.setColorAt(0, QColor(255, 30, 30, 180))
@@ -627,1950 +1073,2042 @@ class ChessBoardWidget(QWidget):
                 p.drawRect(x, y, sz, sz)
             if legal_targets and (r, c) in legal_targets:
                 cx, cy = x + sz // 2, y + sz // 2
-                if board.piece_at(sq) is not None:
-                    p.setPen(QPen(QColor(0, 0, 0, 90), max(3, sz // 14)))
+                if board.piece_at(sq):
+                    p.setPen(QPen(QColor(0, 0, 0, 50), max(3, sz // 14)))
                     p.setBrush(Qt.NoBrush)
                     p.drawEllipse(cx - sz * 5 // 12, cy - sz * 5 // 12,
                                   sz * 10 // 12, sz * 10 // 12)
                 else:
-                    p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 90))
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(QColor(0, 0, 0, 60))
                     p.drawEllipse(cx - sz // 6, cy - sz // 6, sz // 3, sz // 3)
 
-        if show_arrow and last_move:
+        # Arrow
+        if last_move:
             (fr, fc), (tr, tc) = last_move
-            ChessBoardWidget._draw_arrow(p, fc * sz + sz // 2, fr * sz + sz // 2,
-                                         tc * sz + sz // 2, tr * sz + sz // 2,
-                                         theme.arrow_clr, sz)
+            sfr, sfc = src(fr, fc); str_, stc = src(tr, tc)
+            BoardRenderer._draw_arrow(
+                p, sfc * sz + sz // 2, sfr * sz + sz // 2,
+                stc * sz + sz // 2, str_ * sz + sz // 2,
+                theme.qcolor('arrow'), sz)
 
+        # Pieces (skip animated squares)
         for sq in chess.SQUARES:
             r, c = 7 - chess.square_rank(sq), chess.square_file(sq)
-            if (r, c) in skip_sq: continue
+            if (r, c) in skip_sq:
+                continue
             piece = board.piece_at(sq)
-            if piece: ChessBoardWidget._draw_piece(p, piece, r, c, sz, font_piece)
+            if piece:
+                sr, sc = src(r, c)
+                BoardRenderer._draw_piece(p, piece, sr, sc, sz, font_piece)
 
+        # Captured piece fade
         if anim_state and anim_state.get('captured', '.') != '.':
-            fr, fc_ = anim_state['from']; tr, tc_ = anim_state['to']
-            cap_piece = board.piece_at(chess.square(tc_, 7 - tr))
-            if cap_piece is None:
-                sym = anim_state['captured']; is_w = sym.isupper()
-                pt_map = {'K': chess.KING, 'Q': chess.QUEEN, 'R': chess.ROOK,
-                          'B': chess.BISHOP, 'N': chess.KNIGHT, 'P': chess.PAWN}
-                pt = pt_map.get(sym.upper())
-                if pt:
-                    cap_piece = chess.Piece(pt, chess.WHITE if is_w else chess.BLACK)
-                    fade = max(0, int(200 * (1.0 - anim_state['progress'])))
-                    p.setOpacity(fade / 255.0)
-                    ChessBoardWidget._draw_piece(p, cap_piece, tr, tc_, sz, font_piece)
-                    p.setOpacity(1.0)
+            tr, tc_ = anim_state['to']
+            sr, sc = src(tr, tc_)
+            sym = anim_state['captured']; is_w = sym.isupper()
+            pt_map = {'K': chess.KING, 'Q': chess.QUEEN, 'R': chess.ROOK,
+                      'B': chess.BISHOP, 'N': chess.KNIGHT, 'P': chess.PAWN}
+            pt = pt_map.get(sym.upper())
+            if pt:
+                cap = chess.Piece(pt, chess.WHITE if is_w else chess.BLACK)
+                fade = max(0, int(200 * (1.0 - anim_state['progress'])))
+                p.setOpacity(fade / 255.0)
+                BoardRenderer._draw_piece(p, cap, sr, sc, sz, font_piece)
+                p.setOpacity(1.0)
 
-        if anim_state:
+        # Animated piece
+        if anim_state and anim_state.get('piece_obj'):
             fr, fc_ = anim_state['from']; tr, tc_ = anim_state['to']
             t = anim_state['progress']
-            anim_piece_obj = anim_state.get('piece_obj')
-            if anim_piece_obj:
-                lift = 4.0 * t * (1.0 - t) * 0.15
-                scale = 1.0 + 4.0 * t * (1.0 - t) * 0.08
-                ir = fr + (tr - fr) * t; ic = fc_ + (tc_ - fc_) * t
-                shadow_alpha = 30 + int(70 * (lift / 0.15))
-                p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, shadow_alpha))
-                sy = ir * sz + sz * 0.82
-                p.drawEllipse(QRectF(ic * sz + (sz * scale - sz * 0.65) / 2,
-                                     sy, sz * 0.65, sz * 0.12))
-                w, h = sz * scale, sz * scale
-                y_lift = ir * sz - (sz * lift)
-                ChessBoardWidget._draw_piece_at(p, anim_piece_obj, y_lift / sz, ic, sz, w, h, font_piece)
+            obj = anim_state['piece_obj']
+            ir = fr + (tr - fr) * t; ic = fc_ + (tc_ - fc_) * t
+            if flipped:
+                scr_ir_f = 7 - ir; scr_ic_f = 7 - ic
+            else:
+                scr_ir_f = ir; scr_ic_f = ic
+            lift = 4.0 * t * (1.0 - t) * 0.15
+            scale = 1.0 + 4.0 * t * (1.0 - t) * 0.08
+            shadow_alpha = 30 + int(70 * max(0, lift / 0.15))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, shadow_alpha))
+            sy = scr_ir_f * sz + sz * 0.82
+            p.drawEllipse(QRectF(scr_ic_f * sz + (sz * scale - sz * 0.65) / 2,
+                                 sy, sz * 0.65, sz * 0.12))
+            y_lift = scr_ir_f * sz - (sz * lift)
+            BoardRenderer._draw_piece_at(
+                p, obj, y_lift / sz, scr_ic_f, sz,
+                sz * scale, sz * scale, font_piece)
 
+        # Coordinates
         p.setFont(font_coord)
-        coord_margin = max(3, int(sz * 0.04)); coord_sz = max(12, sz // 5)
-        for c in range(8):
-            is_light = (7 + c) % 2 == 0
-            col = theme.dark_sq if is_light else theme.light_sq
-            p.setPen(col)
-            p.drawText(QRect(c * sz + sz - coord_sz - coord_margin,
-                             7 * sz + coord_margin, coord_sz, coord_sz),
-                       Qt.AlignCenter, FILES_STR[c])
-        for r in range(8):
-            is_light = r % 2 == 0
-            col = theme.dark_sq if is_light else theme.light_sq
-            p.setPen(col)
-            p.drawText(QRect(coord_margin, r * sz + coord_margin,
-                             coord_sz, coord_sz), Qt.AlignCenter, RANKS_STR[r])
+        cm = max(3, int(sz * 0.04)); csz = max(12, sz // 5)
+        for ci in range(8):
+            fc = FILES_STR[7 - ci] if flipped else FILES_STR[ci]
+            is_light = (7 + ci) % 2 == 0
+            p.setPen(theme.qcolor('dark_sq' if is_light else 'light_sq'))
+            p.drawText(QRect(ci * sz + sz - csz - cm, 7 * sz + cm, csz, csz),
+                       Qt.AlignCenter, fc)
+        for ri in range(8):
+            rc = RANKS_STR[7 - ri] if flipped else RANKS_STR[ri]
+            is_light = ri % 2 == 0
+            p.setPen(theme.qcolor('dark_sq' if is_light else 'light_sq'))
+            p.drawText(QRect(cm, ri * sz + cm, csz, csz), Qt.AlignCenter, rc)
 
+        # Text overlay
         if text_overlay:
-            p.fillRect(0, sz * 4 - 28, sz * 8, 56, QColor(0, 0, 0, 200))
-            p.setPen(Qt.white); p.setFont(QFont("Sans", max(12, sz // 4), QFont.Bold))
-            p.drawText(QRect(0, sz * 4 - 28, sz * 8, 56), Qt.AlignCenter, text_overlay)
-        p.end(); return img
+            p.fillRect(0, sz * 4 - 28, sz * 8, 56, QColor(0, 0, 0, 160))
+            p.setPen(Qt.white)
+            p.setFont(QFont("Sans", max(12, sz // 4), QFont.Bold))
+            p.drawText(QRect(0, sz * 4 - 28, sz * 8, 56),
+                       Qt.AlignCenter, text_overlay)
+
+        p.end()
+        return img
 
     @staticmethod
-    def render_card(text, bg="#1a1a2e", fg="#e0e0e0", w=544, h=544,
-                    width=None, height=None, font_size=36, sub_text="",
-                    bg_color=None, fg_color=None):
-        bg_val = bg if bg != "#1a1a2e" else (bg_color or bg)
-        fg_val = fg if fg != "#e0e0e0" else (fg_color or fg)
-        w_val = width if width is not None else w
-        h_val = height if height is not None else h
-        img = QImage(w_val, h_val, QImage.Format_ARGB32_Premultiplied)
-        img.fill(QColor(bg_val))
+    def render_card(text: str, w: int = 544, h: int = 544,
+                    font_size: int = 36, sub: str = "",
+                    bg: str = "#FAFAFA", fg: str = "#1A1A1A") -> QImage:
+        img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        img.fill(QColor(bg))
         p = QPainter(img); p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(QColor(fg_val)); p.setFont(QFont("Sans", font_size, QFont.Bold))
-        p.drawText(QRect(0, 0, w_val, h_val), Qt.AlignCenter, text)
-        if sub_text:
+        p.setPen(QColor(fg)); p.setFont(QFont("Sans", font_size, QFont.Bold))
+        p.drawText(QRect(0, 0, w, h), Qt.AlignCenter, text)
+        if sub:
             p.setFont(QFont("Sans", max(10, font_size // 2)))
-            p.setPen(QColor(fg_val).lighter(140))
-            p.drawText(QRect(0, h_val * 3 // 5, w_val, h_val // 4),
-                       Qt.AlignCenter, sub_text)
+            p.setPen(QColor(fg).lighter(140))
+            p.drawText(QRect(0, h * 3 // 5, w, h // 4),
+                       Qt.AlignCenter, sub)
         p.end(); return img
 
-    @staticmethod
-    def _draw_piece(p, piece_obj, row, col, sz, font):
-        ChessBoardWidget._draw_piece_at(p, piece_obj, float(row), float(col), sz, sz, sz, font)
+    # ── Private helpers ──
 
     @staticmethod
-    def _draw_piece_at(p, piece_obj, row_f, col_f, sz, w, h, font):
-        FIT_FRAC = 0.85
-        is_w = piece_obj.color == chess.WHITE
-        glyph = PIECE_SYM[(piece_obj.piece_type, piece_obj.color)]
+    def _draw_piece(p: QPainter, piece: chess.Piece,
+                    row: int, col: int, sz: int, font: QFont) -> None:
+        BoardRenderer._draw_piece_at(
+            p, piece, float(row), float(col), sz, sz, sz, font)
+
+    @staticmethod
+    def _draw_piece_at(p: QPainter, piece: chess.Piece,
+                       row_f: float, col_f: float,
+                       sz: int, w: float, h: float,
+                       font: QFont) -> None:
+        glyph = PIECE_SYM[(piece.piece_type, piece.color)]
+        is_w = piece.color == chess.WHITE
         px = col_f * sz; py = row_f * sz
         rect = QRectF(px + (sz - w) / 2, py + (sz - h) / 2, w, h)
         center = rect.center(); p.setFont(font)
         path = QPainterPath(); path.addText(QPointF(0, 0), font, glyph)
-        br = path.boundingRect(); path.translate(-br.center().x(), -br.center().y())
+        br = path.boundingRect()
+        path.translate(-br.center().x(), -br.center().y())
         if br.width() > 0 and br.height() > 0:
-            sx = (w * FIT_FRAC) / br.width(); sy = (h * FIT_FRAC) / br.height()
-            s = min(sx, sy); path = QTransform.fromScale(s, s).map(path)
+            s = min((w * 0.85) / br.width(), (h * 0.85) / br.height())
+            path = QTransform.fromScale(s, s).map(path)
         path.translate(center.x(), center.y())
-        if is_w:
-            shadow = QPainterPath(path); shadow.translate(1.5, 2.0)
-            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 50)); p.drawPath(shadow)
-            olw = max(1.2, sz * 0.028)
-            p.setPen(QPen(QColor(30, 30, 30), olw, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            p.setBrush(QColor(255, 255, 255)); p.drawPath(path)
-        else:
-            shadow = QPainterPath(path); shadow.translate(1.5, 2.0)
-            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 60)); p.drawPath(shadow)
-            olw = max(0.8, sz * 0.018)
-            p.setPen(QPen(QColor(10, 10, 10), olw, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            p.setBrush(QColor(40, 40, 40)); p.drawPath(path)
+        shadow = QPainterPath(path); shadow.translate(1.5, 2.0)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 40 if is_w else 50))
+        p.drawPath(shadow)
+        olw = max(1.0, sz * (0.022 if is_w else 0.014))
+        p.setPen(QPen(QColor(60 if is_w else 20, 60 if is_w else 20,
+                             60 if is_w else 20), olw,
+                      Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(QColor(255, 255, 255) if is_w else QColor(50, 50, 50))
+        p.drawPath(path)
 
     @staticmethod
-    def _draw_arrow(painter, fx, fy, tx, ty, color, sz):
+    def _draw_arrow(p: QPainter, fx: float, fy: float,
+                    tx: float, ty: float, color: QColor, sz: int) -> None:
         dx = tx - fx; dy = ty - fy; dist = max(1, math.hypot(dx, dy))
-        margin = sz * 0.22
-        fx2 = fx + dx * margin / dist; fy2 = fy + dy * margin / dist
-        tx2 = tx - dx * margin / dist; ty2 = ty - dy * margin / dist
-        painter.setPen(QPen(color, max(2, sz // 20), Qt.SolidLine, Qt.RoundCap))
-        painter.drawLine(int(fx2), int(fy2), int(tx2), int(ty2))
-        angle = math.atan2(dy, dx); a_sz = sz * 0.22
-        p1x = tx2 - a_sz * math.cos(angle - 0.45)
-        p1y = ty2 - a_sz * math.sin(angle - 0.45)
-        p2x = tx2 - a_sz * math.cos(angle + 0.45)
-        p2y = ty2 - a_sz * math.sin(angle + 0.45)
-        tri = QPolygonF([QPointF(tx2, ty2), QPointF(p1x, p1y), QPointF(p2x, p2y)])
-        painter.setBrush(color); painter.setPen(Qt.NoPen); painter.drawPolygon(tri)
+        m = sz * 0.22
+        fx2 = fx + dx * m / dist; fy2 = fy + dy * m / dist
+        tx2 = tx - dx * m / dist; ty2 = ty - dy * m / dist
+        p.setPen(QPen(color, max(2, sz // 20), Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(int(fx2), int(fy2), int(tx2), int(ty2))
+        angle = math.atan2(dy, dx); a = sz * 0.22
+        tri = QPolygonF([
+            QPointF(tx2, ty2),
+            QPointF(tx2 - a * math.cos(angle - 0.45),
+                    ty2 - a * math.sin(angle - 0.45)),
+            QPointF(tx2 - a * math.cos(angle + 0.45),
+                    ty2 - a * math.sin(angle + 0.45))])
+        p.setBrush(color); p.setPen(Qt.NoPen); p.drawPolygon(tri)
 
     @staticmethod
-    def qimage_to_np(img):
+    def to_numpy(img: QImage) -> np.ndarray:
+        if img.isNull():
+            return np.zeros((1, 1, 3), dtype=np.uint8)
         img2 = img.convertToFormat(QImage.Format_RGB888)
         ptr = img2.constBits()
-        if hasattr(ptr, 'setsize'): ptr.setsize(img2.sizeInBytes())
-        w = img2.width(); h = img2.height(); bpl = img2.bytesPerLine()
+        if hasattr(ptr, 'setsize'):
+            ptr.setsize(img2.sizeInBytes())
+        w, h, bpl = img2.width(), img2.height(), img2.bytesPerLine()
         raw = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bpl)).copy()
-        if bpl == w * 3: return raw.reshape((h, w, 3))
-        return _fix_stride_nb(raw, w, h, bpl)
+        needed = w * 3
+        if bpl == needed:
+            return raw.reshape((h, w, 3))
+        if bpl > needed:
+            return raw[:, :needed].reshape((h, w, 3))
+        out = np.zeros((h, needed), dtype=np.uint8)
+        for i in range(h):
+            out[i, :min(bpl, needed)] = raw[i, :min(bpl, needed)]
+        return out.reshape((h, w, 3))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PUZZLE LOADER — Strategy pattern per format
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BaseLoader(ABC):
+    """Abstract puzzle file loader."""
+
+    @abstractmethod
+    def can_load(self, path: str) -> bool: ...
+
+    @abstractmethod
+    def load(self, path: str) -> List[Dict[str, Any]]: ...
+
+
+class CsvLoader(BaseLoader):
+    def can_load(self, path: str) -> bool:
+        return path.lower().endswith('.csv')
+
+    def load(self, path: str) -> List[Dict[str, Any]]:
+        rows = []
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                for row in csv.DictReader(f):
+                    rows.append(row)
+        except Exception as e:
+            log(f"CSV error: {e}", "ERROR")
+        return rows
+
+
+class ParquetLoader(BaseLoader):
+    def can_load(self, path: str) -> bool:
+        return path.lower().endswith(('.parquet', '.pq'))
+
+    def load(self, path: str) -> List[Dict[str, Any]]:
+        if HAS_PANDAS:
+            return pd.read_parquet(path).to_dict('records')
+        if HAS_PYARROW:
+            return pq.read_table(path).to_pandas().to_dict('records')
+        if HAS_DUCKDB:
+            r = duckdb.query(f"SELECT * FROM '{path}'")
+            cols = [c[0] for c in r.description]
+            return [dict(zip(cols, row)) for row in r.fetchall()]
+        log("No Parquet reader available", "ERROR")
+        return []
+
+
+class JsonLoader(BaseLoader):
+    def can_load(self, path: str) -> bool:
+        return path.lower().endswith(('.json', '.jsonl'))
+
+    def load(self, path: str) -> List[Dict[str, Any]]:
+        if path.lower().endswith('.jsonl'):
+            rows = []
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            rows.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+            return rows
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                if 'puzzles' in data:
+                    return data['puzzles']
+                return [data]
+        except Exception as e:
+            log(f"JSON error: {e}", "ERROR")
+        return []
+
+
+class PgnLoader(BaseLoader):
+    """Load puzzles from PGN files (one game per puzzle)."""
+
+    def can_load(self, path: str) -> bool:
+        return path.lower().endswith('.pgn')
+
+    def load(self, path: str) -> List[Dict[str, Any]]:
+        rows = []
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                while True:
+                    game = chess.pgn.read_game(f)
+                    if game is None:
+                        break
+                    headers = dict(game.headers)
+                    board = game.board()
+                    moves_uci = []
+                    for move in game.mainline_moves():
+                        moves_uci.append(move.uci())
+                    fen = board.fen()
+                    rows.append({
+                        'FEN': fen,
+                        'Moves': ' '.join(moves_uci),
+                        'Name': headers.get('Event', headers.get('White', 'PGN Game')),
+                        'Themes': headers.get('Opening', ''),
+                        'Rating': headers.get('WhiteElo', ''),
+                    })
+        except Exception as e:
+            log(f"PGN error: {e}", "ERROR")
+        return rows
+
+
+class PuzzleLoader:
+    """
+    Factory / dispatcher: picks the right loader and normalizes rows
+    into Puzzle objects. Handles various CSV schemas (Lichess, custom, etc.).
+    """
+
+    LOADERS: List[BaseLoader] = [CsvLoader(), ParquetLoader(),
+                                  JsonLoader(), PgnLoader()]
+
+    # Known column-name mappings for common schemas
+    _COL_MAPS: List[Dict[str, str]] = [
+        # Lichess puzzle CSV
+        {'PuzzleId': 'id', 'FEN': 'fen', 'Moves': 'moves',
+         'Rating': 'rating', 'Themes': 'themes', 'Opening': 'opening',
+         'GameUrl': 'url', 'Popularity': 'popularity', 'NbPlays': 'nbplays'},
+        # Generic
+        {'puzzle_id': 'id', 'fen': 'fen', 'moves': 'moves',
+         'rating': 'rating', 'themes': 'themes', 'opening': 'opening',
+         'name': 'name', 'description': 'desc', 'difficulty': 'difficulty',
+         'eco': 'eco'},
+    ]
+
+    @classmethod
+    def load_file(cls, path: str) -> List[Puzzle]:
+        """Load a puzzle file, auto-detect format, return Puzzle list."""
+        for loader in cls.LOADERS:
+            if loader.can_load(path):
+                rows = loader.load(path)
+                return cls._normalize(rows, path)
+        log(f"No loader for: {path}", "WARN")
+        return []
+
+    @classmethod
+    def _normalize(cls, rows: List[Dict[str, Any]],
+                   source: str = "") -> List[Puzzle]:
+        """Convert raw dicts to Puzzle objects, handling varied schemas."""
+        puzzles: List[Puzzle] = []
+        for i, row in enumerate(rows):
+            try:
+                puzzle = cls._row_to_puzzle(row, i, source)
+                if puzzle:
+                    puzzles.append(puzzle)
+            except Exception as e:
+                if i < 5:
+                    log(f"Row {i} parse error: {e}", "WARN")
+        log(f"Loaded {len(puzzles)} puzzles from {source}", "LOAD")
+        return puzzles
+
+    @classmethod
+    def _row_to_puzzle(cls, row: Dict[str, Any], idx: int,
+                       source: str) -> Optional[Puzzle]:
+        # Try to extract fields with flexible key matching
+        def get(keys: List[str], default: Any = "") -> Any:
+            for k in keys:
+                if k in row:
+                    return row[k]
+                kl = k.lower()
+                for rk, rv in row.items():
+                    if rk.lower() == kl:
+                        return rv
+            return default
+
+        # ID
+        pid = get(['PuzzleId', 'puzzle_id', 'id', 'ID'])
+        if pid == "":
+            pid = idx
+        try:
+            pid = int(pid)
+        except (ValueError, TypeError):
+            pid = idx
+
+        # FEN
+        fen = str(get(['FEN', 'fen', 'position', 'start_fen'], ""))
+        if not fen:
+            fen = chess.STARTING_FEN
+
+        # Moves
+        moves_raw = str(get(['Moves', 'moves', 'move_list', 'uci'], ""))
+        moves = cls._parse_moves(moves_raw)
+        if not moves:
+            return None
+
+        # Name
+        name = str(get(['Name', 'name', 'Title', 'title', 'Event',
+                        'puzzle_name'], ""))
+        if not name:
+            name = f"Puzzle #{pid}"
+
+        # Description
+        desc = str(get(['Description', 'desc', 'description',
+                        'comment', 'text'], ""))
+
+        # Rating
+        rating_raw = get(['Rating', 'rating', 'RatingDeviation',
+                          'elo', 'puzzle_rating'], None)
+        rating = None
+        if rating_raw is not None:
+            try:
+                rating = int(float(str(rating_raw)))
+            except (ValueError, TypeError):
+                pass
+
+        # Themes
+        themes_raw = str(get(['Themes', 'themes', 'tags', 'tags_list'], ""))
+        if themes_raw:
+            themes = frozenset(t.strip() for t in re.split(r'[\s,;]+', themes_raw)
+                               if t.strip())
+        else:
+            themes = frozenset()
+
+        # Opening
+        opening = str(get(['Opening', 'opening', 'OpeningTags',
+                           'opening_name'], ""))
+
+        # ECO
+        eco = str(get(['ECO', 'eco'], ""))
+
+        # Difficulty: derive from rating if not explicit
+        diff_raw = get(['difficulty', 'Difficulty', 'difficulty_score'], None)
+        if diff_raw is not None:
+            try:
+                difficulty = float(diff_raw)
+                difficulty = max(0.0, min(1.0, difficulty))
+            except (ValueError, TypeError):
+                difficulty = cls._rating_to_difficulty(rating)
+        else:
+            difficulty = cls._rating_to_difficulty(rating)
+
+        move_count = len(moves)
+
+        return Puzzle(
+            id=pid, name=name, fen=fen, moves=tuple(moves),
+            desc=desc, difficulty=difficulty, themes=themes,
+            rating=rating, move_count=move_count,
+            opening=opening, eco=eco, raw_row=row,
+        )
 
     @staticmethod
-    def qimage_to_np_batch(images, use_gpu=False):
-        if not images: return np.empty((0, 0, 0, 3), dtype=np.uint8)
-        arrays = [ChessBoardWidget.qimage_to_np(im) for im in images]
-        stack = np.stack(arrays)
-        if use_gpu and HAS_CUPY:
-            import cupy as _cp; return _cp.asarray(stack)
-        return stack
+    def _parse_moves(raw: str) -> List[str]:
+        """Parse a UCI move string, handling various formats."""
+        if not raw:
+            return []
+        tokens = raw.strip().split()
+        moves = []
+        for t in tokens:
+            # Skip move numbers like "1." or "1..."
+            if MVNUM_RE.match(t):
+                continue
+            # Skip results
+            if t in RESULT_RE:
+                continue
+            # Validate UCI format
+            if UCI_RE.match(t):
+                moves.append(t)
+            else:
+                # Try to parse as SAN — skip for now
+                pass
+        return moves
 
-    def mousePressEvent(self, e):
-        if self.animating or self.engine.game_over: return
-        c = int(e.position().x()) // SQ_SIZE
-        r = int(e.position().y()) // SQ_SIZE
-        if not (0 <= r < 8 and 0 <= c < 8): return
-        sq = self.engine.rc_to_sq(r, c)
-        piece = self.engine.board.piece_at(sq)
-        if self.selected:
-            sr, sc = self.selected
-            if (r, c) in self.legal_targets:
-                info = self.engine.make_move(sr, sc, r, c)
-                if info:
-                    is_capture = info['captured'] != '.'
-                    sfx = ("capture" if is_capture
-                           else "castle" if info['castle'] else "move")
-                    if info['mate']: sfx = "checkmate"
-                    elif info['check']: sfx = "check"
-                    self.snd.play(sfx)
-                    if self.anim_speed > 0:
-                        self.start_animation(sr, sc, r, c, info['piece_obj'],
-                                             info['captured'], info['notation'])
-                    else:
-                        self.move_made.emit(info['notation'])
-            self.selected = None; self.legal_targets = []
-        else:
-            if piece and piece.color == self.engine.board.turn:
-                self.selected = (r, c)
-                self.legal_targets = self.engine.legal_moves(r, c)
-                if not self.legal_targets:
-                    self.snd.play("error"); self.selected = None
+    @staticmethod
+    def _rating_to_difficulty(rating: Optional[int]) -> float:
+        """Map rating to 0.0–1.0 difficulty score."""
+        if rating is None:
+            return 0.5
+        return max(0.0, min(1.0, (rating - 400) / 2800))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETTINGS MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Settings:
+    """Persistent application settings via JSON."""
+
+    _DEFAULTS: Dict[str, Any] = {
+        'theme': 'Minimal',
+        'flipped': False,
+        'sound_enabled': True,
+        'sound_volume': 0.7,
+        'anim_speed': ANIM_SPEED_DEFAULT,
+        'last_file': '',
+        'window_geometry': '',
+        'export_preset': 'Board Only (544×544)',
+    }
+
+    def __init__(self) -> None:
+        self._data: Dict[str, Any] = dict(self._DEFAULTS)
+        self.load()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._data.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        self._data[key] = value
+
+    def load(self) -> None:
+        try:
+            if os.path.exists(SETTINGS_PATH):
+                with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                self._data.update(saved)
+        except Exception as e:
+            log(f"Settings load error: {e}", "WARN")
+
+    def save(self) -> None:
+        try:
+            with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
+                json.dump(self._data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            log(f"Settings save error: {e}", "WARN")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EXPORTER — GIF / Video export
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PuzzleExporter:
+    """Exports a puzzle as an animated GIF or MP4."""
+
+    @staticmethod
+    def render_frames(puzzle: Puzzle,
+                      sq_size: int = SQ_SIZE,
+                      theme: BoardTheme = THEMES["Minimal"],
+                      flipped: bool = False,
+                      anim_speed: int = ANIM_SPEED_DEFAULT,
+                      pause_start: float = 1.0,
+                      pause_end: float = 2.0,
+                      fps: int = 30,
+                      progress_cb: Optional[Callable[[float], None]] = None,
+                      ) -> List[np.ndarray]:
+        """Render all frames for a puzzle animation."""
+        engine = ChessEngine()
+        engine.load_fen(puzzle.fen)
+        frames: List[np.ndarray] = []
+
+        # Start pause
+        start_img = BoardRenderer.render(
+            engine.board, theme=theme, sq_size=sq_size, flipped=flipped,
+            text_overlay=f"{puzzle.name}")
+        for _ in range(int(pause_start * fps)):
+            frames.append(BoardRenderer.to_numpy(start_img))
+
+        total_moves = len(puzzle.moves)
+        for mi, uci in enumerate(puzzle.moves):
+            info = engine.make_move_uci(uci)
+            if info is None:
+                log(f"Bad move {uci} in puzzle {puzzle.id}", "WARN")
+                continue
+
+            # Animation frames
+            n_anim = max(1, int((anim_speed / 1000.0) * fps))
+            for fi in range(n_anim):
+                t = (fi + 1) / n_anim
+                anim = {
+                    'from': info.from_rc, 'to': info.to_rc,
+                    'piece_obj': info.piece_obj,
+                    'captured': info.captured,
+                    'progress': t,
+                }
+                # Render with anim: show board BEFORE this move
+                tmp_engine = ChessEngine()
+                tmp_engine.load_fen(puzzle.fen)
+                for prev_uci in puzzle.moves[:mi]:
+                    tmp_engine.make_move_uci(prev_uci)
+
+                img = BoardRenderer.render(
+                    tmp_engine.board,
+                    last_move=tmp_engine.last_move,
+                    check_squares=tmp_engine.check_squares(),
+                    anim_state=anim,
+                    sq_size=sq_size, theme=theme, flipped=flipped,
+                )
+                frames.append(BoardRenderer.to_numpy(img))
+
+            # Still frame after move
+            overlay = ""
+            if info.is_mate:
+                overlay = "CHECKMATE"
+            elif info.is_check:
+                overlay = "CHECK"
+
+            still_img = BoardRenderer.render(
+                engine.board,
+                last_move=engine.last_move,
+                check_squares=engine.check_squares(),
+                sq_size=sq_size, theme=theme, flipped=flipped,
+                text_overlay=overlay,
+            )
+            frames.append(BoardRenderer.to_numpy(still_img))
+
+            # Brief pause between moves
+            if mi < total_moves - 1:
+                for _ in range(max(1, int(0.3 * fps))):
+                    frames.append(BoardRenderer.to_numpy(still_img))
+
+            if progress_cb:
+                progress_cb((mi + 1) / total_moves)
+
+        # End pause
+        end_img = BoardRenderer.render(
+            engine.board,
+            last_move=engine.last_move,
+            sq_size=sq_size, theme=theme, flipped=flipped,
+            text_overlay=puzzle.tier_label if engine.game_over else "")
+        for _ in range(int(pause_end * fps)):
+            frames.append(BoardRenderer.to_numpy(end_img))
+
+        return frames
+
+    @staticmethod
+    def export_gif(puzzle: Puzzle, path: str,
+                   sq_size: int = SQ_SIZE,
+                   theme: BoardTheme = THEMES["Minimal"],
+                   flipped: bool = False,
+                   fps: int = 15,
+                   progress_cb: Optional[Callable[[float], None]] = None,
+                   ) -> bool:
+        if not HAS_IMAGEIO:
+            log("imageio not available for GIF export", "ERROR")
+            return False
+        try:
+            frames = PuzzleExporter.render_frames(
+                puzzle, sq_size=sq_size, theme=theme, flipped=flipped,
+                fps=fps, progress_cb=progress_cb)
+            # Downsample for GIF (lower fps)
+            step = max(1, len(frames) // (len(frames) * fps // 30))
+            sampled = frames[::step]
+            iio.imwrite(path, sampled, duration=int(1000 / fps),
+                        loop=0)
+            log(f"GIF saved: {path} ({len(sampled)} frames)", "EXPORT")
+            return True
+        except Exception as e:
+            log(f"GIF export error: {e}", "ERROR")
+            return False
+
+    @staticmethod
+    def export_video(puzzle: Puzzle, path: str,
+                     preset: ExportPreset = EXPORT_PRESETS["Board Only (544×544)"],
+                     theme: BoardTheme = THEMES["Minimal"],
+                     flipped: bool = False,
+                     anim_speed: int = ANIM_SPEED_DEFAULT,
+                     progress_cb: Optional[Callable[[float], None]] = None,
+                     ) -> bool:
+        sq_size = preset.calc_sq_size()
+        try:
+            frames = PuzzleExporter.render_frames(
+                puzzle, sq_size=sq_size, theme=theme, flipped=flipped,
+                anim_speed=anim_speed, fps=preset.fps,
+                progress_cb=progress_cb)
+
+            if not frames:
+                return False
+
+            # Compose frames into preset canvas size
+            bx, by, bw, bh = preset.calc_board_rect()
+            composed: List[np.ndarray] = []
+            bg = np.array(preset.bg, dtype=np.uint8)
+            for f in frames:
+                canvas = np.full((preset.height, preset.width, 3),
+                                 bg, dtype=np.uint8)
+                # Resize frame to board rect
+                h_src, w_src = f.shape[:2]
+                if w_src != bw or h_src != bh:
+                    # Simple nearest-neighbor resize
+                    row_idx = np.linspace(0, h_src - 1, bh).astype(int)
+                    col_idx = np.linspace(0, w_src - 1, bw).astype(int)
+                    f_resized = f[np.ix_(row_idx, col_idx)]
+                else:
+                    f_resized = f
+                canvas[by:by + bh, bx:bx + bw] = f_resized
+                composed.append(canvas)
+
+            if path.lower().endswith('.gif'):
+                if HAS_IMAGEIO:
+                    iio.imwrite(path, composed,
+                                duration=int(1000 / preset.fps), loop=0)
+                    log(f"GIF saved: {path}", "EXPORT")
+                    return True
+                return False
+
+            if HAS_IMAGEIO and HAS_FFMPEG:
+                iio.imwrite(path, composed, fps=preset.fps)
+                log(f"Video saved: {path}", "EXPORT")
+                return True
+
+            # Fallback: write raw frames, try ffmpeg
+            if HAS_FFMPEG:
+                tmpdir = tempfile.mkdtemp(prefix="chess_export_")
+                for i, frame in enumerate(composed):
+                    fpath = os.path.join(tmpdir, f"frame_{i:06d}.png")
+                    if HAS_IMAGEIO:
+                        iio.imwrite(fpath, frame)
+                cmd = [
+                    'ffmpeg', '-y', '-framerate', str(preset.fps),
+                    '-i', os.path.join(tmpdir, 'frame_%06d.png'),
+                    '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                    '-preset', 'medium', '-crf', '23', path,
+                ]
+                subprocess.run(cmd, capture_output=True, check=True)
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                log(f"Video saved via ffmpeg: {path}", "EXPORT")
+                return True
+
+            log("No video export method available (need imageio[ffmpeg] or ffmpeg)",
+                "ERROR")
+            return False
+        except Exception as e:
+            log(f"Video export error: {e}", "ERROR")
+            return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CHESS BOARD WIDGET — Interactive board with animation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ChessBoardWidget(QWidget):
+    """Interactive chess board widget with move animation."""
+
+    move_made = Signal(str)        # UCI string
+    move_info = Signal(object)     # MoveInfo
+    board_changed = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.engine = ChessEngine()
+        self.sound = SoundManager()
+        self.theme = THEMES["Minimal"]
+        self.flipped = False
+        self.sq_size = SQ_SIZE
+
+        # Selection state
+        self._selected: Optional[Tuple[int, int]] = None
+        self._legal_targets: List[Tuple[int, int]] = []
+
+        # Animation state
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(1000 // ANIM_FPS)
+        self._anim_timer.timeout.connect(self._anim_tick)
+        self._anim_state: Optional[Dict] = None
+        self._anim_speed = ANIM_SPEED_DEFAULT
+        self._anim_start_time: float = 0.0
+        self._pending_info: Optional[MoveInfo] = None
+
+        # Puzzle playback state
+        self._puzzle_mode = False
+        self._puzzle_moves: List[str] = []
+        self._puzzle_idx = 0
+        self._auto_play = False
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(800)
+        self._auto_timer.timeout.connect(self._auto_step)
+
+        # Text overlay
+        self._overlay = ""
+
+        self.setFixedSize(self.sq_size * 8, self.sq_size * 8)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    # ── Public API ──
+
+    def set_theme(self, name: str) -> None:
+        self.theme = THEMES.get(name, THEMES["Minimal"])
         self.update()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PUZZLE LOADER
-# ═══════════════════════════════════════════════════════════════════════════════
+    def set_flipped(self, flipped: bool) -> None:
+        self.flipped = flipped
+        self.update()
 
-_CHUNK = 4096
-_CSV_PROCESS_CHUNK = 50_000
-_PARQUET_BATCH = 50_000
+    def set_anim_speed(self, ms: int) -> None:
+        self._anim_speed = max(50, ms)
 
-_UCI_RE = re.compile(r'^[a-h][1-8][a-h][1-8][qrbn]?$')
-_MVNUM_RE = re.compile(r'^\d+\.+$')
-_RESULT_RE = frozenset({'1-0', '0-1', '1/2-1/2', '*'})
+    def set_sound_enabled(self, enabled: bool) -> None:
+        self.sound.set_enabled(enabled)
 
-def _clean_move_tokens(tokens):
-    out = []
-    for t in tokens:
-        t = t.strip()
-        if not t or _MVNUM_RE.match(t) or t in _RESULT_RE: continue
-        t = t.rstrip('.')
-        if not t: continue
-        out.append(t)
-    return out
+    def set_sound_volume(self, vol: float) -> None:
+        self.sound.set_volume(vol)
 
-def _detect_move_format(tokens):
-    for t in tokens:
-        if _UCI_RE.match(t): return 'uci'
-        return 'san'
-    return 'uci'
+    def load_fen(self, fen: str) -> None:
+        self._clear_state()
+        self.engine.load_fen(fen)
+        self.update()
 
-def _san_to_uci(tokens, fen=''):
-    board = chess.Board(fen) if fen else chess.Board()
-    result = []
-    for t in tokens:
-        try:
-            m = board.parse_san(t); result.append(m.uci()); board.push(m); continue
-        except Exception: pass
-        try:
-            m = chess.Move.from_uci(t)
-            if m in board.legal_moves: result.append(t); board.push(m); continue
-        except Exception: pass
-        break
-    return result
+    def load_puzzle(self, puzzle: Puzzle) -> None:
+        """Load a puzzle for playback."""
+        self._clear_state()
+        self.engine.load_fen(puzzle.fen)
+        self._puzzle_mode = True
+        self._puzzle_moves = list(puzzle.moves)
+        self._puzzle_idx = 0
+        self._overlay = puzzle.name
+        self.update()
+        # Clear overlay after a moment
+        QTimer.singleShot(1500, self._clear_overlay)
 
-def _extract_uci_moves(row):
-    raw_val = ''
-    for col in ('uci', 'moves', 'pgn'):
-        v = row.get(col, '')
-        if v and str(v).strip(): raw_val = v; break
-    tokens = _parse_uci_value(raw_val)
-    tokens = _clean_move_tokens(tokens)
-    if not tokens: return []
-    fen = str(row.get('fen', row.get('epd', ''))).strip()
-    if fen and len(fen.split()) < 6: fen += " 0 1"
-    fmt = _detect_move_format(tokens)
-    if fmt == 'san':
-        uci_moves = _san_to_uci(tokens, fen)
-        if uci_moves: return uci_moves
-    return tokens
+    def start_auto_play(self, interval: int = 800) -> None:
+        self._auto_play = True
+        self._auto_timer.setInterval(interval)
+        self._auto_timer.start()
 
-if HAS_NUMBA:
-    from numba import njit as _njit3, prange as _prange
-    @_njit3(cache=True, nogil=True)
-    def _count_moves_nb(data, offsets, lengths):
-        n = len(offsets); out = np.empty(n, dtype=np.int64); comma = np.uint8(44)
-        for i in range(n):
-            ln = lengths[i]
-            if ln == 0: out[i] = 0; continue
-            c = 1; s = offsets[i]; e = s + ln
-            for j in range(s, e):
-                if data[j] == comma: c += 1
-            out[i] = c
-        return out
-    @_njit3(cache=True, nogil=True)
-    def _validate_uci_first_nb(data, offsets, lengths):
-        n = len(offsets); valid = np.ones(n, dtype=np.bool_)
-        for i in range(n):
-            s = offsets[i]; ln = lengths[i]
-            if ln == 0 or ln < 4: valid[i] = False; continue
-            for j in range(4):
-                b = int(data[s + j])
-                if not ((48 <= b <= 57) or (97 <= b <= 122)): valid[i] = False; break
-        return valid
-    @_njit3(cache=True, nogil=True)
-    def _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals):
-        n = len(move_counts); out = np.empty(n, dtype=np.float64)
-        for i in range(n):
-            base = min(1.0, max(0.0, float(move_counts[i]) / 8.0))
-            fen_b = 0.15 if has_fen[i] else 0.0
-            if has_rating[i]: rating = min(1.0, max(0.0, rating_vals[i] / 3000.0))
-            else: rating = 0.5
-            out[i] = 0.4 * base + 0.2 * fen_b + 0.4 * rating
-        return out
-    log("Numba JIT puzzle helpers ready", "PUZZLE")
-else:
-    def _count_moves_nb(data, offsets, lengths):
-        out = np.empty(len(offsets), dtype=np.int64)
-        for i in range(len(offsets)):
-            if lengths[i] == 0: out[i] = 0
-            else:
-                seg = data[offsets[i]:offsets[i] + lengths[i]].tobytes()
-                out[i] = seg.count(b',') + 1
-        return out
-    def _validate_uci_first_nb(data, offsets, lengths):
-        valid = np.ones(len(offsets), dtype=np.bool_)
-        for i in range(len(offsets)):
-            if lengths[i] < 4: valid[i] = lengths[i] > 0
-        return valid
-    def _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals):
-        n = len(move_counts); out = np.empty(n, dtype=np.float64)
-        for i in range(n):
-            base = min(1.0, max(0.0, float(move_counts[i]) / 8.0))
-            fen_b = 0.15 if has_fen[i] else 0.0
-            rating = (min(1.0, max(0.0, rating_vals[i] / 3000.0)) if has_rating[i] else 0.5)
-            out[i] = 0.4 * base + 0.2 * fen_b + 0.4 * rating
-        return out
+    def stop_auto_play(self) -> None:
+        self._auto_play = False
+        self._auto_timer.stop()
 
-def _pack_strings(strings):
-    encoded = [s.encode('utf-8') if s else b'' for s in strings]
-    lengths = np.array([len(e) for e in encoded], dtype=np.int64)
-    offsets = np.empty(len(encoded), dtype=np.int64); total = 0
-    for i in range(len(encoded)): offsets[i] = total; total += lengths[i]
-    buf = b''.join(encoded)
-    data = (np.frombuffer(buf, dtype=np.uint8).copy() if buf else np.empty(0, dtype=np.uint8))
-    return data, offsets, lengths
+    def puzzle_next_move(self) -> bool:
+        """Play the next puzzle move. Returns False if done."""
+        if not self._puzzle_mode:
+            return False
+        if self._puzzle_idx >= len(self._puzzle_moves):
+            return False
+        uci = self._puzzle_moves[self._puzzle_idx]
+        info = self.engine.make_move_uci(uci)
+        if info:
+            self._puzzle_idx += 1
+            self._play_move_sound(info)
+            self.update()
+            if info.is_mate:
+                self._overlay = "CHECKMATE"
+                QTimer.singleShot(2500, self._clear_overlay)
+            elif info.is_check:
+                self._overlay = "CHECK"
+                QTimer.singleShot(1000, self._clear_overlay)
+            self.move_info.emit(info)
+            self.move_made.emit(uci)
+            self.board_changed.emit()
+            return True
+        return False
 
-def batch_count_moves(move_strings):
-    if not move_strings: return np.array([], dtype=np.int64)
-    data, offsets, lengths = _pack_strings(move_strings)
-    return _count_moves_nb(data, offsets, lengths)
+    def puzzle_prev_move(self) -> bool:
+        """Undo last puzzle move."""
+        if not self._puzzle_mode:
+            return False
+        if self._puzzle_idx <= 0:
+            return False
+        self.engine.undo()
+        self._puzzle_idx -= 1
+        self._overlay = ""
+        self.update()
+        self.board_changed.emit()
+        return True
 
-def batch_validate_uci(move_strings):
-    if not move_strings: return np.array([], dtype=np.bool_)
-    data, offsets, lengths = _pack_strings(move_strings)
-    return _validate_uci_first_nb(data, offsets, lengths)
+    def puzzle_reset(self) -> None:
+        """Reset to puzzle starting position."""
+        if self._puzzle_mode:
+            self.engine.reset_to_initial()
+            self._puzzle_idx = 0
+            self._overlay = ""
+            self._selected = None
+            self._legal_targets = []
+            self.update()
+            self.board_changed.emit()
 
-if HAS_CUPY:
-    import cupy as _cp_gpu
-    def gpu_difficulty_scores(move_counts, has_fen, has_rating, rating_vals):
-        mc_gpu = _cp_gpu.asarray(move_counts.astype(np.float64))
-        hf_gpu = _cp_gpu.asarray(has_fen.astype(np.float64))
-        hr_gpu = _cp_gpu.asarray(has_rating.astype(np.float64))
-        rv_gpu = _cp_gpu.asarray(rating_vals.astype(np.float64))
-        base = _cp_gpu.clip(mc_gpu / 8.0, 0.0, 1.0)
-        fen_b = 0.15 * hf_gpu
-        rating = _cp_gpu.where(hr_gpu > 0, _cp_gpu.clip(rv_gpu / 3000.0, 0.0, 1.0), 0.5)
-        return _cp_gpu.asnumpy(0.4 * base + 0.2 * fen_b + 0.4 * rating)
-    log("CuPy GPU puzzle helpers ready", "PUZZLE")
-else:
-    _cp_gpu = None
-    def gpu_difficulty_scores(move_counts, has_fen, has_rating, rating_vals):
-        return _compute_difficulty_nb(move_counts, has_fen, has_rating, rating_vals)
+    @property
+    def puzzle_progress(self) -> Tuple[int, int]:
+        """Returns (current_move_index, total_moves)."""
+        return (self._puzzle_idx, len(self._puzzle_moves))
 
-def _parse_uci_value(val):
-    if isinstance(val, list):
-        flat = []
-        for item in val:
-            if isinstance(item, str): flat.extend(item.replace(',', ' ').split())
-            elif item is not None:
-                s = str(item).strip().replace(',', ' ')
-                if s: flat.extend(s.split())
-        return flat
-    s = str(val).strip().replace(',', ' ')
-    return s.split() if s else []
+    @property
+    def puzzle_complete(self) -> bool:
+        return self._puzzle_mode and self._puzzle_idx >= len(self._puzzle_moves)
 
-def _rating_category(rating):
-    if rating < 800: return "Beginner"
-    if rating < 1200: return "Easy"
-    if rating < 1600: return "Medium"
-    if rating < 2000: return "Hard"
-    return "Expert"
+    def undo(self) -> None:
+        if self._anim_state:
+            return
+        self.engine.undo()
+        self._selected = None
+        self._legal_targets = []
+        self.update()
+        self.board_changed.emit()
 
-def _generate_name(row, uci_moves, idx):
-    number = idx + 1; attrs = []
-    name = str(row.get('name', '')).strip()
-    if name and name.lower() not in ('nan', 'none', ''): attrs.append(name)
-    themes = str(row.get('themes', row.get('theme', ''))).strip()
-    if themes and themes.lower() not in ('nan', 'none', ''): attrs.append(themes)
-    opening = str(row.get('opening', row.get('opening_tags', row.get('openingtags', '')))).strip()
-    if opening and opening.lower() not in ('nan', 'none', ''): attrs.append(opening)
-    for rkey in ('rating', 'elo', 'difficulty', 'score'):
-        rval = str(row.get(rkey, '')).strip()
-        if rval and rval.lower() not in ('nan', 'none', ''):
-            try:
-                rv = float(rval); attrs.append(f"{_rating_category(rv)} ({int(rv)})"); break
-            except ValueError: pass
-    if not name:
-        white = str(row.get('white', '')).strip(); black = str(row.get('black', '')).strip()
-        if white and black: attrs.append(f"{white} vs {black}")
-    if not name:
-        event = str(row.get('event', '')).strip()
-        if event and event.lower() not in ('nan', 'none', ''): attrs.append(event)
-    eco = str(row.get('eco', '')).strip()
-    if eco and eco.lower() not in ('nan', 'none', ''): attrs.append(f"ECO {eco}")
-    if attrs: return f"Puzzle #{number} — {' | '.join(attrs)}"
-    return _generate_name_fallback(row, uci_moves, idx)
+    def get_move_list(self) -> List[str]:
+        """Get SAN notation for all moves played."""
+        board = chess.Board(self.engine.initial_fen or chess.STARTING_FEN)
+        san_list = []
+        for move in self.engine.board.move_stack:
+            san = board.san(move)
+            board.push(move)
+            san_list.append(san)
+        return san_list
 
-def _generate_name_fallback(row, uci_moves, idx):
-    number = idx + 1
-    ignore = frozenset({'fen', 'moves', 'uci', 'pgn', 'id', 'name', 'img',
-                        'desc', 'description', 'white', 'black', 'event',
-                        'rating', 'difficulty', 'score', 'elo', 'themes',
-                        'theme', 'opening', 'opening_tags', 'openingtags', 'eco'})
-    parts = []
-    for k, v in row.items():
-        val = str(v).strip() if v is not None else ''
-        if k not in ignore and val and val.lower() not in ('nan', 'none', ''):
-            parts.append(f"{k.title()}: {val}")
-            if len(parts) == 2: break
-    if parts: return f"Puzzle #{number} — {' | '.join(parts)}"
-    if uci_moves: return f"Puzzle #{number} — {uci_moves[0]}…"
-    return f"Puzzle #{number}"
+    # ── Overrides ──
 
-def _compute_iterative_difficulty(row, uci_moves):
-    move_count = len(uci_moves)
-    base = min(1.0, max(0.0, move_count / 8.0))
-    fen = str(row.get('fen', '')).strip()
-    fen_b = 0.15 if fen else 0.0
-    rating = 0.5
-    for rkey in ('rating', 'elo', 'difficulty', 'score'):
-        rval = str(row.get(rkey, '')).strip()
-        if rval and rval.lower() not in ('nan', 'none', ''):
-            try:
-                rv = float(rval); rating = min(1.0, max(0.0, rv / 3000.0)); break
-            except ValueError: pass
-    return 0.4 * base + 0.2 * fen_b + 0.4 * rating
+    def mousePressEvent(self, event) -> None:
+        if self._anim_state:
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        r, c = self._pixel_to_rc(event.position().toPoint())
+        if r < 0 or r > 7 or c < 0 or c > 7:
+            return
 
-def _process_rows_iterative(rows):
-    puzzles = []
-    for idx, row in enumerate(rows):
-        row = {str(k).lower(): (v if v is not None else '') for k, v in row.items()}
-        uci_moves = _extract_uci_moves(row)
-        name = _generate_name(row, uci_moves, idx)
-        difficulty = _compute_iterative_difficulty(row, uci_moves)
-        puzzles.append({'name': name, 'fen': str(row.get('fen', '')),
-                        'moves': uci_moves, 'desc': str(row.get('desc', row.get('description', ''))),
-                        'difficulty': difficulty})
-    return puzzles
+        # If in puzzle mode, only allow puzzle moves via auto/next
+        if self._puzzle_mode:
+            return
 
-def _process_rows_vectorized(rows):
-    import pandas as pd
-    df = pd.DataFrame(rows); df.columns = df.columns.str.lower().str.strip()
-    str_cols = df.select_dtypes(include=['object']).columns
-    df[str_cols] = df[str_cols].fillna(''); n = len(df)
-    moves_col = None
-    for candidate in ('uci', 'moves', 'pgn'):
-        if candidate in df.columns: moves_col = candidate; break
-    moves_series = (df[moves_col] if moves_col else pd.Series([''] * n, index=df.index))
-    uci_moves_list = moves_series.apply(_parse_uci_value)
-    move_strs = moves_series.astype(str).tolist()
-    move_counts = batch_count_moves(move_strs)
-    uci_valid = batch_validate_uci(move_strs)
-    invalid_n = int((~uci_valid).sum())
-    if invalid_n:
-        log(f"Note: {invalid_n}/{n} rows have non-UCI first token", "PUZZLE")
-    has_fen = np.array([bool(str(v).strip()) for v in df.get('fen', pd.Series('', index=df.index))], dtype=np.bool_)
-    rating_col = None
-    for candidate in ('rating', 'difficulty', 'score', 'elo'):
-        if candidate in df.columns: rating_col = candidate; break
-    if rating_col:
-        rating_vals = pd.to_numeric(df[rating_col], errors='coerce').fillna(0).values.astype(np.float64)
-        has_rating = rating_vals > 0
-    else:
-        rating_vals = np.zeros(n, dtype=np.float64); has_rating = np.zeros(n, dtype=np.bool_)
-    difficulty = gpu_difficulty_scores(move_counts, has_fen, has_rating, rating_vals)
-    fen_col = ('fen' if 'fen' in df.columns else None)
-    desc_col = ('desc' if 'desc' in df.columns else 'description' if 'description' in df.columns else None)
-    fens = (df[fen_col].astype(str) if fen_col else pd.Series([''] * n, index=df.index))
-    descs = (df[desc_col].astype(str) if desc_col else pd.Series([''] * n, index=df.index))
+        piece = self.engine.board.piece_at(
+            ChessEngine.rc_to_sq(r, c))
 
-    # Generate names
-    names = np.empty(n, dtype=object)
-    def _str_col(col_name):
-        s = df.get(col_name, pd.Series('', index=df.index))
-        return s.fillna('').astype(str).str.strip() if isinstance(s, pd.Series) else pd.Series('', index=df.index)
-    name_col = _str_col('name'); themes_col = _str_col('themes')
-    if (themes_col == '').all(): themes_col = _str_col('theme')
-    opening_col = _str_col('opening')
-    if (opening_col == '').all(): opening_col = _str_col('opening_tags')
-    if (opening_col == '').all(): opening_col = _str_col('openingtags')
-    rating_col_s = _str_col('rating'); eco_col = _str_col('eco')
-    white_col = _str_col('white'); black_col = _str_col('black')
-    event_col = _str_col('event')
-    for i in range(n):
-        number = i + 1; attrs = []
-        nm = name_col.iloc[i]
-        if nm and nm.lower() not in ('nan', 'none', ''): attrs.append(nm)
-        th = themes_col.iloc[i]
-        if th and th.lower() not in ('nan', 'none', ''): attrs.append(th)
-        op = opening_col.iloc[i]
-        if op and op.lower() not in ('nan', 'none', ''): attrs.append(op)
-        rv = rating_col_s.iloc[i]
-        if rv and rv.lower() not in ('nan', 'none', ''):
-            try:
-                rvf = float(rv); attrs.append(f"{_rating_category(rvf)} ({int(rvf)})")
-            except ValueError: pass
-        if not nm:
-            w, b = white_col.iloc[i], black_col.iloc[i]
-            if w and b: attrs.append(f"{w} vs {b}")
-        if not nm:
-            ev = event_col.iloc[i]
-            if ev and ev.lower() not in ('nan', 'none', ''): attrs.append(ev)
-        eco = eco_col.iloc[i]
-        if eco and eco.lower() not in ('nan', 'none', ''): attrs.append(f"ECO {eco}")
-        if attrs: names[i] = f"Puzzle #{number} — {' | '.join(attrs)}"
-        else:
-            row_dict = df.iloc[i].to_dict()
-            uci_moves = uci_moves_list.iloc[i]
-            names[i] = _generate_name_fallback(row_dict, uci_moves, i)
-
-    puzzles = []
-    for i in range(n):
-        raw_tokens = _clean_move_tokens(uci_moves_list.iloc[i])
-        fmt = _detect_move_format(raw_tokens)
-        if fmt == 'san':
-            fen_str = str(fens.iloc[i]).strip()
-            if fen_str and len(fen_str.split()) < 6: fen_str += " 0 1"
-            uci_moves = _san_to_uci(raw_tokens, fen_str)
-            if not uci_moves: uci_moves = raw_tokens
-        else:
-            uci_moves = raw_tokens
-        puzzles.append({'name': names[i], 'fen': fens.iloc[i], 'moves': uci_moves,
-                        'desc': descs.iloc[i], 'difficulty': float(difficulty[i])})
-    return puzzles
-
-def _process_rows(rows):
-    if not rows: return []
-    n = len(rows)
-    if HAS_PANDAS and n > 100:
-        try: return _process_rows_vectorized(rows)
-        except Exception as exc:
-            log(f"Vectorized path failed ({exc}); falling back to iterative", "PUZZLE")
-    return _process_rows_iterative(rows)
-
-def load_puzzles(filepath):
-    ext = Path(filepath).suffix.lower()
-    log(f"Loading puzzles from {Path(filepath).name} ({ext})…", "PUZZLE")
-    if ext == '.csv': yield from _load_csv_chunked(filepath)
-    elif ext in ('.parquet', '.pq'): yield from _load_parquet_chunked(filepath)
-    elif ext == '.duckdb': yield from _load_duckdb_chunked(filepath)
-    elif ext in ('.db', '.sqlite'): yield from _load_sqlite_chunked(filepath)
-    else: raise ValueError(f"Unsupported file format: {ext}")
-    gc.collect()
-
-def _load_csv_chunked(filepath):
-    if HAS_PANDAS:
-        import pandas as pd
-        for chunk_df in pd.read_csv(filepath, dtype=str, chunksize=_CSV_PROCESS_CHUNK, encoding='utf-8', on_bad_lines='skip'):
-            chunk_df = chunk_df.fillna(''); rows = chunk_df.to_dict('records')
-            yield _process_rows(rows); del rows, chunk_df
-        gc.collect()
-    else:
-        rows = []
-        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-            for row in csv.DictReader(f): rows.append(row)
-        log(f"Parsed {len(rows)} CSV rows (stdlib)", "PUZZLE")
-        for i in range(0, len(rows), _CSV_PROCESS_CHUNK):
-            yield _process_rows(rows[i:i + _CSV_PROCESS_CHUNK])
-        del rows; gc.collect()
-
-def _load_parquet_chunked(filepath):
-    if HAS_PYARROW:
-        import pyarrow.parquet as pq
-        pf = pq.ParquetFile(filepath); total = 0
-        for batch in pf.iter_batches(batch_size=_PARQUET_BATCH):
-            df = batch.to_pandas(); df = df.where(df.notna(), None)
-            rows = df.to_dict('records'); yield _process_rows(rows)
-            total += len(rows); del rows, df, batch
-        log(f"Chunked-parquet: {total} rows from {Path(filepath).name}", "PUZZLE")
-    elif HAS_PANDAS:
-        import pandas as pd
-        df = pd.read_parquet(filepath); df = df.where(df.notna(), None)
-        rows = df.to_dict('records')
-        for i in range(0, len(rows), _CSV_PROCESS_CHUNK):
-            yield _process_rows(rows[i:i + _CSV_PROCESS_CHUNK])
-        del rows, df; gc.collect()
-    else:
-        raise ImportError("Parquet requires 'pandas' or 'pyarrow'")
-
-def _load_duckdb_chunked(filepath):
-    if not HAS_DUCKDB: raise ImportError("DuckDB requires 'duckdb'")
-    import duckdb
-    con = duckdb.connect(filepath, read_only=True)
-    try:
-        tables = con.execute("SHOW TABLES").fetchall()
-        if not tables: raise ValueError("No tables found in DuckDB database")
-        table_name = tables[0][0]
-        count = con.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
-        offset = 0
-        while offset < count:
-            df = con.execute(f'SELECT * FROM "{table_name}" LIMIT {_CSV_PROCESS_CHUNK} OFFSET {offset}').fetchdf()
-            df = df.where(df.notna(), None); rows = df.to_dict('records')
-            yield _process_rows(rows); offset += _CSV_PROCESS_CHUNK; del rows, df
-    finally:
-        con.close()
-
-def _load_sqlite_chunked(filepath):
-    import sqlite3
-    conn = sqlite3.connect(filepath)
-    try:
-        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = cursor.fetchall()
-        if not tables: raise ValueError("No tables found in SQLite database")
-        table_name = tables[0][0]
-        cursor = conn.execute(f'SELECT * FROM "{table_name}"')
-        col_names = [desc[0] for desc in cursor.description]
-        while True:
-            rows_raw = cursor.fetchmany(_CSV_PROCESS_CHUNK)
-            if not rows_raw: break
-            rows = [dict(zip(col_names, r)) for r in rows_raw]
-            yield _process_rows(rows); del rows, rows_raw
-    finally:
-        conn.close()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DATA MANAGER (Puzzles only)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-DB_PUZZLES_PATH = os.path.join(DATA_DIR, "cache_puzzles.parquet")
-
-def _sanitize_for_json(obj):
-    if isinstance(obj, dict): return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, list): return [_sanitize_for_json(v) for v in obj]
-    elif isinstance(obj, bytes): return base64.b64encode(obj).decode('ascii')
-    elif isinstance(obj, (str, int, float, bool)) or obj is None: return obj
-    else: return str(obj)
-
-class DataProvider:
-    _PUZZLE_COLS = ['id', 'name', 'fen', 'moves', 'desc', 'difficulty', 'display_title']
-    _SLIM_PUZZLE_COLS = ['id', 'name', 'difficulty', 'display_title']
-    _LIST_COLS = {'moves'}
-
-    def __init__(self):
-        os.makedirs(DATA_DIR, exist_ok=True)
-        self._slim = {}; self._next_id = {}; self._dirty = {}
-        self._load_slim('puzzles'); self._dirty['puzzles'] = False
-
-    def _columns(self, db_type): return self._PUZZLE_COLS
-    def _slim_columns(self, db_type): return self._SLIM_PUZZLE_COLS
-    def _cache_path(self, db_type): return DB_PUZZLES_PATH
-
-    @staticmethod
-    def _parquet_columns(path):
-        try:
-            if HAS_PYARROW:
-                import pyarrow.parquet as pq
-                return [f.name for f in pq.read_schema(path)]
-        except Exception: pass
-        try:
-            if HAS_PANDAS:
-                import pandas as pd
-                return list(pd.read_parquet(path, columns=None).head(0).columns)
-        except Exception: pass
-        return []
-
-    def _empty_slim(self, db_type):
-        if HAS_PANDAS:
-            import pandas as pd; return pd.DataFrame(columns=self._slim_columns(db_type))
-        return []
-
-    def _load_slim(self, db_type):
-        path = self._cache_path(db_type); slim_cols = self._slim_columns(db_type)
-        if not os.path.exists(path):
-            self._slim[db_type] = self._empty_slim(db_type); self._next_id[db_type] = 1; return
-        if not HAS_PANDAS and not HAS_PYARROW:
-            self._slim[db_type] = self._empty_slim(db_type); self._next_id[db_type] = 1; return
-        try:
-            available = self._parquet_columns(path)
-            read_cols = [c for c in slim_cols if c in available] if available else slim_cols
-            if not read_cols:
-                self._slim[db_type] = self._empty_slim(db_type); self._next_id[db_type] = 1; return
-            df = None
-            try:
-                if HAS_PANDAS:
-                    import pandas as pd; df = pd.read_parquet(path, columns=read_cols)
-                elif HAS_PYARROW:
-                    import pyarrow.parquet as pq; df = pq.read_table(path, columns=read_cols).to_pandas()
-            except Exception: df = None
-            if df is None:
-                try:
-                    if HAS_PANDAS:
-                        import pandas as pd; df = pd.read_parquet(path)
-                    elif HAS_PYARROW:
-                        import pyarrow.parquet as pq; df = pq.read_table(path).to_pandas()
-                except Exception as e2:
-                    self._slim[db_type] = self._empty_slim(db_type); self._next_id[db_type] = 1; return
-            for c in slim_cols:
-                if c not in df.columns:
-                    if c == 'id': df[c] = 0
-                    elif c == 'difficulty': df[c] = 0.5
-                    else: df[c] = ''
-            df = df[slim_cols]
-            if 'id' in df.columns: df['id'] = df['id'].astype(int)
-            if 'difficulty' in df.columns:
-                df['difficulty'] = pd.to_numeric(df['difficulty'], errors='coerce').fillna(0.5)
-            self._slim[db_type] = df
-            self._next_id[db_type] = (int(df['id'].max()) + 1 if len(df) > 0 else 1)
-            mem_mb = df.memory_usage(deep=True).sum() / 1e6
-            log(f"Loaded slim {len(df):,} {db_type} ({mem_mb:.1f} MB)", "DATA")
-        except Exception as e:
-            log(f"Error loading {db_type} slim: {e}", "DATA")
-            import traceback; traceback.print_exc()
-            self._slim[db_type] = self._empty_slim(db_type); self._next_id[db_type] = 1
-
-    def _deserialize_record(self, rec):
-        for col in self._LIST_COLS:
-            if col in rec and isinstance(rec[col], str):
-                try: rec[col] = json.loads(rec[col])
-                except Exception: pass
-        if 'id' in rec: rec['id'] = int(rec['id'])
-        if 'difficulty' in rec and rec.get('difficulty') is None: rec['difficulty'] = 0.5
-        for key in list(rec.keys()):
-            if rec[key] is None:
-                if key == 'id': rec[key] = 0
-                elif key == 'difficulty': rec[key] = 0.5
-                else: rec[key] = ''
-        return rec
-
-    def _records_from_parquet(self, db_type, ids=None):
-        path = self._cache_path(db_type)
-        if not os.path.exists(path): return []
-        id_set = set(ids) if ids is not None else None; results = []; scan_batch = 100_000
-        try:
-            if HAS_PYARROW:
-                import pyarrow.parquet as pq
-                pf = pq.ParquetFile(path)
-                for batch in pf.iter_batches(batch_size=scan_batch):
-                    df = batch.to_pandas()
-                    if id_set is not None:
-                        df = df[df['id'].isin(id_set)]; id_set -= set(df['id'].tolist())
-                    for rec in df.to_dict('records'): results.append(self._deserialize_record(rec))
-                    del df, batch
-                    if id_set is not None and not id_set: break
-            elif HAS_PANDAS:
-                import pandas as pd
-                df = pd.read_parquet(path)
-                if id_set is not None: df = df[df['id'].isin(id_set)]
-                for rec in df.to_dict('records'): results.append(self._deserialize_record(rec))
-                del df
-        except Exception as e:
-            log(f"Error reading {db_type} records: {e}", "DATA")
-        return results
-
-    def _chunks_from_parquet(self, db_type, ids=None, chunk_size=500):
-        path = self._cache_path(db_type)
-        if not os.path.exists(path): return
-        id_set = set(ids) if ids is not None else None; buf = []; scan_batch = 100_000
-        try:
-            if HAS_PYARROW:
-                import pyarrow.parquet as pq
-                pf = pq.ParquetFile(path)
-                for batch in pf.iter_batches(batch_size=scan_batch):
-                    df = batch.to_pandas()
-                    if id_set is not None:
-                        df = df[df['id'].isin(id_set)]; id_set -= set(df['id'].tolist())
-                    for rec in df.to_dict('records'):
-                        buf.append(self._deserialize_record(rec))
-                        if len(buf) >= chunk_size: yield buf; buf = []
-                    del df
-                    if id_set is not None and not id_set: break
-            elif HAS_PANDAS:
-                import pandas as pd
-                df = pd.read_parquet(path)
-                if id_set is not None: df = df[df['id'].isin(id_set)]
-                for rec in df.to_dict('records'):
-                    buf.append(self._deserialize_record(rec))
-                    if len(buf) >= chunk_size: yield buf; buf = []
-                del df
-        except Exception as e:
-            log(f"Error scanning {db_type}: {e}", "DATA")
-        if buf: yield buf
-
-    def _make_record(self, db_type, item, next_id):
-        return {'id': next_id, 'name': str(item.get('name', '')),
-                'fen': str(item.get('fen', '')), 'moves': item.get('moves', []),
-                'desc': str(item.get('desc', '')),
-                'difficulty': float(item.get('difficulty', 0.5)),
-                'display_title': str(item.get('display_title', item.get('name', '')))}
-
-    def _serialize_record_for_parquet(self, rec, cols):
-        sr = dict(rec)
-        for col in self._LIST_COLS:
-            if col in sr and isinstance(sr[col], list): sr[col] = json.dumps(sr[col], default=str)
-        if 'difficulty' in sr:
-            try: sr['difficulty'] = float(sr.get('difficulty', 0.5))
-            except (ValueError, TypeError): sr['difficulty'] = 0.5
-        if 'id' in sr: sr['id'] = int(sr['id'])
-        for col in cols:
-            if col not in sr:
-                if col == 'id': sr[col] = 0
-                elif col == 'difficulty': sr[col] = 0.5
-                else: sr[col] = ''
-        return sr
-
-    def _records_to_dataframe(self, records, cols):
-        import pandas as pd
-        if not records: return pd.DataFrame(columns=cols)
-        df = pd.DataFrame(records, columns=cols)
-        if 'id' in df.columns: df['id'] = df['id'].astype(int)
-        if 'difficulty' in df.columns:
-            df['difficulty'] = pd.to_numeric(df['difficulty'], errors='coerce').fillna(0.5)
-        return df
-
-    def stream_import(self, db_type, chunk_generator):
-        cols = self._columns(db_type); path = self._cache_path(db_type)
-        if HAS_PYARROW:
-            yield from self._stream_import_pyarrow(db_type, chunk_generator, cols, path, self._next_id[db_type])
-        elif HAS_PANDAS:
-            yield from self._stream_import_pandas(db_type, chunk_generator, cols, path, self._next_id[db_type])
-        else:
-            raise ImportError("Need pandas or pyarrow for parquet I/O")
-        self._load_slim(db_type); self._dirty[db_type] = False
-
-    def _stream_import_pyarrow(self, db_type, chunk_generator, cols, path, next_id):
-        import pyarrow as pa; import pyarrow.parquet as pq
-        writer = None; total_count = 0; schema = None
-        try:
-            for chunk in chunk_generator:
-                if not chunk: continue
-                records = []
-                for item in chunk:
-                    rec = self._make_record(db_type, item, next_id)
-                    records.append(self._serialize_record_for_parquet(rec, cols)); next_id += 1
-                chunk_df = self._records_to_dataframe(records, cols)
-                table = pa.Table.from_pandas(chunk_df, preserve_index=False)
-                if writer is None: schema = table.schema; writer = pq.ParquetWriter(path, schema)
+        if self._selected:
+            # Try to make a move
+            sr, sc = self._selected
+            if (r, c) in self._legal_targets:
+                # Check promotion
+                if self.engine.is_promotion(sr, sc, r, c):
+                    promo = self._prompt_promotion()
+                    if promo is None:
+                        return
+                    info = self.engine.make_move(sr, sc, r, c, promo)
                 else:
-                    if table.schema != schema: table = table.cast(schema)
-                writer.write_table(table); total_count += len(chunk)
-                del records, chunk_df, table; yield len(chunk), total_count
-        finally:
-            if writer is not None: writer.close()
-        self._next_id[db_type] = next_id
-
-    def _stream_import_pandas(self, db_type, chunk_generator, cols, path, next_id):
-        import pandas as pd
-        temp_dir = path + '.parts'; os.makedirs(temp_dir, exist_ok=True)
-        temp_files = []; total_count = 0
-        try:
-            for chunk_idx, chunk in enumerate(chunk_generator):
-                if not chunk: continue
-                records = []
-                for item in chunk:
-                    rec = self._make_record(db_type, item, next_id)
-                    records.append(self._serialize_record_for_parquet(rec, cols)); next_id += 1
-                chunk_df = self._records_to_dataframe(records, cols)
-                temp_path = os.path.join(temp_dir, f'part_{chunk_idx:06d}.parquet')
-                chunk_df.to_parquet(temp_path, index=False); temp_files.append(temp_path)
-                total_count += len(chunk); del records, chunk_df; yield len(chunk), total_count
-            if temp_files:
-                dfs = [pd.read_parquet(tf) for tf in temp_files]
-                combined = pd.concat(dfs, ignore_index=True); combined.to_parquet(path, index=False)
-                del dfs, combined
-            else:
-                pd.DataFrame(columns=cols).to_parquet(path, index=False)
-        finally:
-            for f in temp_files:
-                try: os.remove(f)
-                except OSError: pass
-            try: shutil.rmtree(temp_dir, ignore_errors=True)
-            except OSError: pass
-        self._next_id[db_type] = next_id
-
-    def _append_records_to_parquet(self, db_type, records, cols):
-        import pandas as pd
-        save_records = [self._serialize_record_for_parquet(rec, cols) for rec in records]
-        new_df = self._records_to_dataframe(save_records, cols)
-        path = self._cache_path(db_type)
-        if not os.path.exists(path): new_df.to_parquet(path, index=False)
+                    info = self.engine.make_move(sr, sc, r, c)
+                if info:
+                    self._selected = None
+                    self._legal_targets = []
+                    self._play_move_sound(info)
+                    self.update()
+                    self.move_info.emit(info)
+                    self.move_made.emit(
+                        chess.Move(ChessEngine.rc_to_sq(sr, sc),
+                                   ChessEngine.rc_to_sq(r, c),
+                                   promo).uci() if info.promo else
+                        chess.Move(ChessEngine.rc_to_sq(sr, sc),
+                                   ChessEngine.rc_to_sq(r, c)).uci())
+                    self.board_changed.emit()
+                    return
+            # Deselect or reselect
+            self._selected = None
+            self._legal_targets = []
+            if piece and self._is_our_piece(piece):
+                self._selected = (r, c)
+                self._legal_targets = self.engine.legal_targets(r, c)
         else:
-            existing = pd.read_parquet(path)
-            combined = pd.concat([existing, new_df], ignore_index=True)
-            combined.to_parquet(path, index=False); del existing, combined
+            if piece and self._is_our_piece(piece):
+                self._selected = (r, c)
+                self._legal_targets = self.engine.legal_targets(r, c)
 
-    def _save_cache(self, db_type): self._dirty[db_type] = False
+        self.update()
 
-    def clear_table(self, db_type):
-        path = self._cache_path(db_type)
-        if os.path.exists(path):
-            try: os.remove(path)
-            except OSError: pass
-        self._slim[db_type] = self._empty_slim(db_type)
-        self._next_id[db_type] = 1; self._dirty[db_type] = False
-
-    def insert_batch(self, db_type, items):
-        if not items: return
-        cols = self._columns(db_type); slim_cols = self._slim_columns(db_type); next_id = self._next_id[db_type]
-        records = []; slim_rows = []
-        for item in items:
-            rec = self._make_record(db_type, item, next_id)
-            records.append(rec); slim_rows.append({c: rec.get(c, '') for c in slim_cols}); next_id += 1
-        self._append_records_to_parquet(db_type, records, cols)
-        if HAS_PANDAS:
-            import pandas as pd
-            new_slim = pd.DataFrame(slim_rows, columns=slim_cols)
-            if 'id' in new_slim.columns: new_slim['id'] = new_slim['id'].astype(int)
-            existing = self._slim.get(db_type)
-            if existing is not None and len(existing) > 0:
-                self._slim[db_type] = pd.concat([existing, new_slim], ignore_index=True)
-            else:
-                self._slim[db_type] = new_slim
-        self._next_id[db_type] = next_id; self._dirty[db_type] = True
-
-    def flush(self, db_type=None):
-        if db_type:
-            if self._dirty.get(db_type, False): self._save_cache(db_type)
-        else:
-            for dt in list(self._dirty.keys()):
-                if self._dirty[dt]: self._save_cache(dt)
-
-    def reload(self, db_type):
-        self._load_slim(db_type); self._dirty[db_type] = False
-
-    def get_count(self, db_type, filter_text=""):
-        df = self._slim.get(db_type)
-        if df is None or not HAS_PANDAS or len(df) == 0: return 0
-        if filter_text:
-            ft = filter_text.lower()
-            mask = df['name'].str.lower().str.contains(ft, na=False)
-            if 'display_title' in df.columns:
-                mask |= df['display_title'].str.lower().str.contains(ft, na=False)
-            return int(mask.sum())
-        return len(df)
-
-    def get_page(self, db_type, page, page_size, filter_text=""):
-        df = self._slim.get(db_type)
-        if df is None or not HAS_PANDAS or len(df) == 0: return []
-        if filter_text:
-            ft = filter_text.lower()
-            mask = df['name'].str.lower().str.contains(ft, na=False)
-            if 'display_title' in df.columns:
-                mask |= df['display_title'].str.lower().str.contains(ft, na=False)
-            filtered = df[mask]
-        else:
-            filtered = df
-        start = page * page_size; end = start + page_size
-        page_df = filtered.iloc[start:end]
-        results = []
-        for rec in page_df.to_dict('records'):
-            r = dict(rec)
-            if 'id' in r: r['id'] = int(r['id'])
-            if 'difficulty' in r and r.get('difficulty') is not None:
-                try: r['difficulty'] = float(r['difficulty'])
-                except (ValueError, TypeError): r['difficulty'] = 0.5
-            results.append(r)
-        return results
-
-    def get_ids_by_filter(self, db_type, filter_text=""):
-        df = self._slim.get(db_type)
-        if df is None or not HAS_PANDAS or len(df) == 0: return []
-        if filter_text:
-            ft = filter_text.lower()
-            mask = df['name'].str.lower().str.contains(ft, na=False)
-            if 'display_title' in df.columns:
-                mask |= df['display_title'].str.lower().str.contains(ft, na=False)
-            filtered = df[mask]
-        else:
-            filtered = df
-        return filtered['id'].astype(int).tolist()
-
-    def get_items_by_ids(self, db_type, ids):
-        if not ids: return []
-        return self._records_from_parquet(db_type, ids)
-
-    def get_chunks_by_ids(self, db_type, ids, chunk_size=500):
-        if not ids: return
-        yield from self._chunks_from_parquet(db_type, ids, chunk_size)
-
-class DataLoadWorker(QThread):
-    data_ready = Signal(str, int)
-    load_error = Signal(str, str)
-
-    def __init__(self, db_type, directory=None, single_file=None):
-        super().__init__()
-        self.db_type = db_type; self.directory = directory
-        self.single_file = single_file; self._abort = False
-
-    def abort(self): self._abort = True
-
-    def run(self):
-        try:
-            db = DataProvider(); db.clear_table(self.db_type); total_count = 0
-            files = self._get_files()
-            for f in files:
-                if self._abort: break
-                try:
-                    chunk_gen = load_puzzles(str(f))
-                    for chunk_count, running_total in db.stream_import(self.db_type, chunk_gen):
-                        if self._abort: break
-                        total_count = running_total
-                        if chunk_count % 100_000 < 60_000:
-                            log(f"  {self.db_type}: {total_count:,} rows (+{chunk_count})", "DATA")
-                except Exception as e:
-                    log(f"Error loading {f.name}: {e}", "DATA")
-                    import traceback; traceback.print_exc()
-                    self.load_error.emit(self.db_type, f"{f.name}: {e}")
-            db.flush(self.db_type)
-            log(f"Load complete: {total_count:,} {self.db_type}", "DATA")
-            self.data_ready.emit(self.db_type, total_count)
-        except Exception as e:
-            log(f"Fatal load error ({self.db_type}): {e}", "DATA")
-            import traceback; traceback.print_exc()
-            self.load_error.emit(self.db_type, str(e))
-            self.data_ready.emit(self.db_type, 0)
-
-    def _get_files(self):
-        valid_exts = {'.csv', '.parquet', '.pq', '.duckdb', '.db', '.sqlite'}
-        if self.single_file: return [Path(self.single_file)]
-        directory = self.directory
-        if not directory or not os.path.exists(directory):
-            if directory: os.makedirs(directory, exist_ok=True)
-            return []
-        return sorted(f for f in Path(directory).iterdir() if f.suffix.lower() in valid_exts)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  EXPORT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-if HAS_NUMBA:
-    from numba import njit as _njit4, prange as _prange2
-    @_njit4(cache=True, parallel=True, nogil=True)
-    def _normalize_frames_nb(frame_ptrs, target_h, target_w):
-        n = frame_ptrs.shape[0]
-        out = np.empty((n, target_h, target_w, 3), dtype=np.uint8)
-        for idx in _prange2(n):
-            src = frame_ptrs[idx]; sh, sw = src.shape[0], src.shape[1]
-            for y in range(target_h):
-                sy = min(int(y * sh / target_h), sh - 1)
-                for x in range(target_w):
-                    sx = min(int(x * sw / target_w), sw - 1)
-                    for c in range(3): out[idx, y, x, c] = src[sy, sx, c]
-        return out
-    log("Numba JIT frame normaliser loaded", "EXPORT")
-else:
-    def _normalize_frames_nb(frame_ptrs, target_h, target_w):
-        out = np.empty((len(frame_ptrs), target_h, target_w, 3), dtype=np.uint8)
-        for idx, src in enumerate(frame_ptrs):
-            sh, sw = src.shape[0], src.shape[1]
-            iy = (np.arange(target_h) * sh // target_h).clip(0, sh - 1)
-            ix = (np.arange(target_w) * sw // target_w).clip(0, sw - 1)
-            out[idx] = src[np.ix_(iy, ix)]
-        return out
-
-if HAS_CUPY:
-    import cupy as _cp_export
-    def _gpu_vignette(frames_gpu, strength=0.25):
-        _n, h, w, _c = frames_gpu.shape
-        yy, xx = _cp_export.meshgrid(_cp_export.linspace(-1, 1, h, dtype=_cp_export.float32),
-                                      _cp_export.linspace(-1, 1, w, dtype=_cp_export.float32), indexing='ij')
-        dist = _cp_export.sqrt(xx ** 2 + yy ** 2)
-        vignette = 1.0 - strength * _cp_export.clip(dist / 1.414, 0, 1)
-        vignette = vignette[_cp_export.newaxis, :, :, _cp_export.newaxis]
-        out = frames_gpu.astype(_cp_export.float32) * vignette
-        return _cp_export.clip(out, 0, 255).astype(_cp_export.uint8)
-    def _gpu_color_grade(frames_gpu, contrast=1.02, brightness=0.0, saturation=1.05):
-        f = frames_gpu.astype(_cp_export.float32)
-        f = _cp_export.clip(f * contrast + brightness, 0, 255)
-        if saturation != 1.0:
-            gray = _cp_export.mean(f, axis=3, keepdims=True)
-            f = _cp_export.clip(gray + saturation * (f - gray), 0, 255)
-        return f.astype(_cp_export.uint8)
-    log("CuPy GPU post-processing helpers loaded", "EXPORT")
-else:
-    _cp_export = None
-
-def _render_puzzle_frames(puzzle, cfg, abort_check=None):
-    sz = cfg.effective_sq_size; bpx = sz * 8; fps = cfg.fps
-    theme = THEMES.get(cfg.theme_name, THEMES["Classic"])
-    tasks = []; tw, th = cfg.target_width, cfg.target_height
-    needs_composite = (tw != bpx or th != bpx); bg = cfg.background_color
-    title_text = cfg.title_text
-    if not title_text: title_text = puzzle.get('display_title', puzzle.get('name', ''))
-    if cfg.title_enabled and title_text:
-        n_frames = int(fps * cfg.title_duration)
-        card_font_size = max(24, int(sz * 0.55))
-        if needs_composite: card_font_size = max(28, int(min(tw, th) * 0.05))
-        for _ in range(n_frames):
-            tasks.append(('card', {'text': title_text, 'bg': cfg.title_bg,
-                                   'fg': cfg.title_fg, 'w': tw if needs_composite else bpx,
-                                   'h': th if needs_composite else bpx,
-                                   'font_size': card_font_size, 'sub_text': cfg.subtitle_text}))
-    eng = ChessEngine()
-    fen = puzzle.get("fen")
-    if fen: eng.load_fen(fen)
-    else: eng.reset()
-    for move_str in puzzle["moves"]:
-        if abort_check and abort_check(): return None
-        move_str = move_str.strip()
-        if not move_str: continue
-        board_before_move = eng.board.copy()
-        move = None
-        try:
-            m = chess.Move.from_uci(move_str)
-            if m in eng.board.legal_moves: move = m
-        except ValueError: pass
-        if move is None:
-            try: move = eng.board.parse_san(move_str)
-            except Exception: pass
-        if move is None:
-            log(f"Skipping illegal move {move_str} in export", "EXPORT"); continue
-        from_sq = move.from_square; to_sq = move.to_square
-        fr = 7 - chess.square_rank(from_sq); fc = chess.square_file(from_sq)
-        tr = 7 - chess.square_rank(to_sq); tc = chess.square_file(to_sq)
-        piece_obj = board_before_move.piece_at(from_sq)
-        if piece_obj is None: continue
-        n_highlight = max(1, int(fps * cfg.highlight_duration))
-        for _ in range(n_highlight):
-            tasks.append(('board', {'board': board_before_move, 'sz': sz, 'selected': (fr, fc), 'last_move': None, 'theme': theme}))
-        n_anim = max(1, int(fps * cfg.move_anim_duration))
-        for i in range(n_anim):
-            prog = i / n_anim
-            tasks.append(('board', {'board': board_before_move, 'sz': sz,
-                                    'anim_state': {'from': (fr, fc), 'to': (tr, tc), 'piece_obj': piece_obj, 'progress': prog}, 'theme': theme}))
-        info = eng.make_move_uci(move.uci())
-        last_move = ((fr, fc), (tr, tc)) if info else None
-        n_pause = max(1, int(fps * cfg.pause_after_move))
-        for _ in range(n_pause):
-            tasks.append(('board', {'board': eng.board.copy(), 'sz': sz, 'last_move': last_move, 'theme': theme}))
-    if cfg.end_enabled and cfg.end_text:
-        n_frames = int(fps * cfg.end_duration)
-        end_font_size = max(28, int(sz * 0.65))
-        if needs_composite: end_font_size = max(32, int(min(tw, th) * 0.058))
-        for _ in range(n_frames):
-            tasks.append(('card', {'text': cfg.end_text, 'bg': cfg.end_bg,
-                                   'fg': cfg.end_fg, 'w': tw if needs_composite else bpx,
-                                   'h': th if needs_composite else bpx,
-                                   'font_size': end_font_size}))
-    total = len(tasks)
-    if total == 0: return []
-    frames = [None] * total
-
-    def render_task(idx_task):
-        idx, (t_type, t_kwargs) = idx_task
-        if t_type == 'card':
-            img = ChessBoardWidget.render_card(**t_kwargs)
-            np_arr = ChessBoardWidget.qimage_to_np(img)
-            if needs_composite: np_arr = composite_card_frame(np_arr, tw, th, bg)
-        else:
-            img = ChessBoardWidget.render_frame(t_kwargs['board'], last_move=t_kwargs.get('last_move'),
-                                                selected=t_kwargs.get('selected'), anim_state=t_kwargs.get('anim_state'),
-                                                sq_size=t_kwargs['sz'], show_arrow=True, theme=t_kwargs['theme'])
-            np_arr = ChessBoardWidget.qimage_to_np(img)
-            if needs_composite:
-                np_arr = composite_frame(np_arr, tw, th, bg,
-                                         title_overlay=cfg.title_overlay_text if cfg.show_title_overlay else "",
-                                         subtitle_overlay=cfg.subtitle_text if cfg.show_title_overlay else "")
-        return idx, np_arr
-
-    with ThreadPoolExecutor(max_workers=cfg.max_workers) as executor:
-        futures = {executor.submit(render_task, (i, t)): i for i, t in enumerate(tasks)}
-        for future in as_completed(futures):
-            if abort_check and abort_check():
-                executor.shutdown(wait=False, cancel_futures=True); return None
-            try:
-                idx, np_arr = future.result(); frames[idx] = np_arr
-            except Exception as e:
-                log(f"Frame render error: {e}", "EXPORT")
-    frames = [f for f in frames if f is not None]
-    if not frames: return None
-    return frames
-
-def _post_process_frames(frames, cfg, abort_check=None):
-    if not frames: return frames
-    target_h, target_w = cfg.target_height, cfg.target_width
-    needs_resize = any(f.shape[0] != target_h or f.shape[1] != target_w for f in frames if f is not None)
-    if needs_resize:
-        frame_ptrs = np.empty(len(frames), dtype=object)
-        for i, f in enumerate(frames): frame_ptrs[i] = f
-        frames_np = _normalize_frames_nb(frame_ptrs, target_h, target_w)
-        frames = [frames_np[i] for i in range(len(frames))]
-    use_gpu = (HAS_CUPY and cfg.gpu_post_process and
-               (cfg.gpu_vignette > 0 or cfg.gpu_contrast != 1.0 or cfg.gpu_saturation != 1.0))
-    if use_gpu:
-        try: frames = _gpu_post_process(frames, cfg)
-        except Exception as e:
-            log(f"CuPy GPU post-processing failed ({e}), skipping", "EXPORT")
-    return frames
-
-def _gpu_post_process(frames, cfg):
-    n = len(frames)
-    if n == 0: return frames
-    h, w, c = frames[0].shape; frame_bytes = h * w * c
-    chunk = max(1, min(200, (1 << 30) // frame_bytes)); result = [None] * n
-    for start in range(0, n, chunk):
-        end = min(start + chunk, n); stack_np = np.stack(frames[start:end])
-        gpu = _cp_export.asarray(stack_np)
-        if cfg.gpu_contrast != 1.0 or cfg.gpu_saturation != 1.0:
-            gpu = _gpu_color_grade(gpu, contrast=cfg.gpu_contrast, saturation=cfg.gpu_saturation)
-        if cfg.gpu_vignette > 0.0: gpu = _gpu_vignette(gpu, strength=cfg.gpu_vignette)
-        cpu = _cp_export.asnumpy(gpu)
-        for i in range(end - start): result[start + i] = cpu[i]
-        del gpu, stack_np, cpu
-        _cp_export.get_default_memory_pool().free_all_blocks()
-    return result
-
-def _write_mp4(filepath, frames, fps, cfg=None):
-    if not HAS_NUMPY or not HAS_IMAGEIO:
-        return False, "ERROR: Missing numpy or imageio"
-    use_ffmpeg = HAS_FFMPEG and (cfg.use_ffmpeg if cfg else True)
-    if use_ffmpeg and cfg and len(frames) > 0:
-        h, w = frames[0].shape[:2]
-        try:
-            tmp_dir = tempfile.mkdtemp(prefix="chess_frames_")
-            write_frames_to_disk(frames, tmp_dir)
-            crf = cfg.ffmpeg_crf if cfg else 20
-            preset = cfg.ffmpeg_preset if cfg else "medium"
-            ok, msg = write_mp4_ffmpeg(tmp_dir, filepath, fps, w, h, crf, preset)
-            try: shutil.rmtree(tmp_dir)
-            except OSError: pass
-            if ok: return True, msg
-            log(f"FFmpeg encode failed ({msg}), falling back to imageio", "EXPORT")
-        except Exception as e:
-            log(f"FFmpeg encode error ({e}), falling back to imageio", "EXPORT")
-    try:
-        import imageio.v3 as iio; iio.imwrite(filepath, frames, fps=fps)
-        return True, f"Saved: {filepath}"
-    except AttributeError:
-        try:
-            import imageio; imageio.mimwrite(filepath, frames, fps=fps)
-            return True, f"Saved: {filepath}"
-        except Exception as e2: return False, f"Error writing {filepath}: {e2}"
-    except Exception as e: return False, f"Error writing {filepath}: {e}"
-
-def _write_gif(filepath, frames, fps, cfg=None):
-    if HAS_FFMPEG and len(frames) > 0:
-        h, w = frames[0].shape[:2]
-        try:
-            tmp_dir = tempfile.mkdtemp(prefix="chess_gif_")
-            write_frames_to_disk(frames, tmp_dir)
-            ok, msg = write_gif_ffmpeg(tmp_dir, filepath, fps, w, h)
-            try: shutil.rmtree(tmp_dir)
-            except OSError: pass
-            if ok: return True, msg
-        except Exception as e:
-            log(f"FFmpeg GIF failed ({e}), trying imageio", "EXPORT")
-    try:
-        import imageio.v3 as iio; iio.imwrite(filepath, frames, fps=fps, loop=0)
-        return True, f"Saved GIF: {filepath}"
-    except Exception as e: return False, f"GIF error: {e}"
-
-def _add_audio(video_path, cfg):
-    audio_path = cfg.audio_path
-    if not audio_path or not os.path.exists(audio_path): return video_path, ""
-    base, ext = os.path.splitext(video_path); audio_out = base + "_audio" + ext
-    ok, msg = mix_audio_ffmpeg(video_path, audio_path, audio_out, volume=cfg.audio_volume)
-    if ok:
-        try: os.replace(audio_out, video_path); return video_path, msg
-        except OSError: return audio_out, msg
-    else:
-        log(f"Audio mixing failed: {msg}", "EXPORT"); return video_path, msg
-
-def composite_frame(board_np, target_w, target_h, bg, title_overlay="", subtitle_overlay=""):
-    canvas = np.full((target_h, target_w, 3), bg, dtype=np.uint8)
-    bh, bw = board_np.shape[:2]
-    x = (target_w - bw) // 2; y = (target_h - bh) // 2
-    y1, y2 = max(0, y), min(target_h, y + bh); x1, x2 = max(0, x), min(target_w, x + bw)
-    by1, by2 = y1 - y, y2 - y; bx1, bx2 = x1 - x, x2 - x
-    canvas[y1:y2, x1:x2] = board_np[by1:by2, bx1:bx2]
-    if title_overlay or subtitle_overlay:
-        canvas = _render_overlays(canvas, title_overlay, subtitle_overlay)
-    return canvas
-
-def composite_card_frame(card_np, target_w, target_h, bg):
-    canvas = np.full((target_h, target_w, 3), bg, dtype=np.uint8)
-    ch, cw = card_np.shape[:2]
-    x = (target_w - cw) // 2; y = (target_h - ch) // 2
-    y1, y2 = max(0, y), min(target_h, y + ch); x1, x2 = max(0, x), min(target_w, x + cw)
-    by1, by2 = y1 - y, y2 - y; bx1, bx2 = x1 - x, x2 - x
-    canvas[y1:y2, x1:x2] = card_np[by1:by2, bx1:bx2]
-    return canvas
-
-def _render_overlays(canvas, title_text, subtitle_text):
-    h, w = canvas.shape[:2]
-    img = QImage(canvas.data, w, h, w * 3, QImage.Format_RGB888).copy()
-    p = QPainter(img); p.setRenderHint(QPainter.TextAntialiasing)
-    if title_text:
-        font_size = max(16, int(min(w, h) * 0.04))
-        p.setFont(QFont("Sans", font_size, QFont.Bold)); p.setPen(QColor(220, 220, 220, 200))
-        margin = int(h * 0.02)
-        p.drawText(QRect(margin, margin, w - 2 * margin, font_size + 10), Qt.AlignLeft | Qt.AlignTop, title_text)
-    if subtitle_text:
-        font_size = max(12, int(min(w, h) * 0.025))
-        p.setFont(QFont("Sans", font_size)); p.setPen(QColor(180, 180, 180, 180))
-        margin = int(h * 0.02); top = h - font_size - margin - 10
-        p.drawText(QRect(margin, top, w - 2 * margin, font_size + 10), Qt.AlignLeft | Qt.AlignBottom, subtitle_text)
-    p.end()
-    ptr = img.constBits()
-    if hasattr(ptr, 'setsize'): ptr.setsize(img.sizeInBytes())
-    raw = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w * 3).copy()
-    return raw.reshape(h, w, 3)
-
-def write_frames_to_disk(frames, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    if HAS_IMAGEIO:
-        import imageio.v3 as iio
-        for i, frame in enumerate(frames):
-            iio.imwrite(os.path.join(output_dir, f"frame_{i:06d}.png"), frame)
-    else:
-        for i, frame in enumerate(frames):
-            h, w = frame.shape[:2]
-            img = QImage(frame.copy().data, w, h, w * 3, QImage.Format_RGB888).copy()
-            img.save(os.path.join(output_dir, f"frame_{i:06d}.png"))
-    log(f"Wrote {len(frames)} frames to {output_dir}", "VIDEO")
-
-def write_mp4_ffmpeg(frame_dir, output_path, fps, width, height, crf=20, preset="medium"):
-    if not HAS_FFMPEG: return False, "FFmpeg not found on PATH"
-    cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i", os.path.join(frame_dir, "frame_%06d.png"),
-           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(crf), "-preset", preset,
-           "-movflags", "+faststart", output_path]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode == 0: return True, f"Saved MP4: {output_path}"
-        return False, f"FFmpeg error: {result.stderr[:300]}"
-    except FileNotFoundError: return False, "FFmpeg binary not found"
-    except subprocess.TimeoutExpired: return False, "FFmpeg encode timed out"
-
-def write_gif_ffmpeg(frame_dir, output_path, fps, width, height):
-    if not HAS_FFMPEG: return False, "FFmpeg not found on PATH"
-    cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i", os.path.join(frame_dir, "frame_%06d.png"),
-           "-filter_complex", f"[0:v] fps={fps},split [a][b];[a] palettegen [p];[b][p] paletteuse",
-           output_path]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode == 0: return True, f"Saved GIF: {output_path}"
-        return False, f"FFmpeg GIF error: {result.stderr[:300]}"
-    except FileNotFoundError: return False, "FFmpeg binary not found"
-    except subprocess.TimeoutExpired: return False, "FFmpeg GIF encode timed out"
-
-def mix_audio_ffmpeg(video_path, audio_path, output_path, volume=0.25):
-    if not HAS_FFMPEG: return False, "FFmpeg not found on PATH"
-    cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
-           "-filter_complex", f"[1:a]volume={volume}[a]",
-           "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-shortest", output_path]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode == 0: return True, "Audio mixed successfully"
-        return False, f"FFmpeg audio error: {result.stderr[:300]}"
-    except FileNotFoundError: return False, "FFmpeg binary not found"
-    except subprocess.TimeoutExpired: return False, "FFmpeg audio mix timed out"
-
-class ExportWorker(QThread):
-    progress = Signal(int); finished = Signal(str)
-    def __init__(self, puzzle, file_path, config=None):
-        super().__init__()
-        self.puzzle = puzzle; self.file_path = file_path
-        self.config = config or ExportConfig(); self._abort = False
-    def abort(self): self._abort = True
-    def run(self):
-        if not HAS_NUMPY or not HAS_IMAGEIO:
-            self.finished.emit("ERROR: Missing numpy or imageio"); return
-        log(f"Exporting '{self.puzzle['name']}' -> {self.file_path}", "EXPORT")
-        self.progress.emit(5)
-        frames = _render_puzzle_frames(self.puzzle, self.config, abort_check=lambda: self._abort)
-        if frames is None: self.finished.emit("Export cancelled."); return
-        self.progress.emit(50)
-        frames = _post_process_frames(frames, self.config, abort_check=lambda: self._abort)
-        if frames is None: self.finished.emit("Export cancelled."); return
-        self.progress.emit(70)
-        if self.config.export_gif:
-            ok, msg = _write_gif(self.file_path, frames, self.config.gif_fps, self.config)
-        else:
-            ok, msg = _write_mp4(self.file_path, frames, self.config.fps, self.config)
-        self.progress.emit(85)
-        if ok and self.config.audio_path:
-            final_path, audio_msg = _add_audio(self.file_path, self.config)
-            if audio_msg: msg = msg + " | " + audio_msg
-        self.progress.emit(100 if ok else 0); self.finished.emit(msg)
-
-class BatchExportWorker(QThread):
-    batch_progress = Signal(int, int, str); puzzle_progress = Signal(int, int)
-    puzzle_done = Signal(int, str); puzzle_error = Signal(int, str)
-    all_done = Signal(int, int, str)
-    def __init__(self, puzzles, output_dir, config=None):
-        super().__init__()
-        self.puzzles = puzzles; self.output_dir = output_dir
-        self.config = config or ExportConfig(); self._abort = False
-    def abort(self): self._abort = True
-    def _unique_path(self, base_name, ext=None):
-        if ext is None: ext = ".gif" if self.config.export_gif else ".mp4"
-        safe = sanitize_filename(base_name)
-        path = os.path.join(self.output_dir, safe + ext)
-        if not os.path.exists(path): return path
-        i = 2
-        while True:
-            path = os.path.join(self.output_dir, f"{safe}_{i}{ext}")
-            if not os.path.exists(path): return path
-            i += 1
-    def run(self):
-        if not HAS_NUMPY or not HAS_IMAGEIO:
-            self.all_done.emit(0, len(self.puzzles), self.output_dir); return
-        os.makedirs(self.output_dir, exist_ok=True)
-        total = len(self.puzzles); exported = 0; errors = 0
-        for i, puzzle in enumerate(self.puzzles):
-            if self._abort: break
-            name = puzzle.get('name', f'puzzle_{i+1}')
-            self.batch_progress.emit(i, total, name); self.puzzle_progress.emit(i, 0)
-            filepath = self._unique_path(name)
-            try:
-                frames = _render_puzzle_frames(puzzle, self.config, abort_check=lambda: self._abort)
-                if frames is None: self.puzzle_error.emit(i, "Cancelled"); errors += 1; continue
-                self.puzzle_progress.emit(i, 40)
-                frames = _post_process_frames(frames, self.config, abort_check=lambda: self._abort)
-                if frames is None: self.puzzle_error.emit(i, "Cancelled"); errors += 1; continue
-                self.puzzle_progress.emit(i, 70)
-                if self.config.export_gif:
-                    ok, msg = _write_gif(filepath, frames, self.config.gif_fps, self.config)
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Left:
+            self.undo()
+        elif event.key() == Qt.Key_Right:
+            if self._puzzle_mode:
+                self.puzzle_next_move()
+        elif event.key() == Qt.Key_Space:
+            if self._puzzle_mode:
+                if self._auto_play:
+                    self.stop_auto_play()
                 else:
-                    ok, msg = _write_mp4(filepath, frames, self.config.fps, self.config)
-                if ok:
-                    if self.config.audio_path and not self.config.export_gif:
-                        final_path, audio_msg = _add_audio(filepath, self.config)
-                        if audio_msg: msg = msg + " | " + audio_msg
-                    exported += 1; self.puzzle_done.emit(i, filepath); self.puzzle_progress.emit(i, 100)
-                else:
-                    errors += 1; self.puzzle_error.emit(i, msg)
-            except Exception as e:
-                errors += 1; self.puzzle_error.emit(i, f"Error: {e}")
-        self.all_done.emit(exported, errors, self.output_dir)
+                    self.start_auto_play()
+        elif event.key() == Qt.Key_R:
+            if self._puzzle_mode:
+                self.puzzle_reset()
+        elif event.key() == Qt.Key_F:
+            self.set_flipped(not self.flipped)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN WINDOW (Puzzle App)
-# ═══════════════════════════════════════════════════════════════════════════════
+    # ── Painting ──
 
-class CheckableListWidget(QListWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent); self.setItemAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-    def add_checkable_item(self, text, data=None, checked=False):
-        item = QListWidgetItem(text)
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-        if data is not None: item.setData(Qt.UserRole, data)
-        self.addItem(item); return item
+    def paintEvent(self, event) -> None:
+        img = BoardRenderer.render(
+            self.engine.board,
+            last_move=self.engine.last_move,
+            selected=self._selected,
+            legal_targets=self._legal_targets,
+            check_squares=self.engine.check_squares(),
+            anim_state=self._anim_state,
+            sq_size=self.sq_size,
+            theme=self.theme,
+            flipped=self.flipped,
+            text_overlay=self._overlay,
+        )
+        qp = QPainter(self)
+        qp.drawImage(0, 0, img)
+        qp.end()
 
-class MainWindow(QWidget):
-    _PAGE_SIZE = 100
+    # ── Private ──
 
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("♚ Chess Puzzle App")
-        log("Initializing Chess Puzzle App...", "APP")
-        self._apply_professional_style()
-        self.engine = ChessEngine(); self.snd = SoundManager()
-        self.db = DataProvider()
-        self.board_widget = ChessBoardWidget(self.engine, self.snd)
-        self.board_widget.move_made.connect(self.on_move)
-        self.export_worker = None; self.batch_worker = None
-        self.puzzles_loaded = False; self._active_workers = []
-        self._pz_page = 0; self._pz_checked = set()
-        layout = QHBoxLayout(self); layout.setContentsMargins(12, 12, 12, 12); layout.setSpacing(12)
-        self.tabs = QTabWidget(); self.tabs.setFixedWidth(460); layout.addWidget(self.tabs)
-        board_frame = QFrame(); board_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
-        board_frame.setStyleSheet("QFrame { border: 1px solid #4a4a4f; border-radius: 6px; background: #25252a; }")
-        bl = QVBoxLayout(board_frame); bl.setContentsMargins(8, 8, 8, 8); bl.setSpacing(8)
-        top_ctrl = QHBoxLayout(); top_ctrl.addWidget(QLabel("Theme:"))
-        self.theme_cb = QComboBox(); self.theme_cb.addItems(THEMES.keys())
-        self.theme_cb.currentTextChanged.connect(self._change_theme); top_ctrl.addWidget(self.theme_cb)
-        top_ctrl.addStretch(); top_ctrl.addWidget(QLabel("Speed:"))
-        self.anim_slider = QSlider(Qt.Horizontal); self.anim_slider.setRange(0, 600)
-        self.anim_slider.setValue(600 - ANIM_SPEED_DEFAULT); self.anim_slider.setInvertedAppearance(True)
-        self.anim_slider.setFixedWidth(120)
-        self.anim_lbl = QLabel(self._fmt_anim(ANIM_SPEED_DEFAULT))
-        self.anim_slider.valueChanged.connect(self._update_anim_speed)
-        top_ctrl.addWidget(self.anim_slider); top_ctrl.addWidget(self.anim_lbl); bl.addLayout(top_ctrl)
-        bl.addWidget(self.board_widget, alignment=Qt.AlignCenter); layout.addWidget(board_frame, alignment=Qt.AlignCenter)
-        self._build_puzzle_tab(); self._build_settings_tab()
-        self.snd.play("start"); log("App initialization complete", "APP")
-        QTimer.singleShot(50, lambda: self._start_data_load("puzzles"))
-
-    def closeEvent(self, event):
-        log("Closing application...", "APP")
-        for worker in self._active_workers[:]:
-            if worker.isRunning(): worker.abort(); worker.wait(2000)
-        if self.export_worker and self.export_worker.isRunning():
-            self.export_worker.abort(); self.export_worker.wait(2000)
-        if self.batch_worker and self.batch_worker.isRunning():
-            self.batch_worker.abort(); self.batch_worker.wait(2000)
-        self.db.flush(); self.snd.cleanup(); event.accept()
-
-    def on_move(self, notation):
-        if self.engine.game_over:
-            if self.engine.board.is_checkmate(): self.puzzle_status.setText("♔ Checkmate!")
-            elif self.engine.board.is_stalemate(): self.puzzle_status.setText("½ Stalemate — Draw")
-            elif self.engine.board.is_insufficient_material(): self.puzzle_status.setText("½ Insufficient material — Draw")
-            else: self.puzzle_status.setText(f"Game over: {self.engine.result}")
-        self.board_widget.update()
-
-    def _apply_professional_style(self):
-        self.setStyleSheet("""
-            QWidget { font-family: 'Segoe UI', Arial, sans-serif; color: #d0d0d0; }
-            QGroupBox { font-weight: bold; border: 1px solid #4a4a4f; border-radius: 6px;
-                margin-top: 14px; padding: 12px 8px 8px 8px; background-color: #2e2e32; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #a0a0a8; }
-            QPushButton { padding: 6px 14px; border-radius: 4px; background-color: #3c3f41;
-                border: 1px solid #4a4a4f; color: #d0d0d0; }
-            QPushButton:hover { background-color: #4e5254; border-color: #606068; }
-            QPushButton:pressed { background-color: #2d2f30; }
-            QPushButton:disabled { background-color: #2a2a2e; color: #606068; border-color: #333338; }
-            QTabWidget::pane { border: 1px solid #4a4a4f; border-radius: 4px; background-color: #25252a; }
-            QTabBar::tab { padding: 8px 18px; border: 1px solid #4a4a4f; border-bottom: none;
-                border-top-left-radius: 6px; border-top-right-radius: 6px;
-                background: #2e2e32; color: #a0a0a8; font-weight: bold; }
-            QTabBar::tab:selected { background: #3c3f41; color: #ffffff; }
-            QListWidget { border: 1px solid #4a4a4f; border-radius: 4px; background-color: #25252a; padding: 2px; }
-            QListWidget::item { padding: 4px; border-bottom: 1px solid #333338; }
-            QListWidget::item:hover { background-color: #3c3f41; }
-            QListWidget::item:selected { background-color: #4e5254; color: white; }
-            QLineEdit, QSpinBox, QComboBox { padding: 4px 8px; border: 1px solid #4a4a4f;
-                border-radius: 4px; background-color: #25252a; color: #d0d0d0; }
-            QComboBox::drop-down { border: none; }
-            QSlider::groove:horizontal { border: 1px solid #4a4a4f; height: 6px;
-                background: #25252a; border-radius: 3px; }
-            QSlider::handle:horizontal { background: #a0a0a8; border: 1px solid #4a4a4f;
-                width: 14px; margin: -5px 0; border-radius: 7px; }
-            QTextEdit { border: 1px solid #4a4a4f; border-radius: 4px;
-                background-color: #25252a; color: #d0d0d0; }
-            QProgressBar { border: 1px solid #4a4a4f; border-radius: 4px; text-align: center;
-                background-color: #25252a; color: white; height: 20px; font-weight: bold; }
-            QProgressBar::chunk { background-color: #5c9fd6; border-radius: 3px; }
-        """)
-
-    # ── Theme / animation helpers ────────────────────────────────────────
-
-    def _change_theme(self, name):
-        if name in THEMES:
-            self.board_widget.current_theme = THEMES[name]; self.board_widget.update()
-            self.theme_cb.blockSignals(True); self.theme_cb.setCurrentText(name); self.theme_cb.blockSignals(False)
-            if hasattr(self, 'settings_theme_cb'):
-                self.settings_theme_cb.blockSignals(True)
-                self.settings_theme_cb.setCurrentText(name)
-                self.settings_theme_cb.blockSignals(False)
-
-    def _fmt_anim(self, ms):
-        if ms == 0: return "Instant"
-        if ms <= 100: return f"Fast ({ms}ms)"
-        if ms <= 350: return f"Normal ({ms}ms)"
-        return f"Slow ({ms}ms)"
-
-    def _update_anim_speed(self, raw_val):
-        val = 600 - raw_val; self.board_widget.anim_speed = val
-        self.anim_lbl.setText(self._fmt_anim(val))
-        self.anim_slider.blockSignals(True); self.anim_slider.setValue(raw_val); self.anim_slider.blockSignals(False)
-        if hasattr(self, 'settings_anim_slider'):
-            self.settings_anim_lbl.setText(self._fmt_anim(val))
-            self.settings_anim_slider.blockSignals(True)
-            self.settings_anim_slider.setValue(raw_val); self.settings_anim_slider.blockSignals(False)
-
-    # ── Thread-safe data loading ─────────────────────────────────────────
-
-    def _start_data_load(self, db_type, single_file=None):
-        self.puzzle_list.clear()
-        self.puzzle_list.add_checkable_item("Loading puzzles…", checked=False)
-        self.puzzles_loaded = False
-        if single_file:
-            worker = DataLoadWorker(db_type, single_file=single_file)
+    def _pixel_to_rc(self, pos) -> Tuple[int, int]:
+        x, y = pos.x(), pos.y()
+        if self.flipped:
+            col = 7 - x // self.sq_size
+            row = 7 - y // self.sq_size
         else:
-            directory = str(Path(DATA_DIR) / db_type)
-            worker = DataLoadWorker(db_type, directory=directory)
-        worker.setObjectName(f"DataLoadWorker_{db_type}")
-        worker.data_ready.connect(self._on_data_ready)
-        worker.load_error.connect(self._on_load_error)
-        worker.finished.connect(lambda w=worker: self._cleanup_worker(w))
-        self._active_workers.append(worker); worker.start()
+            col = x // self.sq_size
+            row = y // self.sq_size
+        return row, col
 
-    def _on_data_ready(self, db_type, total_count):
-        self.db.reload(db_type); self.puzzles_loaded = True
-        self._pz_checked.clear(); self._pz_page = 0
-        self._populate_puzzle_page()
-        self.puzzle_db_status.setText(f"Loaded {total_count:,} puzzles")
+    def _is_our_piece(self, piece: chess.Piece) -> bool:
+        return ((piece.color == chess.WHITE and self.engine.turn == 'w') or
+                (piece.color == chess.BLACK and self.engine.turn == 'b'))
 
-    def _on_load_error(self, db_type, error_msg):
-        log(f"Load error ({db_type}): {error_msg}", "DATA")
-        self.puzzle_db_status.setText(f"Error: {error_msg}")
+    def _play_move_sound(self, info: MoveInfo) -> None:
+        if info.is_mate:
+            self.sound.play("checkmate")
+        elif info.is_check:
+            self.sound.play("check")
+        elif info.is_castle:
+            self.sound.play("castle")
+        elif info.captured != '.':
+            self.sound.play("capture")
+        elif info.promo:
+            self.sound.play("promote")
+        else:
+            self.sound.play("move")
 
-    def _cleanup_worker(self, worker):
-        if worker in self._active_workers: self._active_workers.remove(worker)
-        if not worker.isRunning(): worker.deleteLater()
-        else: worker.finished.connect(worker.deleteLater)
+    def _prompt_promotion(self) -> Optional[int]:
+        items = [
+            ("Queen", chess.QUEEN), ("Rook", chess.ROOK),
+            ("Bishop", chess.BISHOP), ("Knight", chess.KNIGHT),
+        ]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Promote pawn")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        result = [None]
 
-    # ════════════════════════════════════════════════════════════════════════
-    #  PUZZLE TAB
-    # ════════════════════════════════════════════════════════════════════════
+        for label, piece_type in items:
+            btn = QPushButton(label)
+            btn.setProperty("accent", True)
+            pt = piece_type
 
-    def _build_puzzle_tab(self):
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        container = QWidget(); l = QVBoxLayout(container); l.setSpacing(12)
+            def make_cb(p):
+                def cb():
+                    result[0] = p
+                    dialog.accept()
+                return cb
+            btn.clicked.connect(make_cb(pt))
+            layout.addWidget(btn)
 
-        # ── 1. Database ──────────────────────────────────────────────────
-        db_group = QGroupBox("📂 Puzzle Database"); db_layout = QVBoxLayout(db_group)
-        path_row = QHBoxLayout()
-        self.puzzle_db_path = QLineEdit()
-        self.puzzle_db_path.setPlaceholderText("Database file path (.csv .parquet .pq .duckdb .db .sqlite)…")
-        path_row.addWidget(self.puzzle_db_path, 1)
-        btn_load_db = QPushButton("Load"); btn_load_db.clicked.connect(self.load_puzzle_db)
-        path_row.addWidget(btn_load_db); db_layout.addLayout(path_row)
-        self.puzzle_db_status = QLabel("No database loaded")
-        self.puzzle_db_status.setAlignment(Qt.AlignCenter)
-        db_layout.addWidget(self.puzzle_db_status); l.addWidget(db_group)
+        dialog.exec()
+        return result[0]
 
-        # ── 2. Filter & Selection ────────────────────────────────────────
-        filter_group = QGroupBox("🔍 Filter & Selection"); fl = QVBoxLayout(filter_group)
-        filter_row = QHBoxLayout()
-        self.puzzle_filter = QLineEdit(); self.puzzle_filter.setPlaceholderText("Filter puzzles…")
-        filter_row.addWidget(self.puzzle_filter, 1); fl.addLayout(filter_row)
-        self._pz_filter_timer = QTimer(); self._pz_filter_timer.setSingleShot(True)
-        self._pz_filter_timer.setInterval(300); self._pz_filter_timer.timeout.connect(self._apply_puzzle_filter)
-        self.puzzle_filter.textChanged.connect(lambda: self._pz_filter_timer.start())
-        sel_row = QHBoxLayout()
-        btn_all = QPushButton("All"); btn_all.setFixedWidth(55); btn_all.clicked.connect(self._puzzle_select_all)
-        btn_none = QPushButton("None"); btn_none.setFixedWidth(55); btn_none.clicked.connect(self._puzzle_select_none)
-        btn_inv = QPushButton("Invert"); btn_inv.setFixedWidth(60); btn_inv.clicked.connect(self._puzzle_select_invert)
-        sel_row.addWidget(btn_all); sel_row.addWidget(btn_none)
-        sel_row.addWidget(btn_inv); sel_row.addStretch(); fl.addLayout(sel_row)
-        range_row = QHBoxLayout()
-        self.puzzle_range_from = QSpinBox(); self.puzzle_range_from.setRange(1, 999999); self.puzzle_range_from.setPrefix("#")
-        self.puzzle_range_to = QSpinBox(); self.puzzle_range_to.setRange(1, 999999); self.puzzle_range_to.setPrefix("#")
-        btn_range = QPushButton("Apply Range"); btn_range.clicked.connect(self._puzzle_select_range)
-        range_row.addWidget(QLabel("From:")); range_row.addWidget(self.puzzle_range_from)
-        range_row.addWidget(QLabel("To:")); range_row.addWidget(self.puzzle_range_to)
-        range_row.addWidget(btn_range); fl.addLayout(range_row)
-        self.puzzle_sel_label = QLabel("Selected: 0")
-        self.puzzle_sel_label.setAlignment(Qt.AlignRight); fl.addWidget(self.puzzle_sel_label)
-        l.addWidget(filter_group)
+    def _clear_state(self) -> None:
+        self._selected = None
+        self._legal_targets = []
+        self._anim_state = None
+        self._anim_timer.stop()
+        self._pending_info = None
+        self._puzzle_mode = False
+        self._puzzle_moves = []
+        self._puzzle_idx = 0
+        self._auto_play = False
+        self._auto_timer.stop()
+        self._overlay = ""
 
-        # ── 3. Puzzle List ───────────────────────────────────────────────
-        list_group = QGroupBox("📋 Puzzles"); ll = QVBoxLayout(list_group)
-        self.puzzle_list = CheckableListWidget(); self.puzzle_list.setMaximumHeight(160)
-        self.puzzle_list.itemChanged.connect(self._on_puzzle_item_changed)
-        ll.addWidget(self.puzzle_list)
-        nav = QHBoxLayout()
-        self.btn_pz_prev = QPushButton("◀"); self.btn_pz_prev.clicked.connect(self._pz_prev_page)
-        self.pz_page_lbl = QLabel("Page 0 / 0"); self.pz_page_lbl.setAlignment(Qt.AlignCenter)
-        self.btn_pz_next = QPushButton("▶"); self.btn_pz_next.clicked.connect(self._pz_next_page)
-        nav.addWidget(self.btn_pz_prev); nav.addWidget(self.pz_page_lbl, 1); nav.addWidget(self.btn_pz_next)
-        nav.addWidget(QLabel("Jump:"))
-        self.pz_jump_spin = QSpinBox(); self.pz_jump_spin.setRange(1, 999999); self.pz_jump_spin.setFixedWidth(65)
-        btn_jump = QPushButton("Go"); btn_jump.setFixedWidth(35); btn_jump.clicked.connect(self._pz_jump_page)
-        nav.addWidget(self.pz_jump_spin); nav.addWidget(btn_jump); ll.addLayout(nav)
-        btn_load = QPushButton("📋 Load Selected Puzzle to Board")
-        btn_load.clicked.connect(self.load_puzzle); ll.addWidget(btn_load); l.addWidget(list_group)
+    def _clear_overlay(self) -> None:
+        self._overlay = ""
+        self.update()
 
-        # ── 4. Export Settings ───────────────────────────────────────────
-        export_group = QGroupBox("🎬 Export Configuration"); eform = QFormLayout(export_group); eform.setSpacing(8)
-        self.exp_preset = QComboBox(); self.exp_preset.addItems(EXPORT_PRESETS.keys())
-        self.exp_preset.setCurrentText("Board Only (544×544)"); eform.addRow("Preset:", self.exp_preset)
-        self.exp_title = QLineEdit(); self.exp_title.setPlaceholderText("Leave blank for puzzle name")
-        eform.addRow("Title:", self.exp_title)
-        self.exp_end = QLineEdit("Solved!"); eform.addRow("End text:", self.exp_end)
-        row_fps = QHBoxLayout()
-        self.exp_fps = QSpinBox(); self.exp_fps.setRange(10, 120); self.exp_fps.setValue(30)
-        self.exp_workers = QSpinBox(); self.exp_workers.setRange(1, 16); self.exp_workers.setValue(4)
-        row_fps.addWidget(self.exp_fps); row_fps.addWidget(QLabel("Workers:")); row_fps.addWidget(self.exp_workers)
-        eform.addRow("FPS:", row_fps)
-        row_theme = QHBoxLayout()
-        self.exp_theme = QComboBox(); self.exp_theme.addItems(THEMES.keys())
-        self.exp_theme.setCurrentText(self.theme_cb.currentText()); row_theme.addWidget(self.exp_theme)
-        eform.addRow("Theme:", row_theme)
-        self.exp_outdir = QLineEdit(); self.exp_outdir.setPlaceholderText("Output directory…")
-        eform.addRow("Output:", self.exp_outdir)
-        row_format = QHBoxLayout()
-        self.exp_gif = QCheckBox("Export as GIF"); row_format.addWidget(self.exp_gif)
-        self.exp_gif_fps = QSpinBox(); self.exp_gif_fps.setRange(5, 30); self.exp_gif_fps.setValue(12)
-        self.exp_gif_fps.setEnabled(False); self.exp_gif.toggled.connect(self.exp_gif_fps.setEnabled)
-        row_format.addWidget(QLabel("GIF FPS:")); row_format.addWidget(self.exp_gif_fps)
-        eform.addRow("Format:", row_format)
-        self.exp_gpu = QCheckBox("GPU post-process")
-        self.exp_gpu.setChecked(HAS_CUPY); self.exp_gpu.setEnabled(HAS_CUPY); eform.addRow(self.exp_gpu)
-        row_gpu1 = QHBoxLayout()
-        self.exp_vignette = QSlider(Qt.Horizontal); self.exp_vignette.setRange(0, 100); self.exp_vignette.setValue(25)
-        self.exp_vignette_lbl = QLabel("0.25")
-        self.exp_vignette.valueChanged.connect(lambda v: self.exp_vignette_lbl.setText(f"{v/100:.2f}"))
-        row_gpu1.addWidget(self.exp_vignette, 1); row_gpu1.addWidget(self.exp_vignette_lbl)
-        eform.addRow("Vignette:", row_gpu1)
-        row_gpu2 = QHBoxLayout()
-        self.exp_contrast = QSlider(Qt.Horizontal); self.exp_contrast.setRange(80, 150); self.exp_contrast.setValue(102)
-        self.exp_contrast_lbl = QLabel("1.02")
-        self.exp_contrast.valueChanged.connect(lambda v: self.exp_contrast_lbl.setText(f"{v/100:.2f}"))
-        row_gpu2.addWidget(self.exp_contrast, 1); row_gpu2.addWidget(self.exp_contrast_lbl)
-        eform.addRow("Contrast:", row_gpu2)
-        row_gpu3 = QHBoxLayout()
-        self.exp_saturation = QSlider(Qt.Horizontal); self.exp_saturation.setRange(80, 150); self.exp_saturation.setValue(105)
-        self.exp_saturation_lbl = QLabel("1.05")
-        self.exp_saturation.valueChanged.connect(lambda v: self.exp_saturation_lbl.setText(f"{v/100:.2f}"))
-        row_gpu3.addWidget(self.exp_saturation, 1); row_gpu3.addWidget(self.exp_saturation_lbl)
-        eform.addRow("Saturation:", row_gpu3); l.addWidget(export_group)
+    def _anim_tick(self) -> None:
+        if not self._anim_state:
+            self._anim_timer.stop()
+            return
+        elapsed = (time.monotonic() - self._anim_start_time) * 1000
+        progress = min(1.0, elapsed / max(1, self._anim_speed))
+        # Ease-out cubic
+        progress = 1.0 - (1.0 - progress) ** 3
+        self._anim_state['progress'] = progress
+        if progress >= 1.0:
+            self._anim_state = None
+            self._anim_timer.stop()
+        self.update()
 
-        # ── 5. Export Actions ────────────────────────────────────────────
-        action_group = QGroupBox("🚀 Export Actions"); al = QVBoxLayout(action_group)
-        exp_btns = QHBoxLayout()
-        self.btn_export_current = QPushButton("Current"); self.btn_export_current.clicked.connect(self._export_current_puzzle)
-        self.btn_export_selected = QPushButton("Selected"); self.btn_export_selected.clicked.connect(self._export_selected_batch)
-        self.btn_export_all = QPushButton("All"); self.btn_export_all.clicked.connect(self._export_all_batch)
-        exp_btns.addWidget(self.btn_export_current); exp_btns.addWidget(self.btn_export_selected)
-        exp_btns.addWidget(self.btn_export_all); al.addLayout(exp_btns)
-        self.puzzle_progress = QProgressBar(); self.puzzle_progress.setRange(0, 100); self.puzzle_progress.setValue(0)
-        al.addWidget(self.puzzle_progress)
-        self.puzzle_status = QLabel(""); self.puzzle_status.setWordWrap(True); al.addWidget(self.puzzle_status)
-        self.btn_cancel_export = QPushButton("✕ Cancel Export")
-        self.btn_cancel_export.clicked.connect(self._cancel_export); self.btn_cancel_export.setEnabled(False)
-        al.addWidget(self.btn_cancel_export); l.addWidget(action_group)
-        self.puzzle_info = QTextEdit(); self.puzzle_info.setReadOnly(True); self.puzzle_info.setMaximumHeight(50)
-        l.addWidget(self.puzzle_info); l.addStretch(); scroll.setWidget(container)
-        self.tabs.addTab(scroll, "🧩 Puzzles")
+    def _auto_step(self) -> None:
+        if not self.puzzle_next_move():
+            self.stop_auto_play()
 
-    # ── Puzzle pagination helpers ────────────────────────────────────────
-
-    def _pz_total_items(self):
-        return self.db.get_count('puzzles', self.puzzle_filter.text().strip())
-
-    def _pz_page_count(self):
-        return max(1, math.ceil(self._pz_total_items() / self._PAGE_SIZE))
-
-    def _populate_puzzle_page(self):
-        self.puzzle_list.blockSignals(True); self.puzzle_list.clear()
-        filter_text = self.puzzle_filter.text().strip()
-        items = self.db.get_page('puzzles', self._pz_page, self._PAGE_SIZE, filter_text)
-        for item in items:
-            di = item['id']; checked = di in self._pz_checked
-            list_item = self.puzzle_list.add_checkable_item(item["name"], data=item, checked=checked)
-            list_item.setData(Qt.UserRole + 1, di)
-        self.puzzle_list.blockSignals(False)
-        self._update_puzzle_nav(); self._update_puzzle_sel_label()
-
-    def _update_puzzle_nav(self):
-        total = self._pz_total_items(); pc = max(1, math.ceil(total / self._PAGE_SIZE))
-        self.pz_page_lbl.setText(f"Page {self._pz_page + 1} / {pc}  ({total:,} items)")
-        self.btn_pz_prev.setEnabled(self._pz_page > 0)
-        self.btn_pz_next.setEnabled(self._pz_page < pc - 1)
-        self.pz_jump_spin.setRange(1, pc); self.pz_jump_spin.setValue(self._pz_page + 1)
-        count = self.db.get_count('puzzles')
-        self.puzzle_range_from.setRange(1, max(1, count)); self.puzzle_range_to.setRange(1, max(1, count))
-
-    def _update_puzzle_sel_label(self, _item=None):
-        cnt = len(self._pz_checked); total = self.db.get_count('puzzles')
-        self.puzzle_sel_label.setText(f"Selected: {cnt:,} / {total:,}")
-
-    def _on_puzzle_item_changed(self, item):
-        di = item.data(Qt.UserRole + 1)
-        if di is None: return
-        if item.checkState() == Qt.Checked: self._pz_checked.add(di)
-        else: self._pz_checked.discard(di)
-        self._update_puzzle_sel_label()
-
-    def _apply_puzzle_filter(self):
-        self._pz_page = 0; self._populate_puzzle_page()
-
-    def _puzzle_select_all(self):
-        self._pz_checked = set(self.db.get_ids_by_filter('puzzles', self.puzzle_filter.text().strip()))
-        self._populate_puzzle_page()
-
-    def _puzzle_select_none(self):
-        self._pz_checked.clear(); self._populate_puzzle_page()
-
-    def _puzzle_select_invert(self):
-        all_ids = set(self.db.get_ids_by_filter('puzzles', self.puzzle_filter.text().strip()))
-        self._pz_checked = all_ids - self._pz_checked; self._populate_puzzle_page()
-
-    def _puzzle_select_range(self):
-        start = self.puzzle_range_from.value(); end = self.puzzle_range_to.value()
-        if start > end: start, end = end, start
-        all_ids = self.db.get_ids_by_filter('puzzles')
-        for i in range(start - 1, min(end, len(all_ids))):
-            self._pz_checked.add(all_ids[i])
-        self._populate_puzzle_page()
-
-    def _pz_prev_page(self):
-        if self._pz_page > 0: self._pz_page -= 1; self._populate_puzzle_page()
-
-    def _pz_next_page(self):
-        if self._pz_page < self._pz_page_count() - 1: self._pz_page += 1; self._populate_puzzle_page()
-
-    def _pz_jump_page(self):
-        page = self.pz_jump_spin.value() - 1
-        if 0 <= page < self._pz_page_count(): self._pz_page = page; self._populate_puzzle_page()
-
-    # ── Build export config ──────────────────────────────────────────────
-
-    def _build_export_config(self, puzzle_name=""):
-        cfg = ExportConfig()
-        title_text = self.exp_title.text().strip()
-        cfg.title_text = title_text if title_text else puzzle_name
-        cfg.end_text = self.exp_end.text(); cfg.fps = self.exp_fps.value()
-        cfg.max_workers = self.exp_workers.value(); cfg.theme_name = self.exp_theme.currentText()
-        cfg.output_dir = self.exp_outdir.text().strip()
-        cfg.gpu_post_process = self.exp_gpu.isChecked()
-        cfg.gpu_vignette = self.exp_vignette.value() / 100.0
-        cfg.gpu_contrast = self.exp_contrast.value() / 100.0
-        cfg.gpu_saturation = self.exp_saturation.value() / 100.0
-        cfg.apply_preset(self.exp_preset.currentText())
-        cfg.export_gif = self.exp_gif.isChecked(); cfg.gif_fps = self.exp_gif_fps.value()
-        return cfg
-
-    def _ensure_output_dir(self):
-        d = self.exp_outdir.text().strip()
-        if not d: d = (self.settings_outdir.text().strip() if hasattr(self, 'settings_outdir') else "")
-        if not d:
-            d = str(Path(DATA_DIR) / "exports"); self.exp_outdir.setText(d)
-            if hasattr(self, 'settings_outdir'): self.settings_outdir.setText(d)
-        os.makedirs(d, exist_ok=True); return d
-
-    # ── Export: current puzzle ────────────────────────────────────────────
-
-    def _export_current_puzzle(self):
-        item = self.puzzle_list.currentItem()
-        if not item: self.puzzle_status.setText("No puzzle selected."); return
-        pz_slim = item.data(Qt.UserRole)
-        if not pz_slim: self.puzzle_status.setText("No puzzle data."); return
-        full = self.db.get_items_by_ids('puzzles', [pz_slim['id']])
-        if not full: self.puzzle_status.setText("Failed to load puzzle data."); return
-        pz_copy = dict(full[0]); pz_copy['display_title'] = f"Puzzle #{pz_copy['id']}"
-        out_dir = self._ensure_output_dir(); cfg = self._build_export_config(pz_copy.get('display_title', pz_copy['name']))
-        ext = ".gif" if cfg.export_gif else ".mp4"
-        filename = sanitize_filename(pz_copy['name']) + ext
-        filepath = os.path.join(out_dir, filename)
-        if os.path.exists(filepath):
-            base = sanitize_filename(pz_copy['name']); i = 2
-            while os.path.exists(os.path.join(out_dir, f"{base}_{i}{ext}")): i += 1
-            filepath = os.path.join(out_dir, f"{base}_{i}{ext}")
-        log(f"Exporting current puzzle: {pz_copy['name']} -> {filepath}", "EXPORT")
-        self._set_exporting(True)
-        self.export_worker = ExportWorker(pz_copy, filepath, cfg)
-        self.export_worker.progress.connect(self._on_single_progress)
-        self.export_worker.finished.connect(self._on_single_finished)
-        self.export_worker.start()
-
-    def _export_selected_batch(self):
-        if not self._pz_checked: self.puzzle_status.setText("No puzzles checked."); return
-        puzzles = self.db.get_items_by_ids('puzzles', list(self._pz_checked))
-        for p in puzzles: p['display_title'] = f"Puzzle #{p['id']}"
-        self._start_batch_export(puzzles)
-
-    def _export_all_batch(self):
-        total = self.db.get_count('puzzles')
-        if total == 0: self.puzzle_status.setText("No puzzles loaded."); return
-        all_ids = self.db.get_ids_by_filter('puzzles')
-        puzzles = self.db.get_items_by_ids('puzzles', all_ids)
-        for p in puzzles: p['display_title'] = f"Puzzle #{p['id']}"
-        self._start_batch_export(puzzles)
-
-    def _on_single_progress(self, pct):
-        self.puzzle_progress.setValue(pct); self.puzzle_status.setText(f"Rendering… {pct}%")
-
-    def _on_single_finished(self, msg):
-        self.puzzle_status.setText(msg); self.puzzle_progress.setValue(100 if "Saved" in msg else 0)
-        self._set_exporting(False)
-        if self.export_worker: self.export_worker.deleteLater(); self.export_worker = None
-
-    # ── Export: batch ─────────────────────────────────────────────────────
-
-    def _start_batch_export(self, puzzles):
-        out_dir = self._ensure_output_dir(); cfg = self._build_export_config()
-        total = len(puzzles); log(f"Starting batch export: {total} puzzles -> {out_dir}", "EXPORT")
-        self._set_exporting(True, batch=True)
-        self.puzzle_progress.setValue(0); self.puzzle_status.setText(f"Batch: 0 / {total}")
-        if self.batch_worker and self.batch_worker.isRunning():
-            self.batch_worker.abort(); self.batch_worker.wait(3000)
-        self.batch_worker = BatchExportWorker(puzzles, out_dir, cfg)
-        self.batch_worker.batch_progress.connect(self._on_batch_progress)
-        self.batch_worker.puzzle_done.connect(self._on_batch_puzzle_done)
-        self.batch_worker.puzzle_error.connect(self._on_batch_puzzle_error)
-        self.batch_worker.all_done.connect(self._on_batch_all_done)
-        self.batch_worker.start()
-
-    def _on_batch_progress(self, idx, total, name):
-        pct = int(100 * (idx + 1) / total) if total > 0 else 0
-        self.puzzle_progress.setValue(pct); self.puzzle_status.setText(f"Batch [{idx+1}/{total}]: {name}")
-
-    def _on_batch_puzzle_done(self, idx, filepath):
-        log(f"Batch puzzle done: {filepath}", "EXPORT")
-
-    def _on_batch_puzzle_error(self, idx, msg):
-        log(f"Batch puzzle error: {msg}", "EXPORT")
-
-    def _on_batch_all_done(self, exported, errors, out_dir):
-        self.puzzle_progress.setValue(100)
-        self.puzzle_status.setText(f"Batch done: {exported} exported, {errors} errors → {out_dir}")
-        self._set_exporting(False, batch=True)
-        if self.batch_worker: self.batch_worker.deleteLater(); self.batch_worker = None
-
-    # ── Cancel / UI state ────────────────────────────────────────────────
-
-    def _cancel_export(self):
-        if self.export_worker and self.export_worker.isRunning():
-            self.export_worker.abort(); self.puzzle_status.setText("Cancelling…")
-        if self.batch_worker and self.batch_worker.isRunning():
-            self.batch_worker.abort(); self.puzzle_status.setText("Cancelling batch…")
-
-    def _set_exporting(self, busy, batch=False):
-        self.btn_export_current.setEnabled(not busy)
-        self.btn_export_selected.setEnabled(not busy)
-        self.btn_export_all.setEnabled(not busy)
-        self.btn_cancel_export.setEnabled(busy)
-
-    # ── Load puzzle DB ───────────────────────────────────────────────────
-
-    def load_puzzle_db(self):
-        path = self.puzzle_db_path.text().strip()
-        if not path: self.puzzle_db_status.setText("Enter a database path above first."); return
-        if not os.path.exists(path): self.puzzle_db_status.setText(f"File not found: {path}"); return
-        self.puzzle_db_status.setText("Loading…"); self._start_data_load("puzzles", single_file=path)
-
-    # ── Load puzzle to board ─────────────────────────────────────────────
-
-    def load_puzzle(self):
-        item = self.puzzle_list.currentItem()
-        if not item: return
-        pz_slim = item.data(Qt.UserRole)
-        if not pz_slim: return
-        full = self.db.get_items_by_ids('puzzles', [pz_slim['id']])
-        if not full: return
-        pz = full[0]
-        if pz.get("fen"): self.engine.load_fen(pz["fen"])
-        else: self.engine.reset()
-        self.puzzle_info.setText(pz.get("desc", ""))
-        self.board_widget.selected = None; self.board_widget.legal_targets = []
-        self.board_widget.update(); self.snd.play("start")
-
-    # ════════════════════════════════════════════════════════════════════════
-    #  SETTINGS TAB
-    # ════════════════════════════════════════════════════════════════════════
-
-    def _build_settings_tab(self):
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        container = QWidget(); l = QVBoxLayout(container); l.setSpacing(12)
-        appear_group = QGroupBox("🎨 Appearance"); aform = QFormLayout(appear_group)
-        self.settings_theme_cb = QComboBox(); self.settings_theme_cb.addItems(THEMES.keys())
-        self.settings_theme_cb.currentTextChanged.connect(self._change_theme)
-        aform.addRow("Theme:", self.settings_theme_cb)
-        row_anim = QHBoxLayout()
-        self.settings_anim_slider = QSlider(Qt.Horizontal)
-        self.settings_anim_slider.setRange(0, 600); self.settings_anim_slider.setValue(600 - ANIM_SPEED_DEFAULT)
-        self.settings_anim_slider.setInvertedAppearance(True)
-        self.settings_anim_lbl = QLabel(self._fmt_anim(ANIM_SPEED_DEFAULT))
-        self.settings_anim_slider.valueChanged.connect(self._update_anim_speed)
-        row_anim.addWidget(self.settings_anim_slider, 1); row_anim.addWidget(self.settings_anim_lbl)
-        aform.addRow("Anim Speed:", row_anim); l.addWidget(appear_group)
-        path_group = QGroupBox("📁 Default Export Path"); pl = QHBoxLayout(path_group)
-        self.settings_outdir = QLineEdit(str(Path(DATA_DIR) / "exports"))
-        pl.addWidget(self.settings_outdir, 1); l.addWidget(path_group)
-        db_info_group = QGroupBox("💾 Database Info"); db_info_layout = QVBoxLayout(db_info_group)
-        db_info_layout.addWidget(QLabel("Cache format: Parquet (.parquet / .pq)"))
-        db_info_layout.addWidget(QLabel(f"Puzzles cache: {self.db._cache_path('puzzles')}"))
-        l.addWidget(db_info_group); l.addStretch(); scroll.setWidget(container)
-        self.tabs.addTab(scroll, "⚙️ Settings")
+    def cleanup(self) -> None:
+        self._anim_timer.stop()
+        self._auto_timer.stop()
+        self.sound.cleanup()
 
 
-def main():
-    log("Launching Chess Puzzle App…", "APP")
-    app = QApplication(sys.argv); app.setStyle("Fusion")
-    shell = QMainWindow(); shell.setWindowTitle("♚ Chess Puzzle App")
-    shell.setCentralWidget(MainWindow()); shell.resize(1020, 640); shell.show()
-    log("Event loop started", "APP"); sys.exit(app.exec())
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FILTER PANEL — Search & filter controls
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FilterPanel(QWidget):
+    """Side panel with search, difficulty, rating, theme, and sort controls."""
+
+    filter_changed = Signal(FilterCriteria)
+
+    def __init__(self, collection: PuzzleCollection,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._collection = collection
+        self._theme_tags: Set[str] = set()
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        # ── Search ──
+        search_group = QFrame()
+        search_group.setObjectName("searchGroup")
+        sl = QVBoxLayout(search_group)
+        sl.setContentsMargins(12, 12, 12, 8)
+        lbl = QLabel("🔍 Search")
+        lbl.setStyleSheet("font-weight:600; font-size:14px; color:#2D7D9A;")
+        sl.addWidget(lbl)
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Name, theme, opening…")
+        self._search_edit.setClearButtonEnabled(True)
+        self._search_edit.textChanged.connect(self._emit_filter)
+        sl.addWidget(self._search_edit)
+
+        # Autocomplete suggestions
+        self._suggest_list = QListWidget()
+        self._suggest_list.setMaximumHeight(120)
+        self._suggest_list.hide()
+        self._suggest_list.itemClicked.connect(self._apply_suggestion)
+        sl.addWidget(self._suggest_list)
+        layout.addWidget(search_group)
+
+        # ── Difficulty ──
+        diff_group = QFrame()
+        dl = QVBoxLayout(diff_group)
+        dl.setContentsMargins(12, 8, 12, 8)
+        self._diff_label = QLabel("Difficulty: All")
+        self._diff_label.setStyleSheet("font-weight:500;")
+        dl.addWidget(self._diff_label)
+        self._diff_slider = QSlider(Qt.Horizontal)
+        self._diff_slider.setRange(0, 100)
+        self._diff_slider.setValue(0)
+        self._diff_slider.setTickPosition(QSlider.TicksBelow)
+        self._diff_slider.setTickInterval(20)
+        self._diff_slider.valueChanged.connect(self._on_diff_changed)
+        dl.addWidget(self._diff_slider)
+        self._diff_hi_slider = QSlider(Qt.Horizontal)
+        self._diff_hi_slider.setRange(0, 100)
+        self._diff_hi_slider.setValue(100)
+        self._diff_hi_slider.valueChanged.connect(self._on_diff_changed)
+        dl.addWidget(self._diff_hi_slider)
+        layout.addWidget(diff_group)
+
+        # ── Rating ──
+        rating_group = QFrame()
+        rl = QVBoxLayout(rating_group)
+        rl.setContentsMargins(12, 8, 12, 8)
+        self._rating_label = QLabel("Rating: 0–3500")
+        self._rating_label.setStyleSheet("font-weight:500;")
+        rl.addWidget(self._rating_label)
+        rh = QHBoxLayout()
+        self._rating_lo = QSpinBox()
+        self._rating_lo.setRange(0, 3500); self._rating_lo.setValue(0)
+        self._rating_lo.setSingleStep(100)
+        self._rating_lo.valueChanged.connect(self._emit_filter)
+        rh.addWidget(QLabel("Min")); rh.addWidget(self._rating_lo)
+        self._rating_hi = QSpinBox()
+        self._rating_hi.setRange(0, 3500); self._rating_hi.setValue(3500)
+        self._rating_hi.setSingleStep(100)
+        self._rating_hi.valueChanged.connect(self._emit_filter)
+        rh.addWidget(QLabel("Max")); rh.addWidget(self._rating_hi)
+        rl.addLayout(rh)
+        self._require_rating = QCheckBox("Has rating only")
+        self._require_rating.stateChanged.connect(self._emit_filter)
+        rl.addWidget(self._require_rating)
+        layout.addWidget(rating_group)
+
+        # ── Move count ──
+        moves_group = QFrame()
+        ml = QVBoxLayout(moves_group)
+        ml.setContentsMargins(12, 8, 12, 8)
+        self._moves_label = QLabel("Moves: 1–50")
+        self._moves_label.setStyleSheet("font-weight:500;")
+        ml.addWidget(self._moves_label)
+        mh = QHBoxLayout()
+        self._moves_lo = QSpinBox()
+        self._moves_lo.setRange(1, 50); self._moves_lo.setValue(1)
+        self._moves_lo.valueChanged.connect(self._emit_filter)
+        mh.addWidget(QLabel("Min")); mh.addWidget(self._moves_lo)
+        self._moves_hi = QSpinBox()
+        self._moves_hi.setRange(1, 50); self._moves_hi.setValue(50)
+        self._moves_hi.valueChanged.connect(self._emit_filter)
+        mh.addWidget(QLabel("Max")); mh.addWidget(self._moves_hi)
+        ml.addLayout(mh)
+        layout.addWidget(moves_group)
+
+        # ── Theme tags ──
+        theme_group = QFrame()
+        tl = QVBoxLayout(theme_group)
+        tl.setContentsMargins(12, 8, 12, 8)
+        lbl2 = QLabel("🏷 Themes")
+        lbl2.setStyleSheet("font-weight:600; color:#2D7D9A;")
+        tl.addWidget(lbl2)
+        self._theme_edit = QLineEdit()
+        self._theme_edit.setPlaceholderText("Type theme…")
+        self._theme_edit.textChanged.connect(self._on_theme_text)
+        tl.addWidget(self._theme_edit)
+        self._theme_suggest = QListWidget()
+        self._theme_suggest.setMaximumHeight(100)
+        self._theme_suggest.hide()
+        self._theme_suggest.itemClicked.connect(self._add_theme_tag)
+        tl.addWidget(self._theme_suggest)
+        self._tag_layout = QHBoxLayout()
+        self._tag_container = QWidget()
+        self._tag_container.setLayout(self._tag_layout)
+        tl.addWidget(self._tag_container)
+        layout.addWidget(theme_group)
+
+        # ── Sort ──
+        sort_group = QFrame()
+        sol = QVBoxLayout(sort_group)
+        sol.setContentsMargins(12, 8, 12, 8)
+        lbl3 = QLabel("Sort by")
+        lbl3.setStyleSheet("font-weight:500;")
+        sol.addWidget(lbl3)
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItem("Default", SortMode.DEFAULT)
+        self._sort_combo.addItem("Name A→Z", SortMode.NAME_ASC)
+        self._sort_combo.addItem("Name Z→A", SortMode.NAME_DESC)
+        self._sort_combo.addItem("Difficulty ↑", SortMode.DIFFICULTY_ASC)
+        self._sort_combo.addItem("Difficulty ↓", SortMode.DIFFICULTY_DESC)
+        self._sort_combo.addItem("Rating ↑", SortMode.RATING_ASC)
+        self._sort_combo.addItem("Rating ↓", SortMode.RATING_DESC)
+        self._sort_combo.addItem("Moves ↑", SortMode.MOVES_ASC)
+        self._sort_combo.addItem("Moves ↓", SortMode.MOVES_DESC)
+        self._sort_combo.currentIndexChanged.connect(self._emit_filter)
+        sol.addWidget(self._sort_combo)
+        layout.addWidget(sort_group)
+
+        # ── Reset ──
+        self._reset_btn = QPushButton("Reset Filters")
+        self._reset_btn.clicked.connect(self._reset_filters)
+        layout.addWidget(self._reset_btn)
+
+        layout.addStretch()
+
+        # Filter debounce timer
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(150)
+
+    def _on_diff_changed(self) -> None:
+        lo = self._diff_slider.value()
+        hi = self._diff_hi_slider.value()
+        if lo > hi:
+            self._diff_hi_slider.setValue(lo)
+            hi = lo
+        tier_names = ["All"] + [t.label for t in DifficultyTier]
+        lo_tier = DifficultyTier.from_score(lo / 100.0).label
+        hi_tier = DifficultyTier.from_score(hi / 100.0).label
+        self._diff_label.setText(f"Difficulty: {lo_tier} – {hi_tier}")
+        self._emit_filter()
+
+    def _on_theme_text(self, text: str) -> None:
+        idx = self._collection.index
+        if not idx:
+            self._theme_suggest.hide()
+            return
+        trie = idx.theme_trie
+        if text:
+            suggestions = trie.search(text, limit=8)
+            if suggestions:
+                self._theme_suggest.clear()
+                for s in suggestions:
+                    self._theme_suggest.addItem(s)
+                self._theme_suggest.show()
+            else:
+                self._theme_suggest.hide()
+        else:
+            self._theme_suggest.hide()
+
+    def _add_theme_tag(self, item: QListWidgetItem) -> None:
+        tag = item.text()
+        self._theme_tags.add(tag)
+        self._theme_edit.clear()
+        self._theme_suggest.hide()
+        self._rebuild_tag_chips()
+        self._emit_filter()
+
+    def _remove_tag(self, tag: str) -> None:
+        self._theme_tags.discard(tag)
+        self._rebuild_tag_chips()
+        self._emit_filter()
+
+    def _rebuild_tag_chips(self) -> None:
+        # Clear existing chips
+        while self._tag_layout.count():
+            child = self._tag_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        for tag in sorted(self._theme_tags):
+            chip = QPushButton(f"✕ {tag}")
+            chip.setFixedHeight(26)
+            chip.setStyleSheet(
+                "QPushButton{background:#E0F0F5;border:1px solid #2D7D9A;"
+                "border-radius:13px;padding:2px 10px;color:#2D7D9A;"
+                "font-size:11px;font-weight:500;}"
+                "QPushButton:hover{background:#CCE5ED;}")
+            chip.clicked.connect(lambda _, t=tag: self._remove_tag(t))
+            self._tag_layout.addWidget(chip)
+        self._tag_layout.addStretch()
+
+    def _apply_suggestion(self, item: QListWidgetItem) -> None:
+        text = item.text()
+        self._search_edit.setText(text)
+        self._suggest_list.hide()
+
+    def _emit_filter(self) -> None:
+        self._debounce.start()
+
+    def get_criteria(self) -> FilterCriteria:
+        lo = self._diff_slider.value() / 100.0
+        hi = self._diff_hi_slider.value() / 100.0
+        return FilterCriteria(
+            text_query=self._search_edit.text().strip(),
+            difficulty_range=(lo, hi),
+            rating_range=(self._rating_lo.value(), self._rating_hi.value()),
+            move_count_range=(self._moves_lo.value(), self._moves_hi.value()),
+            theme_tags=frozenset(self._theme_tags),
+            sort_mode=self._sort_combo.currentData() or SortMode.DEFAULT,
+            require_rating=self._require_rating.isChecked(),
+        )
+
+    def _reset_filters(self) -> None:
+        self._search_edit.clear()
+        self._diff_slider.setValue(0)
+        self._diff_hi_slider.setValue(100)
+        self._rating_lo.setValue(0)
+        self._rating_hi.setValue(3500)
+        self._moves_lo.setValue(1)
+        self._moves_hi.setValue(50)
+        self._require_rating.setChecked(False)
+        self._sort_combo.setCurrentIndex(0)
+        self._theme_tags.clear()
+        self._rebuild_tag_chips()
+        self._emit_filter()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PUZZLE LIST WIDGET
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PuzzleListWidget(QWidget):
+    """Scrollable list of puzzle cards."""
+
+    puzzle_selected = Signal(int)  # puzzle id
+
+    def __init__(self, collection: PuzzleCollection,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._collection = collection
+        self._ids: List[int] = []
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        hdr = QHBoxLayout()
+        self._count_label = QLabel("0 puzzles")
+        self._count_label.setStyleSheet("color:#757575; font-size:12px;")
+        hdr.addWidget(self._count_label)
+        hdr.addStretch()
+        layout.addLayout(hdr)
+
+        self._list = QListWidget()
+        self._list.currentRowChanged.connect(self._on_row_changed)
+        layout.addWidget(self._list)
+
+    def set_ids(self, ids: List[int]) -> None:
+        self._ids = ids
+        self._list.clear()
+        self._count_label.setText(f"{len(ids)} puzzles")
+        for pid in ids:
+            puzzle = self._collection.get(pid)
+            if puzzle:
+                self._add_puzzle_item(puzzle)
+
+    def _add_puzzle_item(self, puzzle: Puzzle) -> None:
+        tier_color = puzzle.tier_color
+        rating_str = f" • {puzzle.rating}" if puzzle.rating else ""
+        themes_str = ""
+        if puzzle.themes:
+            t_list = sorted(puzzle.themes)[:3]
+            themes_str = " • " + ", ".join(t_list)
+            if len(puzzle.themes) > 3:
+                themes_str += f" +{len(puzzle.themes) - 3}"
+
+        text = f"<b style='color:{tier_color}'>●</b> {puzzle.name}"
+        sub = (f"<span style='color:#757575;font-size:11px;'>"
+               f"{puzzle.tier_label}{rating_str} • "
+               f"{puzzle.move_count} moves{themes_str}</span>")
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, puzzle.id)
+        item.setSizeHint(QSize(0, 52))
+        self._list.addItem(item)
+
+        # Use a custom widget for rich formatting
+        widget = QWidget()
+        wl = QVBoxLayout(widget)
+        wl.setContentsMargins(8, 4, 8, 4)
+        wl.setSpacing(1)
+        name_lbl = QLabel(text)
+        name_lbl.setStyleSheet("font-size:13px; font-weight:500;")
+        sub_lbl = QLabel(sub)
+        sub_lbl.setTextFormat(Qt.RichText)
+        wl.addWidget(name_lbl)
+        wl.addWidget(sub_lbl)
+        self._list.setItemWidget(item, widget)
+
+    def _on_row_changed(self, row: int) -> None:
+        if 0 <= row < len(self._ids):
+            self.puzzle_selected.emit(self._ids[row])
+
+    def select_puzzle(self, pid: int) -> None:
+        if pid in self._ids:
+            row = self._ids.index(pid)
+            self._list.setCurrentRow(row)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PUZZLE DETAIL PANEL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PuzzleDetailPanel(QWidget):
+    """Shows details of the selected puzzle."""
+
+    play_requested = Signal(int)     # puzzle id
+    export_requested = Signal(int)   # puzzle id
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._puzzle: Optional[Puzzle] = None
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        self._name_label = QLabel("Select a puzzle")
+        self._name_label.setWordWrap(True)
+        self._name_label.setStyleSheet("font-size:16px; font-weight:700;")
+        layout.addWidget(self._name_label)
+
+        self._tier_label = QLabel("")
+        self._tier_label.setStyleSheet("font-size:13px; font-weight:600;")
+        layout.addWidget(self._tier_label)
+
+        # Details grid
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        details = ["Rating", "Moves", "Opening", "ECO", "Themes"]
+        self._detail_labels: Dict[str, QLabel] = {}
+        for i, d in enumerate(details):
+            lbl = QLabel(f"{d}:")
+            lbl.setStyleSheet("color:#757575; font-weight:500;")
+            val = QLabel("—")
+            val.setWordWrap(True)
+            grid.addWidget(lbl, i, 0)
+            grid.addWidget(val, i, 1)
+            self._detail_labels[d] = val
+        layout.addLayout(grid)
+
+        # Description
+        self._desc_label = QLabel("")
+        self._desc_label.setWordWrap(True)
+        self._desc_label.setStyleSheet("color:#555; font-size:12px; "
+                                       "padding:8px; background:#F5F5F5; "
+                                       "border-radius:6px;")
+        self._desc_label.hide()
+        layout.addWidget(self._desc_label)
+
+        # FEN
+        self._fen_label = QLabel("")
+        self._fen_label.setWordWrap(True)
+        self._fen_label.setStyleSheet("color:#999; font-size:11px; "
+                                      "font-family:monospace;")
+        self._fen_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._fen_label.hide()
+        layout.addWidget(self._fen_label)
+
+        layout.addStretch()
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self._play_btn = QPushButton("▶ Play")
+        self._play_btn.setProperty("accent", True)
+        self._play_btn.clicked.connect(self._on_play)
+        self._play_btn.setEnabled(False)
+        btn_row.addWidget(self._play_btn)
+
+        self._export_btn = QPushButton("📹 Export")
+        self._export_btn.clicked.connect(self._on_export)
+        self._export_btn.setEnabled(False)
+        btn_row.addWidget(self._export_btn)
+        layout.addLayout(btn_row)
+
+    def set_puzzle(self, puzzle: Optional[Puzzle]) -> None:
+        self._puzzle = puzzle
+        if puzzle is None:
+            self._name_label.setText("Select a puzzle")
+            self._tier_label.setText("")
+            self._desc_label.hide()
+            self._fen_label.hide()
+            self._play_btn.setEnabled(False)
+            self._export_btn.setEnabled(False)
+            for v in self._detail_labels.values():
+                v.setText("—")
+            return
+
+        self._name_label.setText(puzzle.name)
+        self._tier_label.setText(
+            f"<span style='color:{puzzle.tier_color}'>●</span> "
+            f"{puzzle.tier_label}")
+        self._detail_labels["Rating"].setText(
+            str(puzzle.rating) if puzzle.rating else "—")
+        self._detail_labels["Moves"].setText(str(puzzle.move_count))
+        self._detail_labels["Opening"].setText(puzzle.opening or "—")
+        self._detail_labels["ECO"].setText(puzzle.eco or "—")
+        self._detail_labels["Themes"].setText(
+            ", ".join(sorted(puzzle.themes)) if puzzle.themes else "—")
+
+        if puzzle.desc:
+            self._desc_label.setText(puzzle.desc)
+            self._desc_label.show()
+        else:
+            self._desc_label.hide()
+
+        self._fen_label.setText(f"FEN: {puzzle.fen}")
+        self._fen_label.show()
+        self._play_btn.setEnabled(True)
+        self._export_btn.setEnabled(True)
+
+    def _on_play(self) -> None:
+        if self._puzzle:
+            self.play_requested.emit(self._puzzle.id)
+
+    def _on_export(self) -> None:
+        if self._puzzle:
+            self.export_requested.emit(self._puzzle.id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EXPORT DIALOG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ExportDialog(QDialog):
+    """Dialog for configuring and running puzzle export."""
+
+    def __init__(self, puzzle: Puzzle, settings: Settings,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._puzzle = puzzle
+        self._settings = settings
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        self.setWindowTitle(f"Export — {self._puzzle.name}")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+
+        # Preset
+        fl = QFormLayout()
+        self._preset_combo = QComboBox()
+        for name, preset in EXPORT_PRESETS.items():
+            self._preset_combo.addItem(name, preset)
+        last = self._settings.get('export_preset', 'Board Only (544×544)')
+        idx = self._preset_combo.findText(last)
+        if idx >= 0:
+            self._preset_combo.setCurrentIndex(idx)
+        fl.addRow("Preset:", self._preset_combo)
+
+        # Format
+        self._format_combo = QComboBox()
+        self._format_combo.addItem("MP4 Video", "mp4")
+        self._format_combo.addItem("Animated GIF", "gif")
+        if not (HAS_IMAGEIO or HAS_FFMPEG):
+            self._format_combo.setItemData(0, False, Qt.UserRole - 1)
+            self._format_combo.setItemData(1, False, Qt.UserRole - 1)
+        fl.addRow("Format:", self._format_combo)
+
+        # FPS
+        self._fps_spin = QSpinBox()
+        self._fps_spin.setRange(10, 60)
+        self._fps_spin.setValue(30)
+        fl.addRow("FPS:", self._fps_spin)
+
+        layout.addLayout(fl)
+
+        # Theme
+        self._theme_combo = QComboBox()
+        for name in THEMES:
+            self._theme_combo.addItem(name)
+        current = self._settings.get('theme', 'Minimal')
+        idx2 = self._theme_combo.findText(current)
+        if idx2 >= 0:
+            self._theme_combo.setCurrentIndex(idx2)
+        fl.addRow("Board theme:", self._theme_combo)
+
+        # Progress
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        layout.addWidget(self._progress)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color:#757575; font-size:12px;")
+        layout.addWidget(self._status)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self._export_btn = QPushButton("Export")
+        self._export_btn.setProperty("accent", True)
+        self._export_btn.clicked.connect(self._do_export)
+        btn_row.addWidget(self._export_btn)
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self._cancel_btn)
+        layout.addLayout(btn_row)
+
+    def _do_export(self) -> None:
+        preset: ExportPreset = self._preset_combo.currentData()
+        theme = THEMES.get(self._theme_combo.currentText(), THEMES["Minimal"])
+        fmt = self._format_combo.currentData()
+        fps = self._fps_spin.value()
+
+        # Build modified preset with custom fps
+        actual_preset = ExportPreset(
+            preset.name, preset.width, preset.height,
+            fps, preset.board_frac, preset.bg, preset.description)
+
+        # Choose save path
+        safe_name = SAFE_FS_RE.sub('_', self._puzzle.name)[:50]
+        ext = ".gif" if fmt == "gif" else ".mp4"
+        default_name = f"{safe_name}{ext}"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Export", default_name,
+            f"{'GIF' if fmt == 'gif' else 'Video'} files (*{ext})")
+        if not path:
+            return
+
+        self._export_btn.setEnabled(False)
+        self._status.setText("Rendering…")
+
+        def progress_cb(frac: float) -> None:
+            # Schedule UI update on main thread
+            QTimer.singleShot(0, lambda: self._progress.setValue(int(frac * 100)))
+
+        def run_export() -> None:
+            if fmt == "gif":
+                ok = PuzzleExporter.export_gif(
+                    self._puzzle, path, sq_size=actual_preset.calc_sq_size(),
+                    theme=theme, fps=fps, progress_cb=progress_cb)
+            else:
+                ok = PuzzleExporter.export_video(
+                    self._puzzle, path, preset=actual_preset,
+                    theme=theme, progress_cb=progress_cb)
+
+            QTimer.singleShot(0, lambda: self._export_done(ok, path))
+
+        threading.Thread(target=run_export, daemon=True).start()
+
+    def _export_done(self, ok: bool, path: str) -> None:
+        self._export_btn.setEnabled(True)
+        if ok:
+            self._status.setText(f"✓ Saved to {path}")
+            self._progress.setValue(100)
+            self._settings.set('export_preset', self._preset_combo.currentText())
+        else:
+            self._status.setText("✗ Export failed — check log")
+            self._progress.setValue(0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PLAYBACK CONTROLS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PlaybackControls(QWidget):
+    """Transport controls for puzzle playback."""
+
+    next_clicked = Signal()
+    prev_clicked = Signal()
+    reset_clicked = Signal()
+    auto_toggled = Signal(bool)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        self._reset_btn = QPushButton("⏮")
+        self._reset_btn.setFixedSize(36, 36)
+        self._reset_btn.setToolTip("Reset (R)")
+        self._reset_btn.clicked.connect(self.reset_clicked)
+        layout.addWidget(self._reset_btn)
+
+        self._prev_btn = QPushButton("◀")
+        self._prev_btn.setFixedSize(36, 36)
+        self._prev_btn.setToolTip("Previous move (←)")
+        self._prev_btn.clicked.connect(self.prev_clicked)
+        layout.addWidget(self._prev_btn)
+
+        self._next_btn = QPushButton("▶")
+        self._next_btn.setFixedSize(36, 36)
+        self._next_btn.setToolTip("Next move (→)")
+        self._next_btn.clicked.connect(self.next_clicked)
+        layout.addWidget(self._next_btn)
+
+        self._auto_btn = QPushButton("⏩")
+        self._auto_btn.setFixedSize(36, 36)
+        self._auto_btn.setToolTip("Auto-play (Space)")
+        self._auto_btn.setCheckable(True)
+        self._auto_btn.toggled.connect(self.auto_toggled)
+        layout.addWidget(self._auto_btn)
+
+        self._progress_label = QLabel("")
+        self._progress_label.setStyleSheet(
+            "color:#757575; font-size:11px; padding:0 8px;")
+        layout.addWidget(self._progress_label)
+
+        layout.addStretch()
+
+        # Flip button
+        self._flip_btn = QPushButton("🔃")
+        self._flip_btn.setFixedSize(36, 36)
+        self._flip_btn.setToolTip("Flip board (F)")
+        layout.addWidget(self._flip_btn)
+
+    def set_progress(self, current: int, total: int) -> None:
+        self._progress_label.setText(f"{current}/{total}")
+
+    def set_auto(self, on: bool) -> None:
+        self._auto_btn.setChecked(on)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN WINDOW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MainWindow(QMainWindow):
+    """Application main window — assembles all components."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Chess Puzzle App")
+        self.setMinimumSize(1100, 700)
+
+        # Core state
+        self.collection = PuzzleCollection()
+        self.settings = Settings()
+        self._current_puzzle: Optional[Puzzle] = None
+        self._filtered_ids: List[int] = []
+
+        # Build UI
+        self._build_ui()
+        self._connect_signals()
+        self._apply_settings()
+
+        # Load default data if available
+        self._try_load_default()
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
+
+        # ── Left: Filter panel ──
+        self.filter_panel = FilterPanel(self.collection)
+        self.filter_panel.setFixedWidth(260)
+        main_layout.addWidget(self.filter_panel)
+
+        # ── Center: Board + controls ──
+        center = QVBoxLayout()
+        center.setSpacing(8)
+
+        # Board
+        self.board_widget = ChessBoardWidget()
+        center.addWidget(self.board_widget, alignment=Qt.AlignCenter)
+
+        # Move list display
+        self._move_list_label = QLabel("")
+        self._move_list_label.setWordWrap(True)
+        self._move_list_label.setStyleSheet(
+            "color:#555; font-size:12px; font-family:monospace; "
+            "padding:6px 10px; background:#FFF; border:1px solid #E0E0E0; "
+            "border-radius:6px; min-height:28px;")
+        center.addWidget(self._move_list_label)
+
+        # Playback controls
+        self.playback = PlaybackControls()
+        center.addWidget(self.playback)
+
+        # Status
+        self._status_label = QLabel("Load a puzzle file to begin")
+        self._status_label.setStyleSheet("color:#999; font-size:11px;")
+        center.addWidget(self._status_label)
+
+        center.addStretch()
+        main_layout.addLayout(center, stretch=1)
+
+        # ── Right: Puzzle list + details ──
+        right = QVBoxLayout()
+        right.setSpacing(8)
+
+        self.puzzle_list = PuzzleListWidget(self.collection)
+        right.addWidget(self.puzzle_list, stretch=1)
+
+        self.detail_panel = PuzzleDetailPanel()
+        self.detail_panel.setFixedWidth(280)
+        right.addWidget(self.detail_panel)
+
+        main_layout.addLayout(right)
+
+        # ── Menu bar ──
+        self._build_menu()
+
+        # ── Status bar ──
+        self.statusBar().showMessage("Ready")
+
+    def _build_menu(self) -> None:
+        mb = self.menuBar()
+
+        file_menu = mb.addMenu("&File")
+        open_act = file_menu.addAction("&Open Puzzle File…")
+        open_act.setShortcut("Ctrl+O")
+        open_act.triggered.connect(self._open_file)
+
+        file_menu.addSeparator()
+
+        load_dir_act = file_menu.addAction("Load &Directory…")
+        load_dir_act.triggered.connect(self._open_directory)
+
+        file_menu.addSeparator()
+
+        quit_act = file_menu.addAction("&Quit")
+        quit_act.setShortcut("Ctrl+Q")
+        quit_act.triggered.connect(self.close)
+
+        # View menu
+        view_menu = mb.addMenu("&View")
+        theme_menu = view_menu.addMenu("Board &Theme")
+        for name in THEMES:
+            act = theme_menu.addAction(name)
+            act.triggered.connect(lambda _, n=name: self._set_theme(n))
+
+        view_menu.addSeparator()
+        flip_act = view_menu.addAction("&Flip Board")
+        flip_act.setShortcut("F")
+        flip_act.triggered.connect(
+            lambda: self.board_widget.set_flipped(
+                not self.board_widget.flipped))
+
+        # Settings menu
+        settings_menu = mb.addMenu("&Settings")
+        self._sound_action = settings_menu.addAction("Sound &Enabled")
+        self._sound_action.setCheckable(True)
+        self._sound_action.setChecked(True)
+        self._sound_action.triggered.connect(
+            lambda: self.board_widget.set_sound_enabled(
+                self._sound_action.isChecked()))
+
+        speed_menu = settings_menu.addMenu("Animation &Speed")
+        for ms, label in [(100, "Fast (100ms)"), (250, "Normal (250ms)"),
+                          (500, "Slow (500ms)"), (1000, "Very Slow (1s)")]:
+            act = speed_menu.addAction(label)
+            act.triggered.connect(lambda _, m=ms: self.board_widget.set_anim_speed(m))
+
+    def _connect_signals(self) -> None:
+        # Filter debounce
+        self.filter_panel._debounce.timeout.connect(self._apply_filter)
+
+        # Puzzle selection
+        self.puzzle_list.puzzle_selected.connect(self._on_puzzle_selected)
+
+        # Detail panel actions
+        self.detail_panel.play_requested.connect(self._play_puzzle_by_id)
+        self.detail_panel.export_requested.connect(self._export_puzzle_by_id)
+
+        # Playback
+        self.playback.next_clicked.connect(self.board_widget.puzzle_next_move)
+        self.playback.prev_clicked.connect(self.board_widget.puzzle_prev_move)
+        self.playback.reset_clicked.connect(self.board_widget.puzzle_reset)
+        self.playback.auto_toggled.connect(self._on_auto_toggle)
+
+        # Board changes
+        self.board_widget.board_changed.connect(self._on_board_changed)
+
+        # Flip
+        self.playback._flip_btn.clicked.connect(
+            lambda: self.board_widget.set_flipped(
+                not self.board_widget.flipped))
+
+    def _apply_settings(self) -> None:
+        self._set_theme(self.settings.get('theme', 'Minimal'))
+        self.board_widget.set_flipped(self.settings.get('flipped', False))
+        self.board_widget.set_sound_enabled(self.settings.get('sound_enabled', True))
+        self.board_widget.set_sound_volume(self.settings.get('sound_volume', 0.7))
+        self.board_widget.set_anim_speed(self.settings.get('anim_speed', 250))
+        self._sound_action.setChecked(self.settings.get('sound_enabled', True))
+
+        geo = self.settings.get('window_geometry', '')
+        if geo:
+            self.restoreGeometry(bytes.fromhex(geo))
+
+    def _try_load_default(self) -> None:
+        """Try to load puzzle files from the data directory."""
+        if not os.path.isdir(DATA_DIR):
+            return
+        files = []
+        for ext in ('*.csv', '*.json', '*.jsonl', '*.parquet', '*.pgn'):
+            files.extend(Path(DATA_DIR).glob(ext))
+        for f in files[:3]:  # Load up to 3 default files
+            self._load_file(str(f))
+
+    # ── File operations ──
+
+    def _open_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Puzzle File", DATA_DIR,
+            "Puzzle files (*.csv *.json *.jsonl *.parquet *.pgn);;All (*)")
+        if path:
+            self._load_file(path)
+
+    def _open_directory(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Open Puzzle Directory", DATA_DIR)
+        if d:
+            count = 0
+            for ext in ('*.csv', '*.json', '*.jsonl', '*.parquet', '*.pgn'):
+                for f in Path(d).glob(ext):
+                    self._load_file(str(f))
+                    count += 1
+            if count == 0:
+                self.statusBar().showMessage("No puzzle files found in directory")
+
+    def _load_file(self, path: str) -> None:
+        self.statusBar().showMessage(f"Loading {os.path.basename(path)}…")
+        QApplication.processEvents()
+
+        puzzles = PuzzleLoader.load_file(path)
+        if not puzzles:
+            self.statusBar().showMessage(f"No puzzles loaded from {path}")
+            return
+
+        self.collection.add_many(puzzles)
+        self.collection.build_index()
+        self.settings.set('last_file', path)
+
+        # Refresh filter
+        self._apply_filter()
+
+        self.statusBar().showMessage(
+            f"Loaded {self.collection.count} puzzles from {os.path.basename(path)}")
+        self._status_label.setText(
+            f"📚 {self.collection.count} puzzles loaded")
+
+    # ── Filtering ──
+
+    def _apply_filter(self) -> None:
+        criteria = self.filter_panel.get_criteria()
+        self._filtered_ids = self.collection.filter(criteria)
+        self.puzzle_list.set_ids(self._filtered_ids)
+        n = len(self._filtered_ids)
+        self.statusBar().showMessage(f"{n} puzzles match current filters")
+
+    # ── Puzzle interaction ──
+
+    def _on_puzzle_selected(self, pid: int) -> None:
+        puzzle = self.collection.get(pid)
+        self.detail_panel.set_puzzle(puzzle)
+
+    def _play_puzzle_by_id(self, pid: int) -> None:
+        puzzle = self.collection.get(pid)
+        if puzzle:
+            self._current_puzzle = puzzle
+            self.board_widget.load_puzzle(puzzle)
+            self.playback.set_progress(0, puzzle.move_count)
+            self._status_label.setText(f"♟ Playing: {puzzle.name}")
+            self.board_widget.sound.play("start")
+
+    def _export_puzzle_by_id(self, pid: int) -> None:
+        puzzle = self.collection.get(pid)
+        if puzzle:
+            dlg = ExportDialog(puzzle, self.settings, self)
+            dlg.exec()
+
+    def _on_board_changed(self) -> None:
+        cur, total = self.board_widget.puzzle_progress
+        self.playback.set_progress(cur, total)
+        # Update move list
+        moves = self.board_widget.get_move_list()
+        self._move_list_label.setText("  ".join(
+            f"{(i // 2) + 1}.{' ' if i % 2 == 0 else '…'}{m}"
+            if i % 2 == 0 else m
+            for i, m in enumerate(moves)))
+        if self.board_widget.puzzle_complete:
+            self._status_label.setText("✓ Puzzle complete!")
+
+    def _on_auto_toggle(self, on: bool) -> None:
+        if on:
+            self.board_widget.start_auto_play()
+        else:
+            self.board_widget.stop_auto_play()
+        self.playback.set_auto(on)
+
+    def _set_theme(self, name: str) -> None:
+        self.board_widget.set_theme(name)
+        self.settings.set('theme', name)
+
+    # ── Window events ──
+
+    def closeEvent(self, event) -> None:
+        # Save settings
+        self.settings.set('flipped', self.board_widget.flipped)
+        self.settings.set('sound_enabled', self._sound_action.isChecked())
+        self.settings.set('sound_volume', self.board_widget.sound._volume)
+        self.settings.set('anim_speed', self.board_widget._anim_speed)
+        geo = self.saveGeometry().hex()
+        self.settings.set('window_geometry', geo.decode() if isinstance(geo, bytes) else geo)
+        self.settings.save()
+        self.board_widget.cleanup()
+        event.accept()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    app.setApplicationName("Chess Puzzle App")
+    app.setApplicationVersion("1.0.0")
+    app.setStyle("Fusion")
+
+    Palette.apply(app)
+    app.setStyleSheet(STYLESHEET)
+
+    window = MainWindow()
+    window.show()
+
+    log("Application started", "APP")
+    exit_code = app.exec()
+    log("Application exiting", "APP")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

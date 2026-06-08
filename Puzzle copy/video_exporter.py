@@ -48,6 +48,7 @@ def _apply_saturation(frame, saturation=1.05):
 
 def _apply_post_process(frame, config):
     """Apply GPU-style post-processing (contrast, saturation, vignette) to a frame."""
+    # Fast path: skip if all defaults or disabled
     if (not config.gpu_post_process or
         (config.gpu_contrast == 1.0 and config.gpu_saturation == 1.0 and config.gpu_vignette <= 0)):
         return frame
@@ -173,7 +174,17 @@ class FFmpegVideoExporter(QObject):
     # ── Streaming Core Logic ────────────────────────────────────────────
 
     def _export_streaming(self, puzzle, output_path):
-        """Stream-render all frames through an FFmpeg pipe to produce a video file."""
+        """Stream-render all frames through an FFmpeg pipe to produce a video file.
+
+        The export flow is:
+          1. Title screen (text card)
+          2. Setup moves (opponent's first move for Lichess puzzles)
+          3. Starting position hold (board with "Find the best move" overlay)
+          4. Puzzle animation (all remaining moves, animated)
+          5. End screen — final position held for a duration with end text overlay
+
+        Returns the total number of frames written (used for silent audio duration).
+        """
         cfg = self.config
         w, h = cfg.target_width, cfg.target_height
 
@@ -248,6 +259,7 @@ class FFmpegVideoExporter(QObject):
             loops = max(1, cfg.loop_count)
             for loop_idx in range(loops):
                 if loop_idx > 0:
+                    # Reset for subsequent loops
                     if fen:
                         engine.load_fen(fen)
                     else:
@@ -269,6 +281,7 @@ class FFmpegVideoExporter(QObject):
 
             # ── 5. End Screen — Final Position Hold ─────────────────────
             if cfg.end_enabled:
+                # Render the final board position with the end text overlaid
                 end_overlay = cfg.end_text if cfg.end_text else ""
                 end_last_move = engine.last_move
                 end_img = self._render_composited_frame(
@@ -291,6 +304,7 @@ class FFmpegVideoExporter(QObject):
             process.kill()
             raise e
 
+        # Finalize the FFmpeg process
         process.stdin.close()
         _, stderr = process.communicate()
         if process.returncode != 0:
@@ -303,9 +317,13 @@ class FFmpegVideoExporter(QObject):
     def _execute_move_streaming(self, process, engine, move_uci, san_moves, move_idx,
                                 frame_idx, total_est, sq_size, w, h, cfg, theme,
                                 puzzle_info, status_text, is_setup=False, is_key_move=False):
-        """Execute a single move: animate it, push it, then pause."""
+        """Execute a single move: animate it, push it, then pause.
+
+        Returns the updated frame_idx after writing all frames for this move.
+        """
         move = chess.Move.from_uci(move_uci)
 
+        # Handle auto-promotion if the raw UCI lacks a promotion flag
         if move not in engine.board.legal_moves:
             if move.promotion is None:
                 piece = engine.board.piece_at(move.from_square)
@@ -323,6 +341,7 @@ class FFmpegVideoExporter(QObject):
         tr, tc = ChessEngine.sq_to_rc(move.to_square)
         promo = chess.piece_symbol(move.promotion) if move.promotion else None
 
+        # Determine captured piece (for fade-out animation)
         is_ep = engine.board.is_en_passant(move)
         if is_ep:
             ep_cap_sq = chess.square(chess.square_file(move.to_square),
@@ -332,6 +351,7 @@ class FFmpegVideoExporter(QObject):
             cap = engine.board.piece_at(move.to_square)
         captured = cap.symbol() if cap else '.'
 
+        # ── Animation frames ────────────────────────────────────────────
         n_anim = max(1, int(cfg.fps * cfg.move_anim_duration))
         piece_obj = chess.Piece(
             engine.board.piece_at(move.from_square).piece_type,
@@ -355,8 +375,10 @@ class FFmpegVideoExporter(QObject):
             frame_idx += 1
             self.progress.emit(frame_idx, total_est)
 
+        # ── Push the move on the engine ─────────────────────────────────
         info = engine.make_move(fr, fc, tr, tc, promo)
 
+        # ── Pause frames after the move ─────────────────────────────────
         pause_duration = cfg.pause_after_move
         if is_key_move and cfg.pause_on_key_moves:
             pause_duration *= cfg.key_move_pause_multiplier
@@ -375,6 +397,7 @@ class FFmpegVideoExporter(QObject):
         return frame_idx
 
     def _is_key_move(self, engine, uci_str):
+        """Determine if a move is a 'key move' worthy of an extended pause."""
         try:
             move = chess.Move.from_uci(uci_str)
             if engine.board.is_capture(move):
@@ -406,6 +429,7 @@ class FFmpegVideoExporter(QObject):
             sq_size=sq_size,
             highlight_last_move=cfg.highlight_last_move,
             show_coords=cfg.coordinate_visible,
+            show_arrow=cfg.show_arrow,
             text_overlay=text_overlay)
 
         final_img = ChessBoardWidget.render_layout(
@@ -415,6 +439,7 @@ class FFmpegVideoExporter(QObject):
         return final_img
 
     def _write_qimage_to_pipe(self, process, qimg, w, h):
+        """Convert a QImage to raw RGB bytes and write it to the FFmpeg pipe."""
         if qimg.width() != w or qimg.height() != h:
             qimg = qimg.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
         np_frame = ChessBoardWidget.qimage_to_np(qimg)
@@ -422,6 +447,7 @@ class FFmpegVideoExporter(QObject):
         process.stdin.write(np_frame.tobytes())
 
     def _precalc_san_moves(self, fen, uci_moves):
+        """Pre-calculate SAN notation for every move in the sequence."""
         board = chess.Board(fen) if fen else chess.Board()
         sans = []
         for uci in uci_moves:
@@ -439,12 +465,14 @@ class FFmpegVideoExporter(QObject):
     # ── YouTube-Optimized FFmpeg Command ────────────────────────────────
 
     def _build_ffmpeg_cmd(self, output_path, w, h):
+        """Build the FFmpeg command for H.264 MP4 output."""
         cfg = self.config
         fps = cfg.fps
         bitrate_k = cfg.effective_bitrate
         maxrate_k = int(bitrate_k * 1.5)
         bufsize_k = bitrate_k * 2
 
+        # H.264 level selection based on resolution
         if w >= 3840 or h >= 2160:
             level = '5.1'
         elif w >= 2560 or h >= 1440:
@@ -452,7 +480,7 @@ class FFmpegVideoExporter(QObject):
         else:
             level = '4.2'
 
-        gop = fps * 2
+        gop = fps * 2  # Keyframe every 2 seconds
 
         return [
             'ffmpeg', '-y',
@@ -479,6 +507,7 @@ class FFmpegVideoExporter(QObject):
         ]
 
     def _estimate_frame_count(self, n_moves):
+        """Estimate total frame count for progress reporting."""
         cfg = self.config
         total = 0
         if cfg.title_enabled and cfg.title_text:
@@ -496,6 +525,7 @@ class FFmpegVideoExporter(QObject):
     # ── Audio Merging ───────────────────────────────────────────────────
 
     def _merge_audio(self, video_path, audio_path):
+        """Merge a silent audio track into the video using FFmpeg."""
         base, ext = os.path.splitext(video_path)
         output_path = f"{base}_with_audio{ext}"
         cmd = [
