@@ -38,4 +38,11 @@ dist/
 
 # >>> AUTO DISCOVERED RULES >>>
 __pycache__/
+MP4Files/
+*.parquet
+data/
+output/
+Output/
+export/
+exports/
 # <<< AUTO DISCOVERED RULES <<<
